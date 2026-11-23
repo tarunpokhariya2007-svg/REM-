@@ -2285,11 +2285,29 @@ class JarvisLive:
                 f" Also briefly and naturally mention that {_when}: {last['summary']}"
             )
 
-        p1 = (
-            f"Greet the user warmly, mention it is {time_str}"
-            f"{', and say you are fetching the news now' if want_news else ''}.{session_clause} "
-            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
-        )
+        hour = datetime.now().hour
+
+if 5 <= hour < 12:
+    greeting = "Good morning"
+elif 12 <= hour < 17:
+    greeting = "Good afternoon"
+elif 17 <= hour < 21:
+    greeting = "Good evening"
+else:
+    greeting = "It's quite late"
+
+p1 = (
+    f"You are REM, the user's devoted and caring personal maid and AI companion. "
+    f"Begin with a natural, affectionate and elegant '{greeting}, Master!' "
+    f"Welcome him warmly and make him feel that you are genuinely happy "
+    f"to see him. Speak naturally, gently and respectfully, with the warmth "
+    f"and personality of Rem from Re:Zero. "
+    f"Briefly mention the current time ({time_str}). "
+    f"{'Tell him you are preparing his daily briefing and news.' if want_news else 'Tell him you are ready to assist him.'} "
+    f"Keep the greeting personal and conversational, not robotic or scripted. "
+    f"Use at most 3 short sentences. Do not call tools. "
+    f"Always address the user as Master."
+)
 
         # Clear the turn-done event so we can wait for Phase 1 to finish
         if self._turn_done_event:

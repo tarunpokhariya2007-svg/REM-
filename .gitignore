@@ -88,3 +88,11 @@ __pycache__/
 .env.*
 !.env.example
 config/api_keys.json
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+config/api_keys.json
