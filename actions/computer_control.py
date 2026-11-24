@@ -98,6 +98,12 @@ def _require_pyperclip() -> bool:
     survive it."""
     return _PYPERCLIP
 
+
+def _ensure_control_active() -> None:
+    from core import desktop_control
+    if desktop_control.should_stop():
+        raise RuntimeError("computer control is paused or emergency-stopped")
+
 _FIRST_NAMES = [
     "Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Drew", "Quinn",
     "Avery", "Blake", "Cameron", "Dakota", "Emerson", "Finley", "Harper",
@@ -174,6 +180,7 @@ def _user_profile() -> dict:
     return {}
 
 def _type(text: str, interval: float = 0.03) -> str:
+    _ensure_control_active()
     _require_pyautogui()
     time.sleep(0.3)
     pyautogui.typewrite(text, interval=interval)
@@ -181,6 +188,7 @@ def _type(text: str, interval: float = 0.03) -> str:
 
 
 def _smart_type(text: str, clear_first: bool = True) -> str:
+    _ensure_control_active()
     _require_pyautogui()
     if clear_first:
         _clear_field()
@@ -198,6 +206,7 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
 
 
 def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
+    _ensure_control_active()
     _require_pyautogui()
     if x is not None and y is not None:
         pyautogui.click(x, y, button=button, clicks=clicks)
@@ -207,18 +216,21 @@ def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
 
 
 def _hotkey(*keys) -> str:
+    _ensure_control_active()
     _require_pyautogui()
     pyautogui.hotkey(*keys)
     return f"Hotkey: {'+'.join(keys)}"
 
 
 def _press(key: str) -> str:
+    _ensure_control_active()
     _require_pyautogui()
     pyautogui.press(key)
     return f"Pressed: {key}"
 
 
 def _scroll(direction: str = "down", amount: int = 3) -> str:
+    _ensure_control_active()
     _require_pyautogui()
     vertical   = direction in ("up", "down")
     amount     = max(1, min(60, abs(int(amount))))
@@ -231,12 +243,14 @@ def _scroll(direction: str = "down", amount: int = 3) -> str:
 
 
 def _move(x: int, y: int, duration: float = 0.3) -> str:
+    _ensure_control_active()
     _require_pyautogui()
     pyautogui.moveTo(x, y, duration=duration)
     return f"Mouse → ({x}, {y})"
 
 
 def _drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5) -> str:
+    _ensure_control_active()
     _require_pyautogui()
     pyautogui.moveTo(x1, y1, duration=0.2)
     pyautogui.dragTo(x2, y2, duration=duration, button="left")
@@ -252,6 +266,7 @@ def _clipboard_get() -> str:
 
 
 def _clipboard_paste(text: str) -> str:
+    _ensure_control_active()
     if _require_pyperclip():
         pyperclip.copy(text)
         time.sleep(0.1)
@@ -263,6 +278,7 @@ def _clipboard_paste(text: str) -> str:
 
 
 def _screenshot(save_path: str | None = None) -> str:
+    _ensure_control_active()
     _require_pyautogui()
     path = _safe_screenshot_path(save_path)
     img  = pyautogui.screenshot()
@@ -279,6 +295,7 @@ def _clear_field() -> str:
     return "Field cleared"
 
 def _focus_window(title: str) -> str:
+    _ensure_control_active()
     os_name = _get_os()
 
     if os_name == "windows":
@@ -366,6 +383,7 @@ def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
         * It then checks whether the process is gone, and answers `done` only
           if it is.
     """
+    _ensure_control_active()
     app_name = (app_name or "").strip()
     if not app_name:
         return outcome.failed("close_app", "no application name was given")
@@ -461,6 +479,7 @@ def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
 
 
 def _screen_find(description: str) -> tuple[int, int] | None:
+    _ensure_control_active()
     api_key = _get_api_key()
     if not api_key:
         print("[ComputerControl] ⚠️ No API key for screen_find")
@@ -505,7 +524,7 @@ def _screen_find(description: str) -> tuple[int, int] | None:
 
     return None
 
-def computer_control(
+def _computer_control_impl(
     parameters: dict,
     response=None,
     player=None,
@@ -565,7 +584,8 @@ def computer_control(
         # core/outcome.is_problem().
         print(f"[ComputerControl] {action}")
 
-    print(f"[ComputerControl] ▶ {action}  {params}")
+    # Never echo typed text or user-profile values into console logs.
+    print(f"[ComputerControl] ▶ {action}")
 
     try:
 
@@ -673,11 +693,36 @@ def computer_control(
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
+def computer_control(parameters: dict, response=None, player=None,
+                     session_memory=None) -> str:
+    params = parameters or {}
+    action = str(params.get("action") or "").strip().lower()
+    if action in ("random_data", "user_data"):
+        return _computer_control_impl(params, response=response, player=player,
+                                      session_memory=session_memory)
+    from core import desktop_control
+    try:
+        with desktop_control.action(f"computer_control:{action or 'unknown'}"):
+            if player:
+                player.set_desktop_control_status(desktop_control.snapshot())
+            result = _computer_control_impl(params, response=response, player=player,
+                                            session_memory=session_memory)
+            desktop_control.report(f"computer_control:{action}", str(result)[:140])
+            if player:
+                player.set_desktop_control_status(desktop_control.snapshot())
+            return result
+    except RuntimeError as exc:
+        return str(exc)
+
+
 TOOL = {
     "name": "computer_control",
     "description": (
-        "Direct computer control: type, click, hotkeys, scroll, move mouse, "
-        "screenshots, find elements on screen, and CLOSE an application. "
+        "Legacy low-level desktop tool. For locating controls or operating a "
+        "native app, prefer screen_agent, which inspects the current UI "
+        "Automation tree and verifies each action instead of guessing "
+        "coordinates. Use this tool only when the user explicitly supplies "
+        "coordinates or requests one low-level pointer operation. "
         "Use action='close_app' with 'app_name' whenever the user asks to "
         "close, quit or exit a program - 'close Spotify', 'quit Chrome'. "
         "Always name the application in 'app_name'; there is no action that "
@@ -690,9 +735,7 @@ TOOL = {
     ),
     # Used in place of `description` only when a small model is on a tool
     # budget - Gemini still gets the full text. See providers/schema.py.
-    "brief": (
-        "Controls the computer: type, click, hotkeys, scroll, screenshots, and close_app to close a named application (put its name in 'app_name'). Use open_app to open one."
-    ),
+    "brief": "Low-level desktop input for explicit coordinates; prefer screen_agent for semantic, verified controls.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

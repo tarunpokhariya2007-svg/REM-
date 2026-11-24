@@ -623,6 +623,7 @@ class RemLive:
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
+        self._last_user_command    = ""      # direct input transcript; never page/document text
         self._interrupted          = False   # True while draining audio after user interrupt
         # Which engine is holding the conversation, and what it can do.
         # None means Gemini Live — the default and, unless somebody has gone to
@@ -928,6 +929,14 @@ class RemLive:
         from core import outcome
         parameters = parameters or {}
         try:
+            control_tools = {"screen_agent", "desktop_ui", "computer_control", "computer_settings",
+                             "browser_control", "screen_process", "open_app", "send_message"}
+            if name in control_tools:
+                from core import desktop_control
+                allowed, reason = desktop_control.authorize_user_request(
+                    self._last_user_command, name, parameters)
+                if not allowed:
+                    return outcome.failed(name, reason)
             if self._action_registry.has(name):
                 return self._action_registry.run(name, parameters,
                                                  {"player": self.ui})
@@ -1606,7 +1615,21 @@ class RemLive:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[REM] 🔧 {name}  {args}")
+        control_tools = {"screen_agent", "desktop_ui", "computer_control", "computer_settings",
+                         "browser_control", "screen_process", "open_app", "send_message"}
+        if name in control_tools:
+            from core import desktop_control
+            allowed, reason = desktop_control.authorize_user_request(
+                self._last_user_command, name, args)
+            if not allowed:
+                print(f"[REM] Refused computer action from unrelated context ({name}).")
+                return types.FunctionResponse(
+                    id=fc.id, name=name, response={"result": reason})
+
+        if name in control_tools:
+            print(f"[REM] Computer action: {name} (arguments hidden)")
+        else:
+            print(f"[REM] 🔧 {name}")
         _t_tool = time.monotonic()
         self.ui.set_state("THINKING")
 
@@ -1754,7 +1777,9 @@ class RemLive:
                     args["folder"] = self.ui.current_file
                     args["mode"] = "improve"
                 _ctx = {"player": self.ui, "speak": self.speak,
-                        "response": None, "session_memory": None}
+                        "response": None,
+                        "session_memory": ({"user_request": self._last_user_command}
+                                           if name in control_tools else None)}
                 r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
@@ -2066,6 +2091,7 @@ class RemLive:
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
+                                self._last_user_command = full_in
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
@@ -2106,6 +2132,9 @@ class RemLive:
                                 self._keep_task(asyncio.create_task(_cam_close()))
 
                     if response.tool_call:
+                        current_user_request = " ".join(in_buf).strip()
+                        if current_user_request:
+                            self._last_user_command = current_user_request
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
                             print(f"[REM] 📞 {fc.name}")
@@ -3140,6 +3169,11 @@ def main():
     ui.root.mainloop()
 
     # The window is closed: write the session summary, stop the engines, go.
+    try:
+        from core import desktop_control
+        desktop_control.emergency_stop()
+    except Exception:
+        pass
     rem = holder.get("rem")
     if rem is not None:
         try:

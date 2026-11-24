@@ -245,8 +245,8 @@ def _say(player, instruction: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Launch + verify, off the conversation's thread
 # ─────────────────────────────────────────────────────────────────────────────
-def _launch_and_verify(player, spoken: str, launcher_name: str,
-                       before: set[int]) -> None:
+def _launch_and_verify_impl(player, spoken: str, launcher_name: str,
+                            before: set[int]) -> None:
     """The part that takes seconds. Speaks ONLY when something needs saying.
 
     Silence means it worked: the window is on the user's screen and a second
@@ -254,6 +254,10 @@ def _launch_and_verify(player, spoken: str, launcher_name: str,
     whatsapp_call.py applies to a phone that is already ringing.
     """
     try:
+        from core import desktop_control
+        if desktop_control.should_stop():
+            _log(player, f"REM: {spoken} was not opened because computer control is paused or stopped.")
+            return
         launcher = _LAUNCHERS[_SYSTEM]
         requested = launcher(launcher_name)
         if not requested and launcher_name.lower() != spoken.lower():
@@ -282,6 +286,21 @@ def _launch_and_verify(player, spoken: str, launcher_name: str,
         print(f"[open_app] {type(exc).__name__}: {exc}")
         _say(player, "Tell the user, in one short sentence in their own "
                      f"language: opening {spoken} failed - {exc}")
+
+
+def _launch_and_verify(player, spoken: str, launcher_name: str,
+                       before: set[int]) -> None:
+    from core import desktop_control
+    try:
+        with desktop_control.action(f"open_app:{spoken}"):
+            if player:
+                player.set_desktop_control_status(desktop_control.snapshot())
+            _launch_and_verify_impl(player, spoken, launcher_name, before)
+            desktop_control.report(f"open_app:{spoken}", "launch result checked")
+            if player:
+                player.set_desktop_control_status(desktop_control.snapshot())
+    except RuntimeError as exc:
+        _log(player, f"REM: {spoken} was not opened: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -340,13 +359,20 @@ def open_app(parameters=None, response=None, player=None,
         # is why failing all of these falls through to the launcher rather than
         # reporting failure. Typing the name into the Start Menu raises a
         # running Store app, and that is the path that ends up serving them.
-        for candidate in existing[:8]:
-            if appidentity.focus(candidate):
-                _log(player, f"REM: {candidate.label} brought to the front.")
-                return outcome.done(
-                    "open_app", app=spoken, matched=candidate.label,
-                    already_running=True, focused=True, verified=True,
-                )
+        from core import desktop_control
+        try:
+            with desktop_control.action(f"focus existing app:{spoken}"):
+                for candidate in existing[:8]:
+                    if desktop_control.should_stop():
+                        return "Computer control is paused; the application was not focused."
+                    if appidentity.focus(candidate):
+                        _log(player, f"REM: {candidate.label} brought to the front.")
+                        return outcome.done(
+                            "open_app", app=spoken, matched=candidate.label,
+                            already_running=True, focused=True, verified=True,
+                        )
+        except RuntimeError as exc:
+            return outcome.failed("open_app", str(exc), app=spoken)
         print(f"[open_app] {best.label} is running but no window could be "
               f"raised — launching it instead, which is what brings back an "
               f"app that is only in the tray.")

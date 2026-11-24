@@ -1,0 +1,4 @@
+from plugins._common import plugin, route, safe_run
+PLUGIN = plugin("flight_finder_plugin", "Compatibility entry for REM's existing flight finder. Reports search results only; it cannot book or pay.", {"origin": {"type": "STRING", "description": "Origin airport or city"}, "destination": {"type": "STRING", "description": "Destination airport or city"}, "date": {"type": "STRING", "description": "Departure date"}, "return_date": {"type": "STRING", "description": "Return date"}, "passengers": {"type": "INTEGER", "description": "Passenger count"}, "cabin": {"type": "STRING", "description": "economy | premium | business | first"}, "save": {"type": "BOOLEAN", "description": "Save results to Notepad"}}, ["origin", "destination", "date"])
+def _run(p, player, memory): return route(player, "flight_finder", p)
+run = safe_run(_run)

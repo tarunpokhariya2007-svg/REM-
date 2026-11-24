@@ -1,0 +1,4 @@
+from plugins._common import plugin, route, safe_run
+PLUGIN = plugin("code_helper_plugin", "Compatibility entry for REM's built-in code_helper. Explain, write, edit, run, or build code through the existing implementation.", {"action": {"type": "STRING", "description": "write | edit | explain | run | build | auto"}, "description": {"type": "STRING", "description": "What code should do or requested change"}, "language": {"type": "STRING", "description": "Programming language"}, "output_path": {"type": "STRING", "description": "Where to save output"}, "file_path": {"type": "STRING", "description": "Existing source path"}, "code": {"type": "STRING", "description": "Code to explain"}, "args": {"type": "STRING", "description": "CLI arguments for run/build"}, "timeout": {"type": "INTEGER", "description": "Run timeout in seconds"}}, ["action"])
+def _run(p, player, memory): return route(player, "code_helper", p)
+run = safe_run(_run)

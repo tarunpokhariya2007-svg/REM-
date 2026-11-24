@@ -129,7 +129,7 @@ It's not just an assistant — it's an extension of your digital life.
 | 📂 File Processor | Read, summarize, and answer questions about local files |
 | 🌐 Browser Control | Open URLs, navigate tabs, and interact with the browser by voice |
 | 📨 Send Message | Compose and send messages through WhatsApp, Telegram, and more |
-| 🖱️ Desktop Control | Taskbar, window management, and desktop-level operations |
+| 🖱️ Desktop Control | UI Automation-first native controls, fresh views, and post-action verification |
 | 🧑‍💻 Silent Language Memory | Detects spoken language on first use — all future sessions adapt automatically |
 | 📱 Remote Dashboard | Control the assistant from your phone via QR code pairing |
 | ⚡ Auto-Start on Boot | Registers with the OS startup system (registry / LaunchAgent / .desktop) |
@@ -142,6 +142,34 @@ It's not just an assistant — it's an extension of your digital life.
 | 🎚️ Per-Device Volume | The output slider belongs to the speaker you picked, not to whatever the system calls default |
 | 🎤 Prove It Hears You | A TEST button with a live meter — the one check an automated probe on silence can never make |
 | 🪪 Assistant Customization | Change the assistant name, your name, voice, and colour from the UI — takes effect immediately |
+
+### Desktop computer use
+
+`screen_agent` is the semantic route for native desktop controls. It reads a
+fresh Windows UI Automation tree (or the platform accessibility tree) before
+each operation, resolves visible labels and roles, refuses ambiguous matches,
+and re-reads the window after clicks, typing, key presses, and scrolling.
+Screen coordinates are not retained between calls. Protected fields are never
+typed into. Raw `computer_control` remains available for explicit low-level
+coordinate requests; use `screen_process` when the request needs visual
+understanding of a surface that exposes no accessibility tree.
+
+The HUD's COMPUTER USE panel has ON-DEMAND, LIVE ASSIST, and COMPUTER CONTROL
+modes, plus pause/resume and an emergency stop. LIVE ASSIST locally polls
+accessible control metadata with an adaptive interval; it does not stream a
+screenshot or continuously send screen content to Gemini. A user request is
+still required for an action. Browser page controls go through Playwright DOM
+roles and labels. If a browser profile is already locked by the user's open
+Chrome, the existing browser controller can use a separate profile; it does
+not attach to arbitrary Chrome processes through CDP. Consequential browser
+buttons and messages require the on-screen confirmation gate.
+
+The accessibility tree is not universal: canvas apps, remote desktops, games,
+and some custom Electron surfaces may expose few or no controls. Those are
+reported as degraded observations and must use visual screen understanding or
+ask the user; this implementation does not guess a coordinate when semantic
+controls are missing. End-to-end desktop reliability still needs validation
+against the user's target applications and display setups.
 
 ### Identity migration compatibility
 
@@ -1060,3 +1088,24 @@ Engineered by a developer building a real-world REM-style assistant.
 | --- | --- |
 | YouTube | [@FatihMakes](https://www.youtube.com/@FatihMakes) |
 | Instagram | [@fatihmakes](https://www.instagram.com/fatihmakes) |
+
+## Reconstructed plugin suite
+
+The plugin loader discovers 26 tools in `plugins/` and loads optional integrations without importing their third-party clients during startup. Plugins are enabled by default; disable individual tools from the existing plugin manager. Integration credentials are entered under Settings → Plugin Settings and stored through the existing configuration manager.
+
+| Capability | Tool name | Setup and limits |
+|---|---|---|
+| Screen control | `screen_agent` | Uses `core.screenview` UI Automation first and the existing screen action verification. The `desktop_ui` action remains available; this plugin supports bounded desktop sequences and routes existing tools such as `browser_control`, `open_app`, and `web_search`. |
+| WhatsApp calls and chat | `whatsapp_call`, `whatsapp_guard`, `chat_takeover` | Uses accessible WhatsApp UI; message sending goes through `send_message` confirmation. UI Automation must expose an exact chat/contact. Guard checks only the visible window and does not run a background call monitor or auto-answer. |
+| Telegram | `telegram_remote` | Configure bot token and authorized chat IDs or a one-time pairing code. Only paired chats reach the cloud task engine; no shell or Python execution is provided. |
+| Gmail and Calendar | `gmail_control`, `calendar_control` | Install the optional Google API packages, configure an OAuth client JSON path and token cache path. Gmail sending and calendar create/update/delete use on-screen confirmation; calendar accepts explicit offsets or local times with an IANA timezone. |
+| Obsidian | `obsidian_vault` | Configure a vault path. Notes are searched/read/created; replacing an existing note requires confirmation and stale changes are refused. |
+| Documents and Excel | `document_review`, `excel_writer` | Document review delegates to `file_processor` and returns suggestions. Excel needs `openpyxl`; edits are written to a new output copy, preserving the source workbook. |
+| Code and development | `code_helper_plugin`, `dev_agent_plugin` | These route to the existing core tools because `code_helper` and `dev_agent` already occupy those names in the action registry. Use the core tools directly for the same capabilities. |
+| Image generation and YouTube upload | `image_generator`, `upload_video` | Image generation needs an OpenAI-compatible images endpoint, model, and key. YouTube upload needs Google OAuth; upload and visibility are confirmed before sending. |
+| YouTube, games, flights | `youtube_video_plugin`, `game_updater_plugin`, `flight_finder_plugin` | Compatibility tools route to the existing core actions, which already use these names. Search and update behavior is owned by those action implementations. |
+| Smart home and printers | `home_assistant`, `printer_control` | Home Assistant needs a base URL and access token; only lights and switches can be changed, after confirmation. MQTT printer access needs broker/topic settings and is read-only in this recovery build. |
+| Personal utilities | `shopping_list`, `pomodoro`, `water_reminder` | Shopping list persists local entries. Timers and reminders use REM speech notifications while the app is running. Hydration tracking makes no health recommendations. |
+| Learning and camera | `quiz`, `spaced_repetition`, `calorie_counter`, `pushup_counter` | Quiz uses the configured model; flashcards are local. Food estimates are approximate. Camera access requires the confirmation UI; push-up counting additionally needs optional OpenCV and MediaPipe. |
+
+Optional packages for this suite are already listed in `requirements.txt`; no packages are installed automatically. OAuth tokens, service credentials, and provider keys belong in plugin settings or user-selected credential files, never in source code.

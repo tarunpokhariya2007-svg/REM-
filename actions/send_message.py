@@ -140,6 +140,10 @@ def _search_in_app(query: str) -> None:
     time.sleep(1.0)
 
 def _desktop_send(app_name: str, receiver: str, message: str) -> str:
+    from core import desktop_control
+    if desktop_control.should_stop():
+        return outcome.failed("send_message", "computer control was stopped; no message was sent",
+                              platform=app_name, to=receiver)
     if not _open_app(app_name):
         return outcome.failed(
             "send_message", f"{app_name} could not be opened, so nothing was "
@@ -148,12 +152,21 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
         )
 
     time.sleep(1.0)
+    if desktop_control.should_stop():
+        return outcome.failed("send_message", "computer control was stopped before contact search; no message was sent",
+                              platform=app_name, to=receiver)
     _search_in_app(receiver)
+    if desktop_control.should_stop():
+        return outcome.failed("send_message", "computer control was stopped before opening the conversation; no message was sent",
+                              platform=app_name, to=receiver)
     pyautogui.press("enter")
     time.sleep(0.8)
 
     _paste_text(message)
     time.sleep(0.2)
+    if desktop_control.should_stop():
+        return outcome.failed("send_message", "computer control was stopped; the draft was not sent",
+                              platform=app_name, to=receiver)
     pyautogui.press("enter")
     time.sleep(0.3)
 
@@ -215,6 +228,10 @@ def _send_whatsapp(receiver: str, message: str) -> str:
         print(f"[SendMessage] {why} — typing blind.")
         return _desktop_send("WhatsApp", receiver, message)
 
+    from core import desktop_control
+    if desktop_control.should_stop():
+        return outcome.failed("send_message", "computer control was stopped; no message was sent",
+                              platform="WhatsApp", to=receiver)
     sent, failure = transport.send_message_to(receiver, message)
     if sent:
         # The one platform that can say `done`: the driver opened the
@@ -339,21 +356,39 @@ def send_message(
             to=receiver, platform=platform,
         )
 
+    # The requested message is only sent after a person confirms it in REM's
+    # trusted HUD. A model-supplied `confirmed` field is never accepted.
+    try:
+        from core import confirm
+        if confirm.pending_title():
+            return outcome.failed("send_message",
+                                  "another confirmation is already waiting; no message was sent",
+                                  platform=platform, to=receiver)
+        preview = message_text[:180] + ("…" if len(message_text) > 180 else "")
+        pending = confirm.request(
+            key="send-message",
+            title=f"Send message to {receiver} via {platform}?",
+            detail=f"Review the recipient and message before approving:\n{preview}",
+            run=lambda: _start_confirmed_send(player, platform, receiver, message_text),
+        )
+        return pending
+    except Exception as exc:
+        return outcome.failed("send_message",
+                              f"could not request user confirmation ({exc}); no message was sent",
+                              platform=platform, to=receiver)
+
+
+def _start_confirmed_send(player, platform: str, receiver: str,
+                          message_text: str) -> str:
     preview = message_text[:50] + ("…" if len(message_text) > 50 else "")
     print(f"[SendMessage] 📨 {platform} → {receiver}: {preview}")
     if player:
-        player.write_log(f"[msg] {platform} → {receiver}")   # the message itself IS the news
-
+        player.write_log(f"[msg] {platform} → {receiver}")
     threading.Thread(
         target=_send_and_report,
         args=(player, platform, receiver, message_text),
         daemon=True, name="send-message",
     ).start()
-
-    # Sending opens an application, searches for a person and types — several
-    # seconds during which the old code held the whole conversation still. The
-    # answer goes out now and the result follows, which is the shape
-    # whatsapp_call.py settled on for the same reason.
     return outcome.started("send_message", platform=platform, to=receiver)
 
 
@@ -367,7 +402,12 @@ def _send_and_report(player, platform: str, receiver: str,
     thing this rewrite exists to stop.
     """
     try:
-        result = _resolve_platform(platform)(receiver, message_text)
+        from core import desktop_control
+        with desktop_control.action(f"send_message:{platform} to {receiver}"):
+            result = _resolve_platform(platform)(receiver, message_text)
+            desktop_control.report(f"send_message:{platform}", str(result)[:140])
+            if player:
+                player.set_desktop_control_status(desktop_control.snapshot())
     except Exception as exc:
         print(f"[SendMessage] {type(exc).__name__}: {exc}")
         result = outcome.failed("send_message", f"it failed: {exc}",

@@ -1,0 +1,4 @@
+from plugins._common import plugin, route, safe_run
+PLUGIN = plugin("game_updater_plugin", "Compatibility entry for REM's built-in game updater, which discovers supported launchers and checks or applies updates using its safety controls.", {"action": {"type": "STRING", "description": "update | install | list | download_status | schedule | cancel_schedule | schedule_status"}, "platform": {"type": "STRING", "description": "steam | epic | both"}, "game_name": {"type": "STRING", "description": "Game title"}, "app_id": {"type": "STRING", "description": "Steam AppID"}, "hour": {"type": "INTEGER", "description": "Schedule hour 0-23"}, "minute": {"type": "INTEGER", "description": "Schedule minute 0-59"}, "shutdown_when_done": {"type": "BOOLEAN", "description": "Shut down after downloads"}})
+def _run(p, player, memory): return route(player, "game_updater", p)
+run = safe_run(_run)

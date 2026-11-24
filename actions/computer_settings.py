@@ -999,7 +999,7 @@ def _suggest(description: str) -> str:
         f"are: {hint}. Which was meant?",
         said=description)
 
-def computer_settings(
+def _computer_settings_impl(
     parameters: dict = None,
     response=None,
     player=None,
@@ -1027,7 +1027,8 @@ def computer_settings(
     if not action:
         return _suggest(description or raw_action)
 
-    print(f"[Settings] Action: {action}  Value: {value}  OS: {_OS}")
+    # Do not print typed values: this tool can enter text into the focused app.
+    print(f"[Settings] Action: {action}  OS: {_OS}")
     if player:
         print(f"[Settings] {action}")            # terminal, not the HUD
 
@@ -1051,7 +1052,7 @@ def computer_settings(
                 wanted=action)
         return confirm.request(
             key=action, title=title, detail=detail,
-            run=lambda f=func, a=action: (f(), f"{a} done.")[1],
+            run=lambda f=func, a=action, p=player: _run_confirmed_settings(f, a, p),
         )
 
     if action in ("volume_set", "set_volume"):
@@ -1201,9 +1202,15 @@ def computer_settings(
 
     try:
         if action in _STEP_ACTIONS:
+            from core import desktop_control
+            if desktop_control.should_stop():
+                return outcome.failed("computer_settings", "computer control was stopped", wanted=action)
             func(step)
         else:
             for i in range(times):
+                from core import desktop_control
+                if desktop_control.should_stop():
+                    return outcome.failed("computer_settings", "computer control was stopped", wanted=action)
                 func()
                 if i + 1 < times:
                     time.sleep(0.08)
@@ -1291,6 +1298,41 @@ def computer_settings(
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
+def _run_confirmed_settings(func, action_name: str, player=None) -> str:
+    """Serialize an irreversible action approved through the trusted HUD."""
+    from core import desktop_control
+    try:
+        with desktop_control.action(f"computer_settings:{action_name}"):
+            if desktop_control.should_stop():
+                return "The action was not performed because computer control is paused or stopped."
+            func()
+            desktop_control.report(f"computer_settings:{action_name}", "confirmed action dispatched")
+            if player:
+                player.set_desktop_control_status(desktop_control.snapshot())
+            return f"{action_name} done."
+    except Exception as exc:
+        return f"The action was not performed: {exc}"
+
+
+def computer_settings(parameters: dict = None, response=None, player=None,
+                      session_memory=None) -> str:
+    """Run computer settings under the shared desktop-control lock."""
+    from core import desktop_control
+    params = parameters or {}
+    action_name = str(params.get("action") or "settings request").strip()
+    try:
+        with desktop_control.action(f"computer_settings:{action_name}"):
+            if player:
+                player.set_desktop_control_status(desktop_control.snapshot())
+            result = _computer_settings_impl(parameters, response, player, session_memory)
+            desktop_control.report(f"computer_settings:{action_name}", "result returned")
+            if player:
+                player.set_desktop_control_status(desktop_control.snapshot())
+            return result
+    except RuntimeError as exc:
+        return outcome.failed("computer_settings", str(exc), wanted=action_name)
+
+
 TOOL = {
     "name": "computer_settings",
     "description": "Controls the computer: volume, mute, brightness, media playback (play/pause, next, previous, seek), window management, keyboard shortcuts, typing text on screen, fullscreen, dark mode, WiFi, restart, shutdown, scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. Use for ANY single computer control command. NUMBERS MATTER: a level the user names is volume_set / brightness_set with value = that level ('volume to 100', 'max' = 100, 'half' = 50); an amount to change by is volume_up / volume_down / brightness_up / brightness_down with value = the amount ('30 louder' = 30; no amount = 10). Never approximate a level with repeated up/down calls. For a key worth repeating (zoom_in, next_tab, go_back, page_down, undo...) pass `times`. Media keys reach music and video apps without focusing them; seek_forward / seek_backward take value = seconds and act on the app in front (for a video on the assistant's own display use video_player instead). restart, shutdown and toggle_wifi put a confirmation on the user's screen and do NOT happen until they press it — never claim they are done. Volume, mute, brightness and dark mode can be reversed with the `undo` tool.",

@@ -82,11 +82,13 @@ _LIVE_ONLY = ("behavior", "scheduling")
 CORE_TOOLS: tuple[str, ...] = (
     "open_app",
     "computer_settings",
+    "desktop_ui",
     "computer_control",
     "file_controller",
     "browser_control",
     "web_search",
     "screen_process",
+    "screen_agent",
     "save_memory",
     "recall_memory",
     "undo",

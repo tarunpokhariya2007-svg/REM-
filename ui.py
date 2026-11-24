@@ -252,6 +252,10 @@ class RemUI:
         """Thread-safe immediate articulation reset on an interrupted turn."""
         self._win._avatar_reset_sig.emit()
 
+    def set_desktop_control_status(self, status: dict) -> None:
+        """Thread-safe desktop-control status update for the HUD panel."""
+        self._win._desktop_control_sig.emit(dict(status or {}))
+
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
 

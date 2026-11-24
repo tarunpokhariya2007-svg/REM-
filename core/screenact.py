@@ -211,6 +211,12 @@ def _permitted() -> tuple[bool, str]:
 
 def available() -> tuple[bool, str]:
     """Is actuation possible here at all? ((True, "") when it is.)"""
+    try:
+        from core import desktop_control
+        if desktop_control.should_stop():
+            return False, "computer control is paused or emergency-stopped"
+    except Exception:
+        pass
     if not _HAS_PYAUTOGUI:
         return False, "pyautogui is not installed. Run: pip install pyautogui"
     return _permitted()
@@ -409,6 +415,11 @@ def click(target: Target, *, button: str = "left", clicks: int = 1,
     try:
         _move_to(point)
 
+        ok, why = available()
+        if not ok:
+            return _fail(action, why, target=point.label, origin=point.origin,
+                         point=(point.x, point.y))
+
         if _lands_on_self(point.x, point.y):
             return _fail(action, SELF_POINT, target=point.label,
                          origin=point.origin, point=(point.x, point.y))
@@ -491,6 +502,9 @@ def drag(start: Target, end: Target, *, duration: float = 0.45) -> Act:
         if _lands_on_self(a.x, a.y):
             return _fail("drag", SELF_POINT, target=a.label, origin=a.origin)
         time.sleep(HOVER_S)
+        ok, why = available()
+        if not ok:
+            return _fail("drag", why, target=a.label, origin=a.origin)
         pyautogui.dragTo(b.x, b.y, duration=max(0.1, duration), button="left")
     except Exception as e:
         if type(e).__name__ == "FailSafeException":
@@ -562,6 +576,9 @@ def scroll(direction: str = "down", amount: int = 3, *,
 
     clicks = max(1, min(20, int(amount or 3)))
     try:
+        ok, why = available()
+        if not ok:
+            return _fail("scroll", why, target=label, origin=origin)
         _wheel(str(direction or "down"), clicks)
         time.sleep(AFTER_KEY_S)
     except Exception as e:
@@ -637,6 +654,9 @@ def press(keys: str, *, presses: int = 1) -> Act:
     presses = max(1, min(50, int(presses or 1)))
     try:
         for _ in range(presses):
+            ok, why = available()
+            if not ok:
+                return _fail("press", why, target="+".join(parts))
             if len(parts) == 1:
                 pyautogui.press(parts[0])
             else:
@@ -650,6 +670,25 @@ def press(keys: str, *, presses: int = 1) -> Act:
     shown = "+".join(parts)
     return Act(ok=True, action="press", target=shown,
                detail=shown if presses == 1 else f"{shown} x{presses}")
+
+
+def release_all() -> None:
+    """Best-effort release used by the visible emergency-stop control."""
+    if not _HAS_PYAUTOGUI:
+        return
+    try:
+        pyautogui.mouseUp()
+    except Exception:
+        pass
+    for key in ("ctrl", "alt", "shift", "win", "command", "left", "right",
+                "middle", "space", "enter", "tab"):
+        try:
+            if key in ("left", "right", "middle"):
+                pyautogui.mouseUp(button=key)
+            else:
+                pyautogui.keyUp(key)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +767,9 @@ def type_text(text: str, *, target: Optional[Target] = None,
                 press("delete")
 
     try:
+        ok, why = available()
+        if not ok:
+            return _fail("type", why, target=label, origin=origin)
         how, error = _deliver_text(text)
     except Exception as e:
         if type(e).__name__ == "FailSafeException":
@@ -968,6 +1010,9 @@ def focus_app(name: str) -> Act:
         if not matches:
             return _fail("focus_app", f"nothing called {name!r} appears to be running",
                          target=name)
+        ok, why = available()
+        if not ok:
+            return _fail("focus_app", why, target=name)
         if appidentity.focus(matches[0]):
             return Act(ok=True, action="focus_app", target=name,
                        detail="window raised")

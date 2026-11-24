@@ -124,6 +124,7 @@ class MainWindow(QMainWindow):
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
+    _desktop_control_sig = pyqtSignal(object)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -411,6 +412,7 @@ class MainWindow(QMainWindow):
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
+        self._desktop_control_sig.connect(self._set_desktop_control_status)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._wake_btns_sig.connect(self._refresh_wake_btns)
@@ -1376,6 +1378,41 @@ class MainWindow(QMainWindow):
             stp.body.addWidget(row)
         lay.addWidget(stp)
 
+        # Explicitly visible screen/control state with an emergency stop that
+        # remains available while a worker is performing a computer action.
+        self._computer_panel = HoloPanel("COMPUTER USE", "ON-DEMAND")
+        self._computer_rows = {}
+        for label in ("SCREEN", "ACTIVE APP", "ACTION", "LAST ACTION",
+                      "INPUT", "VERIFICATION"):
+            row = DataRow(label, "OFF" if label == "SCREEN" else "—")
+            self._computer_rows[label] = row
+            self._computer_panel.body.addWidget(row)
+        self._desktop_mode = QComboBox()
+        self._desktop_mode.addItems(["ON-DEMAND", "LIVE ASSIST", "COMPUTER CONTROL"])
+        self._desktop_mode.setToolTip(
+            "ON-DEMAND reads the screen only for a requested action. LIVE ASSIST "
+            "locally polls accessible controls and sends no screen content. "
+            "COMPUTER CONTROL arms user-requested desktop actions.")
+        self._desktop_mode.setFont(px_font(9, QFont.Weight.DemiBold))
+        self._desktop_mode.setStyleSheet(
+            f"QComboBox {{ color: {C.TEXT}; background: {C.PANEL}; "
+            f"border: 1px solid {C.BORDER}; padding: 4px; }}")
+        self._desktop_mode.currentTextChanged.connect(self._on_desktop_mode_changed)
+        self._computer_panel.body.addWidget(self._desktop_mode)
+        control_buttons = QHBoxLayout()
+        control_buttons.setSpacing(4)
+        self._desktop_pause = QPushButton("PAUSE")
+        self._desktop_stop = QPushButton("EMERGENCY STOP")
+        for button in (self._desktop_pause, self._desktop_stop):
+            button.setFont(px_font(8, QFont.Weight.Bold))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(btn_css("dim", align="center"))
+            control_buttons.addWidget(button)
+        self._desktop_pause.clicked.connect(self._toggle_desktop_pause)
+        self._desktop_stop.clicked.connect(self._emergency_stop_desktop)
+        self._computer_panel.body.addLayout(control_buttons)
+        lay.addWidget(self._computer_panel)
+
         # Background tasks (core/tasks). Read from the engine every two seconds —
         # an in-memory list, no disk — and hidden rows cost nothing to paint.
         self._tasks_panel = HoloPanel("TASKS", "")
@@ -1462,6 +1499,57 @@ class MainWindow(QMainWindow):
         self._tasks_tmr.start(2000)
         self._refresh_identity_rows()
         return w
+
+    def _on_desktop_mode_changed(self, mode: str) -> None:
+        try:
+            from core import desktop_control
+            desktop_control.set_mode(mode)
+        except Exception as exc:
+            self._log.append_log(f"SYS: Could not change computer-use mode: {exc}")
+
+    def _toggle_desktop_pause(self) -> None:
+        try:
+            from core import desktop_control
+            status = desktop_control.snapshot()
+            if status.get("paused") or status.get("stopped"):
+                desktop_control.resume()
+            else:
+                desktop_control.pause()
+            self._set_desktop_control_status(desktop_control.snapshot())
+        except Exception as exc:
+            self._log.append_log(f"SYS: Could not update computer control: {exc}")
+
+    def _emergency_stop_desktop(self) -> None:
+        try:
+            from core import desktop_control
+            desktop_control.emergency_stop()
+            self._set_desktop_control_status(desktop_control.snapshot())
+            self._log.append_log("SYS: Emergency stop — desktop control paused and inputs released.")
+        except Exception as exc:
+            self._log.append_log(f"ERR: Emergency stop failed: {exc}")
+
+    def _set_desktop_control_status(self, status: dict) -> None:
+        status = dict(status or {})
+        if not hasattr(self, "_computer_panel"):
+            return
+        self._computer_panel.set_code(str(status.get("mode") or "ON-DEMAND"))
+        mode = str(status.get("mode") or "ON-DEMAND")
+        if self._desktop_mode.currentText() != mode:
+            self._desktop_mode.blockSignals(True)
+            self._desktop_mode.setCurrentText(mode)
+            self._desktop_mode.blockSignals(False)
+        self._computer_rows["SCREEN"].set_value(
+            "ACCESS ACTIVE" if status.get("screen_access") else "OFF",
+            "GREEN" if status.get("screen_access") else "DIM")
+        self._computer_rows["ACTIVE APP"].set_value(str(status.get("active_app") or "—")[:22])
+        self._computer_rows["ACTION"].set_value(str(status.get("current_action") or "None")[:22])
+        self._computer_rows["LAST ACTION"].set_value(str(status.get("last_action") or "None")[:22])
+        self._computer_rows["INPUT"].set_value(
+            "MOUSE/KEYBOARD ACTIVE" if status.get("mouse_keyboard") else "IDLE",
+            "ACC2" if status.get("mouse_keyboard") else "DIM")
+        self._computer_rows["VERIFICATION"].set_value(str(status.get("verification") or "Not run")[:22])
+        self._desktop_pause.setText("RESUME" if status.get("paused") or status.get("stopped") else "PAUSE")
+        self._desktop_pause.setEnabled(True)
 
     def _flip_tasks_panel(self) -> None:
         to_routines = self._tasks_stack.currentIndex() == 0

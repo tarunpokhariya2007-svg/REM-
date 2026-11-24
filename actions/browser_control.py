@@ -670,7 +670,13 @@ class _BrowserSession:
         if not self._loop:
             raise RuntimeError(f"Session for '{self.browser_name}' not started.")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout)
+        from core import desktop_control
+        cancel = future.cancel
+        desktop_control.register_cancel(cancel)
+        try:
+            return future.result(timeout=timeout)
+        finally:
+            desktop_control.unregister_cancel(cancel)
 
     def close(self):
         if self._loop:
@@ -902,14 +908,16 @@ class _BrowserSession:
     async def click(self, selector: str = None, text: str = None) -> str:
         page = await self._get_page()
         try:
+            before = await self._page_state(page)
             if text:
-                await page.get_by_text(text, exact=False).first.click(timeout=8_000)
-                return f"Clicked text: '{text}'"
+                loc = page.get_by_text(text, exact=False)
             if selector:
-                await page.click(selector, timeout=8_000)
-                return f"Clicked selector: {selector}"
+                loc = page.locator(selector)
+            if text and selector:
+                return outcome.failed("browser_control", "name a text target or a CSS selector, not both")
             return outcome.failed("browser_control",
-                                  "no element was named to click")
+                                  "no element was named to click") if not (text or selector) else await self._click_unique(
+                                      page, loc, before, text or selector)
         except PlaywrightTimeout:
             return outcome.failed(
                 "browser_control",
@@ -922,12 +930,22 @@ class _BrowserSession:
                         clear_first: bool = True) -> str:
         page = await self._get_page()
         try:
-            el = page.locator(selector).first if selector else page.locator(":focus")
+            el = page.locator(selector) if selector else page.locator(":focus")
+            count = await el.count()
+            if count != 1:
+                return (f"Ambiguous input: {count} elements matched. Provide a unique accessible label."
+                        if count > 1 else "No input matched.")
+            if not await el.is_editable():
+                return "The matched element is not an editable field."
+            if (await el.get_attribute("type") or "").casefold() == "password":
+                return "Password fields are protected. Enter credentials yourself."
             if clear_first:
-                await el.clear()
-            await el.type(text, delay=50)
-            # playwright raises when the field is not there, so reaching this
-            # line means the text went into a real input.
+                await el.fill(str(text))
+            else:
+                await el.press_sequentially(str(text), delay=35)
+            value = await el.input_value()
+            if value != str(text) and clear_first:
+                return outcome.unverified("browser_control", "text entry did not read back exactly")
             return outcome.done("browser_control", typed=True, verified=True)
         except Exception as e:
             return f"Type error: {e}"
@@ -944,8 +962,21 @@ class _BrowserSession:
     async def press(self, key: str) -> str:
         page = await self._get_page()
         try:
+            if str(key).strip().casefold() in ("enter", "return"):
+                focused = page.locator(":focus")
+                if await focused.count() == 1:
+                    meta = await focused.evaluate("el => ({tag:el.tagName, type:el.type||'', role:el.getAttribute('role')||'', label:el.getAttribute('aria-label')||'', placeholder:el.getAttribute('placeholder')||'', name:el.getAttribute('name')||'', editable:el.isContentEditable})")
+                    text = " ".join(str(v) for v in meta.values()).casefold()
+                    search = (meta.get("type") == "search" or meta.get("role") == "searchbox"
+                              or any(x in text for x in ("search", "query", "address")))
+                    chat = any(x in text for x in ("message", "reply", "chat", "comment"))
+                    if chat:
+                        return "I will not submit a message or comment through a generic Enter key. Use the explicit send action and confirm it."
+                    if meta.get("editable") or (meta.get("tag") in ("INPUT", "TEXTAREA")
+                                                and not search):
+                        return "Enter could submit this form; use an explicit named button, which will request confirmation when consequential."
             await page.keyboard.press(key)
-            return f"Pressed: {key}"
+            return f"Pressed: {key}; current page: {page.url}"
         except Exception as e:
             return f"Key error: {e}"
 
@@ -966,38 +997,94 @@ class _BrowserSession:
         results = []
         for selector, value in fields.items():
             try:
-                el = page.locator(selector).first
-                await el.clear()
-                await el.type(str(value), delay=40)
-                results.append(f"✓ {selector}")
+                el = page.locator(selector)
+                count = await el.count()
+                if count != 1:
+                    results.append(f"unverified: {selector!r} matched {count}; skipped")
+                    continue
+                if not await el.is_editable():
+                    results.append(f"failed: {selector!r} is not editable")
+                    continue
+                if (await el.get_attribute("type") or "").casefold() == "password":
+                    results.append(f"protected: password field {selector!r} skipped")
+                    continue
+                await el.fill(str(value))
+                verified = await el.input_value() == str(value)
+                results.append(("verified" if verified else "unverified") + f": {selector!r}")
             except Exception as e:
                 results.append(f"✗ {selector}: {e}")
         return "Form filled: " + ", ".join(results)
 
     async def smart_click(self, description: str) -> str:
         page = await self._get_page()
+        before = await self._page_state(page)
         for role in ("button", "link", "searchbox", "textbox", "menuitem", "tab"):
             try:
                 loc = page.get_by_role(role, name=description)
-                if await loc.count() > 0:
-                    await loc.first.click(timeout=5_000)
-                    return f"Clicked ({role}): '{description}'"
+                count = await loc.count()
+                if count > 1:
+                    return f"Multiple {role} controls match {description!r}; specify a more specific label."
+                if count == 1:
+                    return await self._click_unique(page, loc, before, f"{role} {description}")
             except Exception:
                 pass
-        for attempt in (
-            lambda: page.get_by_text(description, exact=False).first.click(timeout=5_000),
-            lambda: page.get_by_placeholder(description, exact=False).first.click(timeout=5_000),
-            lambda: page.locator(
-                f'[alt*="{description}" i],[title*="{description}" i],'
-                f'[aria-label*="{description}" i]'
-            ).first.click(timeout=5_000),
-        ):
+        for loc in (page.get_by_text(description, exact=False),
+                    page.get_by_placeholder(description, exact=False),
+                    page.get_by_role("img", name=description)):
             try:
-                await attempt()
-                return f"Clicked: '{description}'"
+                count = await loc.count()
+                if count > 1:
+                    return f"Multiple page elements match {description!r}; specify a more specific label."
+                if count == 1:
+                    return await self._click_unique(page, loc, before, description)
             except Exception:
-                pass
+                continue
         return f"Could not find element: '{description}'"
+
+    async def _click_unique(self, page, loc, before: tuple, label: str) -> str:
+        count = await loc.count()
+        if count != 1:
+            return f"Target {label!r} matched {count} elements; no click was made."
+        try:
+            if not await loc.is_visible() or not await loc.is_enabled():
+                return f"Target {label!r} is not visible and enabled."
+            details = await loc.evaluate("""el => {
+              const form = el.form || el.closest('form');
+              return {text: (el.innerText || el.value || '').slice(0,120),
+                aria: el.getAttribute('aria-label') || '',
+                title: el.getAttribute('title') || '',
+                type: (el.getAttribute('type') || '').toLowerCase(),
+                role: (el.getAttribute('role') || '').toLowerCase(),
+                method: form ? (form.method || 'get').toLowerCase() : '',
+                searchForm: !!(form && (form.role === 'search' ||
+                  form.querySelector('input[type=search], [role=searchbox]')))};
+            }""")
+            semantics = " ".join(str(v) for v in details.values()).casefold()
+            risky = ("send", "submit", "delete", "remove", "purchase", "buy",
+                     "place order", "pay", "transfer", "share", "install",
+                     "allow access", "disable security")
+            if (any(term in semantics for term in risky)
+                    or (details.get("type") == "submit" and not details.get("searchForm")
+                        and details.get("method") == "post")):
+                return "CONFIRM_REQUIRED: " + str(details.get("aria") or details.get("text") or label)[:80]
+            await loc.click(timeout=8_000)
+            await asyncio.sleep(0.25)
+            after = await self._page_state(page)
+            if after != before:
+                return f"Clicked {label!r}; verified page state changed."
+            return outcome.unverified("browser_control",
+                                      f"clicked {label!r}, but no page-state change was observed")
+        except Exception as exc:
+            return outcome.failed("browser_control", f"click on {label!r} failed: {exc}")
+
+    @staticmethod
+    async def _page_state(page) -> tuple:
+        try:
+            title = await page.title()
+            text = await page.locator("body").inner_text(timeout=2_000)
+            return (page.url, title, text[:4000])
+        except Exception:
+            return (page.url, "", "")
 
     async def smart_type(self, description: str, text: str) -> str:
         page = await self._get_page()
@@ -1010,12 +1097,23 @@ class _BrowserSession:
         ]
         for method, loc in candidates:
             try:
-                el = loc.first
-                if await el.count() == 0:
+                count = await loc.count()
+                if count == 0:
                     continue
-                await el.clear()
-                await el.type(text, delay=50)
-                return f"Typed into ({method}): '{description}'"
+                if count > 1:
+                    return f"Multiple inputs match {description!r}; no text was entered."
+                el = loc
+                if not await el.is_editable():
+                    continue
+                if (await el.get_attribute("type") or "").casefold() == "password":
+                    return "Password fields are protected. Enter credentials yourself."
+                await el.fill(str(text))
+                value = await el.input_value()
+                if value == str(text):
+                    return outcome.done("browser_control", field=description,
+                                        method=method, verified=True)
+                return outcome.unverified("browser_control",
+                                          f"text in {description!r} did not read back exactly")
             except Exception:
                 continue
         return f"Could not find input: '{description}'"
@@ -1196,16 +1294,44 @@ def _unknown_action(action: str) -> str:
         valid_actions=", ".join(_ACTIONS))
 
 
-def browser_control(
+def _browser_control_impl(
     parameters:    dict = None,
     response=None,
     player=None,
     session_memory=None,
+    _approved_internal: bool = False,
 ) -> str:
     params  = parameters or {}
     action  = params.get("action", "").lower().strip()
     browser = params.get("browser", "").lower().strip() or None
     result  = _unknown_action(action)
+
+    # A visible label/selector that implies a consequential click is never
+    # trusted as permission by itself. The person approves it in the HUD.
+    target_text = " ".join(str(params.get(k) or "") for k in
+                           ("text", "description", "selector")).casefold()
+    sensitive_terms = ("send", "submit", "delete", "remove", "purchase", "buy",
+                       "place order", "pay", "transfer", "share", "install",
+                       "allow access", "disable security", "login", "log in",
+                       "sign in", "authenticate")
+    needs_confirm = (
+        (action in ("click", "smart_click")
+         and any(term in target_text for term in sensitive_terms))
+        or action in ("close", "close_all", "close_tab")
+    )
+    if not _approved_internal and needs_confirm:
+        from core import confirm
+        if confirm.pending_title():
+            return "Another confirmation is already waiting. I have not clicked anything."
+        label = (params.get("description") or params.get("text") or
+                 params.get("selector") or "the requested control")
+        return confirm.request(
+            key="browser-consequential-click",
+            title=f"Confirm browser action: {str(label)[:70]}?",
+            detail="Review the current browser page before approving this action.",
+            run=lambda: browser_control(params, player=player,
+                                        _approved_internal=True),
+        )
 
     if action == "switch":
         target = browser or params.get("target", "").lower().strip()
@@ -1321,6 +1447,20 @@ def browser_control(
         else:
             result = _unknown_action(action)
 
+        if str(result).startswith("CONFIRM_REQUIRED:") and not _approved_internal:
+            from core import confirm
+            if confirm.pending_title():
+                result = "Another confirmation is already waiting; no browser action was performed."
+            else:
+                label = str(result).split(":", 1)[-1].strip()
+                result = confirm.request(
+                    key="browser-consequential-submit",
+                    title=f"Confirm browser action: {label}?",
+                    detail="Review the current page and intended effect before approving.",
+                    run=lambda: browser_control(params, player=player,
+                                                _approved_internal=True),
+                )
+
     except concurrent.futures.TimeoutError:
         result = f"Browser action '{action}' timed out (60s)."
     except Exception as e:
@@ -1328,6 +1468,31 @@ def browser_control(
 
     _log(player, result)
     return result
+
+
+def browser_control(parameters: dict = None, response=None, player=None,
+                    session_memory=None, _approved_internal: bool = False) -> str:
+    params = parameters or {}
+    action = str(params.get("action") or "").lower().strip()
+    # Browser DOM operations share the central action lock with native input,
+    # so two voice/tool calls cannot race the foreground application.
+    from core import desktop_control
+    try:
+        with desktop_control.action(f"browser:{action}"):
+            if player:
+                try:
+                    player.set_desktop_control_status(desktop_control.snapshot())
+                except Exception:
+                    pass
+            result = _browser_control_impl(params, response=response, player=player,
+                                           session_memory=session_memory,
+                                           _approved_internal=_approved_internal)
+            desktop_control.report(f"browser:{action}", str(result)[:140])
+            if player:
+                player.set_desktop_control_status(desktop_control.snapshot())
+            return result
+    except RuntimeError as exc:
+        return str(exc)
 
 
 def _log(player, text: str):
@@ -1366,10 +1531,11 @@ TOOL = {
         "'click' with a 'selector' needs a CSS selector that is exactly right "
         "for that site's markup, which is not something to guess at; use it "
         "only when the selector is known. "
-        "For a job on a page that takes several steps - open a site, then find "
-        "and click something on it - call 'screen_agent' instead: it plans the "
-        "steps, calls this tool for each of them, and checks after every one "
-        "that it actually worked. "
+        "Use screen_agent for native desktop controls. This tool is for web "
+        "pages and uses the DOM/accessibility roles instead of screenshot "
+        "coordinates. Each click/read/entry is checked against current page "
+        "state; ambiguous matches are refused. Consequential buttons and form "
+        "submissions pause for on-screen user confirmation. "
         "Read the status it returns. 'done' means it was confirmed - for an "
         "open, the url reported back is the page's OWN address, so if it "
         "differs from what was asked for the site redirected and the user "
