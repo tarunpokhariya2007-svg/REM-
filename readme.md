@@ -79,11 +79,11 @@ It's not just an assistant — it's an extension of your digital life.
 | 🌙 Quiet Hours | A window in which nothing unprompted speaks. What you set for an exact time still does |
 | 🛰️ Command-Center HUD | Glass panels, ring gauges, network sparkline, a transcript-style log and one TASKS / ROUTINES panel |
 | ⚛️ 3-D Reactor Core | A depth-cued sphere with gyro rings, drawn in software at ~5 ms a frame — the classic face is still one setting away |
-| 🧑‍🎤 Holographic Avatar | An animated human head in the HUD — real facial geometry, lit and drawn in software, no GPU or extra packages |
-| 👄 Real Lip-Sync | ~50 mouth shapes a second from the audio's formants **and** the transcript — closures, spreads and rounds, not a volume meter |
-| 🌍 Language-Free Mouth | Articulation is derived by Unicode reduction, so Latin, Cyrillic and Greek scripts all work from one rule set — and scripts that hide pronunciation fall back cleanly |
-| 🙂 Facial Acting | Brows track the phrase, gaze saccades between fixations, natural blinking, a small nod on stressed syllables |
-| 😐 Face as Status | Looks away while thinking, meets your eyes while listening, lids fall while asleep, glances down at new content |
+| 🩵 Rem Particle Portrait | Rem's supplied portrait remains on screen while playback-synchronized viseme and blink layers animate |
+| 👄 Playback-Driven Mouth | The particle portrait uses the speaker PCM's 20 ms formant frames plus transcript-derived viseme classes; Live provides no word timestamps here, so alignment is approximate |
+| 🌍 Hindi and Mixed-Script Poses | Devanagari grapheme classes and Latin text classes share the same PCM timing; Hindi schwa handling and Hinglish articulation remain approximations |
+| 🙂 Facial Acting | Independent variable-interval blinks and local mouth poses are layered over the original particle artwork |
+| 😐 Face as Status | The same portrait remains visible in every state; only mouth poses, blinks, particle shimmer and the status indicators change |
 | 🎚️ Push-to-Talk | Hold **Ctrl+Space** and the mic opens — closed the rest of the time. Truly global on Windows, window-scoped elsewhere |
 | 🔇 Self-Echo Guard | Never answers its own last sentence: the tail of its own voice is recognised and dropped without muting you |
 | 🪪 Runtime Self-Knowledge | Name, OS, abilities **and limits** are generated from the live system each session — rename it or add a plugin and it knows |
@@ -698,7 +698,7 @@ This is not only tidiness. Every bundled skill is declared to the model on **eve
 * **Every launch paid 201 ms for a plugin nobody had asked to use.** Discovery executes every file in `plugins/`, and `youtube_video` imported `requests` and `youtube_transcript_api` at module scope. Deferring one of them would have saved nothing — the transcript library imports `requests` itself. Both are now checked with `find_spec`, which answers "is it installed?" without executing anything, and loaded on first use: **plugin discovery 211 ms → 39 ms**.
 * A plugin that needed a file from a **newer Mark** was rejected with *"pip install core"*. The loader could not tell this project's own packages from a third-party one, so it told people to install a same-named stranger from an index — wrong, and a supply-chain hazard dressed up as a fix. First-party names now say the app is behind the plugin and that there is nothing to install.
 
-> Built on the Mark LI–LV foundation: the **🧑‍🎤 Holographic Avatar**, **👄 Lip-Sync**, **🎚️ Push-to-Talk**, **🔇 Self-Echo Guard**, **🧩 Plugin System**, **♾️ Unlimited Sessions**, **🎨 Live Theming** and **🎙️ Wake Word** are all still here.
+> Built on the Mark LI–LV foundation: the **🩵 Rem Particle Portrait** with playback-PCM-driven mouth poses and natural blinks, **🎚️ Push-to-Talk**, **🔇 Self-Echo Guard**, **🧩 Plugin System**, **♾️ Unlimited Sessions** and **🎨 Live Theming** are all still here.
 
 ---
 
@@ -808,7 +808,7 @@ It is held in memory only, deliberately: writing it to disk would make a fresh l
 | **LI** | Plugin system · affective dialog · proactive audio · unlimited sessions |
 | **LII** | Voice picker · live theming · reactive HUD · recallable memory · undo · real confirmation · audio device picker · session continuity |
 | **LIII** | Wake word · Gemini 3.1 Flash Live · instant acknowledgment · self-describing action/plugin architecture |
-| **LIV** | Holographic avatar · viseme lip-sync · facial acting · face-as-status · push-to-talk · self-echo guard · runtime self-knowledge & limits |
+| **LIV** | Rem particle portrait · PCM-synchronized visemes · Hindi script classes · natural blinks · face-as-status · push-to-talk · self-echo guard · runtime self-knowledge & limits |
 | **LV** | Video on the HUD · model ladder with measured fallback · split settings drawers · trimmed bundled skill list |
 | **LVI** | Choose your engine · local & third-party models · Whisper + Piper in ~50 languages · language-following voice · ElevenLabs · tool budget for small models · verified outcomes instead of claimed ones · close an app by name · untrusted-content boundary · platform honesty on Wayland and macOS · hardened phone dashboard |
 | *shared* | The last five above also shipped to LIII, LIV and LV at the same time — moving up a Mark never loses them |
@@ -878,7 +878,9 @@ Mark LVII/
 ├── gui/                      # The HUD itself
 │   ├── theme.py              # Palette, config, constants, version
 │   ├── style.py              # Fonts by family fallback, blends, chamfers, button styles
-│   ├── hud.py                # The centre canvas — backdrop, reactor or face, waveform, state
+│   ├── hud.py                # The centre canvas — backdrop, Rem portrait or reactor, waveform, state
+│   ├── assets/rem_particle_portrait.png  # Still portrait for idle state
+│   ├── assets/rem_flow_speaking.mp4      # Supplied reference clip; not used for dynamic lip-sync
 │   ├── reactor.py            # 3-D reactor core — depth-cued projection, cached static layers
 │   ├── widgets.py            # Glass panels, gauges, sparkline, log, task and routine rows
 │   ├── window.py             # MainWindow — header, columns, drawers, content panel
@@ -993,10 +995,11 @@ Mark LVII/
 │   ├── gemini.py             # One place for every one-shot Gemini call — model ladder, timeouts,
 │   │                         #   cooldowns, and the configured provider as one more rung
 │   ├── prompt.txt            # All prompt wording — {tokens} are filled from the live system at startup
-│   ├── avatar.py             # Avatar renderer — lighting, pose, expression, mouth (QPainter)
-│   ├── avatar_mesh.py        # Head geometry — loads the face, generates skull/neck/rigs
-│   ├── face_model.obj        # The face itself (MediaPipe canonical model, Apache-2.0, 25 KB)
-│   ├── viseme.py             # Transcript → mouth shapes, fused with the audio's timing
+│   ├── rem_avatar.py         # Active particle portrait with PCM-driven visemes and natural blinks
+│   ├── avatar.py             # Legacy inactive mesh avatar renderer
+│   ├── avatar_mesh.py        # Legacy human-head geometry used by avatar.py
+│   ├── face_model.obj        # Legacy MediaPipe face mesh data
+│   ├── viseme.py             # Transcript script classes fused with playback-PCM timing and formants
 │   ├── echo.py               # Tells your voice from the assistant's own echo; self-calibrating
 │   ├── hotkey.py             # Push-to-talk chord — global on Windows, windowed fallback elsewhere
 │   ├── undo.py               # One shared undo stack — actions register how to reverse themselves

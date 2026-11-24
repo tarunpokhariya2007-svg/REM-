@@ -19,11 +19,11 @@ import psutil
 from PyQt6.QtCore import (
     QEasingCurve, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
     QPoint, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, Qt, QTimer,
-    QUrl, pyqtSignal,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
+    QFontDatabase, QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
 
 from gui.theme import (
     C,
-    HoloAvatar,
+    RemParticleAvatar,
     qcol,
 )
 
@@ -59,12 +59,12 @@ class HudCanvas(QWidget):
         self.state    = "INITIALISING"
         self._assistant_name = assistant_name
 
-        # The holographic head that fills the HUD. If it could not be imported
+        # The particle portrait that fills the HUD. If it could not be imported
         # we fall back to the old glowing core so the panel is never empty.
         self._avatar = None
-        if HoloAvatar is not None:
+        if RemParticleAvatar is not None:
             try:
-                self._avatar = HoloAvatar()
+                self._avatar = RemParticleAvatar()
             except Exception:
                 self._avatar = None
 
@@ -95,11 +95,12 @@ class HudCanvas(QWidget):
         self._tgt_halo   = 55.0
         self._last_t     = time.time()
         self._step_t     = time.time()
-        self._blink      = True
-        self._blink_tick = 0
+        # This is a small HUD status pulse, not a portrait blink.
+        self._pulse_on   = True
+        self._pulse_tick = 0
 
-        # Rescaled-face cache: the smooth rescale is expensive, so we keep the
-        # last result and only rebuild it when the (quantised) size changes.
+        # The portrait renderer caches its source-resolution particle field;
+        # Qt scales that stable image to the current panel size during painting.
 
         # Static grid-dot layer, pre-rendered once per size/theme into a pixmap
         # so paintEvent blits it in one call instead of thousands of drawPoint()s.
@@ -124,7 +125,7 @@ class HudCanvas(QWidget):
         self._tmr.start(16)
 
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
-        """Ask the avatar to look somewhere for a moment (see HoloAvatar.glance)."""
+        """Ask the Rem portrait to look somewhere for a moment."""
         try:
             if self._avatar is not None:
                 self._avatar.glance(dx, dy, hold)
@@ -183,6 +184,16 @@ class HudCanvas(QWidget):
             self._vis_i = None
         except Exception:
             pass
+
+    def reset_avatar_motion(self) -> None:
+        """Clear queued articulation immediately after playback interruption."""
+        self._visemes = None
+        self._vis_i = None
+        self._live_amp = 0.0
+        self._amp_disp = 0.0
+        if self._avatar is not None:
+            self._avatar.reset_motion()
+        self.update()
 
     def set_audio_level(self, level: float) -> None:
         """Thread-safe entry point for the audio threads. Stores the louder of
@@ -293,9 +304,8 @@ class HudCanvas(QWidget):
         now = time.time()
 
         # ── Live audio reactivity ────────────────────────────────────────────
-        # A viseme schedule, if one is playing, gives both the level and the
-        # mouth shape for this exact instant; otherwise fall back to the peak
-        # level the audio threads pushed in.
+        # Playback levels and transcript visemes are anchored to the actual
+        # speaker schedule, then passed to the particle avatar below.
         v_open = v_wide = v_level = None
         v_seq = None
         sched = self._visemes
@@ -312,7 +322,11 @@ class HudCanvas(QWidget):
                 j = self._vis_i if self._vis_i is not None else i
                 v_seq = frames[max(0, j):i + 1]
                 self._vis_i = max(j, i + 1)
-                v_level, v_open, v_wide = frames[i]
+                fraction = max(0.0, min(1.0, (now - (t0 + i * hop)) / hop))
+                current = frames[i]
+                following = frames[min(i + 1, len(frames) - 1)]
+                v_level, v_open, v_wide = tuple(
+                    a + (b - a) * fraction for a, b in zip(current, following))
                 if v_seq:
                     peak = max(f[0] for f in v_seq)
                     if peak > self._live_amp:
@@ -327,8 +341,6 @@ class HudCanvas(QWidget):
         self._amp_disp += (self._live_amp - self._amp_disp) * 0.45
         amp = self._amp_disp
 
-        # The avatar animates off the very same smoothed level the waveform
-        # uses — one audio source, so the mouth can never drift out of sync.
         dt = now - self._step_t
         self._step_t = now
         # Integrated, not derived from absolute time: multiplying wall-clock by
@@ -337,11 +349,13 @@ class HudCanvas(QWidget):
         self._core_phase += min(0.10, max(0.0, dt))
 
         if self._avatar is not None and self.hud_style == "face":
-            self._avatar.step(dt, amp, speaking=self.speaking,
-                              muted=self.muted, state=self.state,
-                              v_open=v_open, v_wide=v_wide or 0.0,
-                              v_level=v_level, v_seq=v_seq,
-                              v_hop=(sched[2] if sched is not None else 0.02))
+            self._avatar.step(
+                dt,
+                openness=v_open,
+                width=v_wide,
+                level=v_level if v_level is not None else amp,
+                speaking=self.speaking,
+            )
         else:
             if self._reactor is not None:
                 self._reactor.step(dt, self.speaking,
@@ -372,13 +386,10 @@ class HudCanvas(QWidget):
             self._scale += (self._tgt_scale - self._scale) * sp
             self._halo  += (self._tgt_halo  - self._halo)  * sp
 
-        self._blink_tick += 1
-        if self._blink_tick >= 38:
-            self._blink = not self._blink
-            self._blink_tick = 0
-            _blinked = True
-        else:
-            _blinked = False
+        self._pulse_tick += 1
+        if self._pulse_tick >= 38:
+            self._pulse_on = not self._pulse_on
+            self._pulse_tick = 0
 
         # Repaint throttling — advancing the animation state above is cheap at
         # 60 Hz, but the paint is heavy. Active (speaking, audio, thinking) runs
@@ -389,8 +400,8 @@ class HudCanvas(QWidget):
         self._paint_tick = (self._paint_tick + 1) % 6
         active = (self.speaking or amp > 0.02
                   or self.state in ("THINKING", "PROCESSING"))
-        if _blinked or (self._paint_tick % 2 == 0 if active
-                        else self._paint_tick % 3 == 0):
+        if (self._paint_tick % 2 == 0 if active
+                else self._paint_tick % 3 == 0):
             # Nothing is on screen when the window is hidden or minimised, so
             # rendering the avatar into it is pure waste — and this app is meant
             # to sit running all day. The animation state above keeps stepping,
@@ -650,7 +661,7 @@ class HudCanvas(QWidget):
         tw = p.fontMetrics().horizontalAdvance(txt)
         p.setPen(QPen(col))
         p.drawText(QRectF(0, sy, W, 22), Qt.AlignmentFlag.AlignCenter, txt)
-        pulse = 0.85 if (self._blink or self.speaking or self.muted) else 0.40
+        pulse = 0.85 if (self._pulse_on or self.speaking or self.muted) else 0.40
         rule = min(110.0, W * 0.12)
         for sgn in (-1, 1):
             x0 = cx + sgn * (tw / 2 + 14)

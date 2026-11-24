@@ -210,15 +210,14 @@ class RemUI:
 
     def set_audio_level(self, level: float) -> None:
         """Thread-safe: feed a 0.0–1.0 live audio level to the HUD waveform.
-        Called from the audio threads; a plain float store is atomic under the
-        GIL, so no signal/lock is needed for this cosmetic value."""
+        Called from the audio threads and applied through the Qt main thread."""
         try:
-            self._win.hud.set_audio_level(level)
+            self._win._audio_level_sig.emit(float(level))
         except Exception:
             pass
 
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
-        """Ask the avatar to look somewhere for a moment (see HoloAvatar.glance)."""
+        """Ask the Rem portrait to look somewhere for a moment."""
         try:
             self._win.hud.glance(dx, dy, hold)
         except Exception:
@@ -245,9 +244,13 @@ class RemUI:
         for REM's own speech. `at` is the wall-clock time the batch begins to
         sound, not the time of the call. See HudCanvas.push_visemes()."""
         try:
-            self._win.hud.push_visemes(frames, hop, at)
+            self._win._viseme_sig.emit(list(frames), float(hop), float(at))
         except Exception:
             pass
+
+    def reset_avatar_motion(self) -> None:
+        """Thread-safe immediate articulation reset on an interrupted turn."""
+        self._win._avatar_reset_sig.emit()
 
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()

@@ -1,5 +1,5 @@
 """
-Text → mouth shape, fused with the audio the avatar is actually speaking.
+Text-derived mouth classes, fused with the audio the avatar is actually speaking.
 
 Why both sources
 ----------------
@@ -17,21 +17,19 @@ audio-only shape, which is what the previous version did on its own.
 
 Language independence
 ---------------------
-There is no per-language table here. Every character is reduced to one of the
-26 bare Latin letters — by Unicode decomposition for accents, by transliteration
-for Cyrillic and Greek — and articulation is looked up on that. So Turkish,
-English, German, French, Spanish, Polish, Vietnamese, Russian, Ukrainian and
-Greek all work from the same twenty-odd rules, and adding a language costs
-nothing because there is nothing to add.
+Latin text is reduced to bare Latin letters — by Unicode decomposition for
+accents and transliteration for Cyrillic and Greek — then mapped to coarse
+articulation classes. Devanagari uses a separate script-class table.
 
-Scripts whose spelling does not reveal pronunciation (CJK, Arabic, Devanagari,
-Hebrew, Thai) are detected by coverage and skipped, and the mouth runs on the
-audio-only shape — which is itself language-independent, being physics. The
-result is never wrong, only less detailed.
+Scripts whose spelling does not reveal pronunciation (CJK, Arabic, Hebrew,
+Thai) are detected by coverage and skipped. Playback formants provide timing
+and energy, but the text-to-shape schedule is a visual approximation, not
+phoneme recognition or forced alignment.
 """
 
 from __future__ import annotations
 
+import os
 import unicodedata
 from collections import deque
 
@@ -65,9 +63,8 @@ _DUR = {"REST": 1.0, "AA": 1.15, "E": 1.05, "I": 1.0, "O": 1.1, "U": 1.05,
 #     which covers every Latin-script language at once rather than one at a time;
 #   * letters that do not decompose get a short explicit entry below;
 #   * Cyrillic and Greek transliterate into the same 26 letters.
-# Anything else — CJK, Arabic, Devanagari, Hebrew, Thai — is not derivable from
-# its written form without a pronunciation dictionary, so those simply fall back
-# to the audio-only mouth. That is a clean degradation, not a missing language.
+# Devanagari is mapped by grapheme class below. Other scripts with no
+# pronunciation mapping fall back to audio-only articulation.
 _LETTER = {
     "a": "AA",
     "e": "E",
@@ -106,6 +103,28 @@ _GREEK = {
     "φ": "f", "χ": "h", "ψ": "s", "ω": "o",
 }
 
+# Devanagari grapheme classes by visible articulation. Aspirated consonants
+# share their place-of-articulation pose; aspiration is not visually distinct.
+_DEVANAGARI = {
+    "अ": "AA", "आ": "AA", "इ": "I", "ई": "I", "उ": "U", "ऊ": "U",
+    "ऋ": "R", "ॠ": "R", "ऌ": "L", "ॡ": "L", "ए": "E", "ऐ": "AA",
+    "ओ": "O", "औ": "O",
+    "ा": "AA", "ि": "I", "ी": "I", "ु": "U", "ू": "U", "ृ": "R",
+    "ॄ": "R", "ॢ": "L", "ॣ": "L", "े": "E", "ै": "AA", "ो": "O", "ौ": "O",
+    "क": "K", "ख": "K", "ग": "K", "घ": "K", "ङ": "K",
+    "क़": "K", "ख़": "K", "ग़": "K",
+    "च": "S", "छ": "S", "ज": "S", "झ": "S", "ञ": "S", "ज़": "S",
+    "ट": "TD", "ठ": "TD", "ड": "TD", "ढ": "TD", "ण": "TD", "ड़": "R", "ढ़": "R",
+    "त": "TD", "थ": "TD", "द": "TD", "ध": "TD", "न": "TD",
+    "प": "MBP", "फ": "MBP", "ब": "MBP", "भ": "MBP", "म": "MBP", "फ़": "FV",
+    "य": "I", "र": "R", "ल": "L", "व": "FV", "श": "S", "ष": "S",
+    "स": "S", "ह": "FV", "ळ": "L", "ं": "MBP", "ँ": "MBP", "ः": "FV",
+}
+_DEVANAGARI_CONSONANTS = set(
+    "कखगघङक़ख़ग़चछजझञज़टठडढणड़ढ़तथदधनपफबभमफ़यरलवशषसहळ"
+)
+_DEVANAGARI_LONG = set("आ ई ऊ ॠ ॡ ऐ औ ा ी ू ॄ ॣ ै ौ".split())
+
 # Below this share of mappable letters the text is in a script we cannot read
 # phonetically, and forcing shapes onto it would be worse than not trying.
 _MIN_COVERAGE = 0.55
@@ -120,7 +139,21 @@ _DIGRAPH = {
     "qu": "K",
 }
 
-_PAUSE = set(".,;:!?…\n")
+_PAUSE = set(".,;:!?…।॥\n")
+_AVATAR_DEBUG = os.environ.get("REM_AVATAR_DEBUG", "").lower() in {
+    "1", "true", "yes", "on",
+}
+
+
+def language_mode(text: str) -> str:
+    """Coarse script mode for optional diagnostics, not speech recognition."""
+    has_devanagari = any("\u0900" <= ch <= "\u097f" for ch in text or "")
+    has_latin = any("a" <= ch.lower() <= "z" for ch in text or "")
+    if has_devanagari and has_latin:
+        return "HINGLISH"
+    if has_devanagari:
+        return "HINDI"
+    return "ENGLISH" if has_latin else "OTHER"
 
 
 def to_latin(ch: str) -> str:
@@ -153,14 +186,14 @@ def coverage(text: str) -> float:
     letters = [c for c in (text or "") if c.isalpha()]
     if not letters:
         return 0.0
-    return sum(1 for c in letters if to_latin(c)) / len(letters)
+    return sum(1 for c in letters if to_latin(c) or c in _DEVANAGARI) / len(letters)
 
 
 def text_to_visemes(text: str) -> list[tuple[str, float]]:
     """Split a line of speech into (viseme, duration-weight) pairs.
 
-    Returns [] for scripts whose written form does not reveal pronunciation, so
-    the caller falls back to the audio-only mouth instead of miming nonsense.
+    Returns [] when the text is mostly outside the supported Latin, Cyrillic,
+    Greek and Devanagari mappings; the caller then uses playback audio alone.
     """
     s = (text or "").lower()
     if coverage(s) < _MIN_COVERAGE:
@@ -172,6 +205,43 @@ def text_to_visemes(text: str) -> list[tuple[str, float]]:
         ch = s[i]
         if ch in _PAUSE:
             out.append(("REST", 1.4))
+            i += 1
+            continue
+        if ch in _DEVANAGARI_CONSONANTS:
+            v = _DEVANAGARI[ch]
+            i += 1
+            out.append((v, _DUR[v]))
+            if i < n and s[i] == "़":
+                i += 1
+            if i < n and s[i] == "्":
+                i += 1
+                if i < n and s[i] in "\u200c\u200d":
+                    i += 1
+                continue
+            if i < n and s[i] in _DEVANAGARI_LONG:
+                # Long vowel signs receive a modestly longer target duration.
+                vowel = _DEVANAGARI[s[i]]
+                out.append((vowel, _DUR[vowel] * 1.2))
+                i += 1
+            elif i < n and s[i] in _DEVANAGARI and s[i] not in _DEVANAGARI_CONSONANTS:
+                vowel = _DEVANAGARI[s[i]]
+                if vowel not in ("REST", "MBP"):
+                    out.append((vowel, _DUR[vowel]))
+                i += 1
+            elif i < n and s[i] in _DEVANAGARI_CONSONANTS:
+                # Approximate the inherent schwa between consonants. Word-final
+                # schwa is omitted; deletion elsewhere varies regionally.
+                out.append(("AA", _DUR["AA"] * 0.75))
+            continue
+
+        if ch in _DEVANAGARI:
+            v = _DEVANAGARI[ch]
+            i += 1
+            if v != "REST":
+                out.append((v, _DUR[v] * (1.2 if ch in _DEVANAGARI_LONG else 1.0)))
+            continue
+        # Halant, ZWJ/ZWNJ and combining signs have no independent mouth pose.
+        if "\u0900" <= ch <= "\u097f" and not ch.isalpha():
             i += 1
             continue
         if ch.isspace():
@@ -221,6 +291,7 @@ class VisemeStream:
         self._q: deque[tuple[str, float]] = deque()
         self._cur = ("REST", 1.0)
         self._carry = 0.0
+        self._debug_language = ""
 
     def reset(self) -> None:
         self._q.clear()
@@ -228,7 +299,13 @@ class VisemeStream:
         self._carry = 0.0
 
     def feed_text(self, text: str) -> None:
-        for item in text_to_visemes(text):
+        mode = language_mode(text)
+        items = text_to_visemes(text)
+        if _AVATAR_DEBUG and mode != self._debug_language:
+            self._debug_language = mode
+            print(f"[Avatar] language={mode} text_visemes={len(items)} "
+                  "sync=text-viseme+playback-PCM (approximate)")
+        for item in items:
             self._q.append(item)
         # Never let a stalled turn pile up an unbounded backlog.
         while len(self._q) > 600:

@@ -101,6 +101,9 @@ from gui.widgets import (ArcLogo, CommandFrame, DataRow, HeaderBar, HoloPanel, I
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
+    _viseme_sig     = pyqtSignal(object, float, float)
+    _audio_level_sig = pyqtSignal(float)
+    _avatar_reset_sig = pyqtSignal()
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _codejob_sig    = pyqtSignal(object)     # dev_agent job state — live coding panel
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
@@ -399,6 +402,9 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
+        self._viseme_sig.connect(self._apply_visemes)
+        self._audio_level_sig.connect(self._apply_audio_level)
+        self._avatar_reset_sig.connect(self.hud.reset_avatar_motion)
         self._content_sig.connect(self._show_content)
         self._codejob_sig.connect(self._show_code_job)
         self._reconfig_sig.connect(self._show_setup)
@@ -2937,6 +2943,12 @@ class MainWindow(QMainWindow):
         self.hud.speaking = (state == "SPEAKING")
         if hasattr(self, "_state_chip"):
             self._state_chip.set_state(state)
+
+    def _apply_visemes(self, frames, hop: float, at: float) -> None:
+        self.hud.push_visemes(frames, hop, at)
+
+    def _apply_audio_level(self, level: float) -> None:
+        self.hud.set_audio_level(level)
 
     def _check_config(self) -> bool:
         d = _read_full_config()

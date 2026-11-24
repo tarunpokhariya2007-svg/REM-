@@ -10,8 +10,8 @@ Two things it deliberately does NOT install:
   * the optional local wake word (see the README for its bundled-model phrase
     limitation) — one-click, opt-in, from
     ⚙ → WAKE WORD inside the app;
-  * anything for the avatar — the holographic head renders in software on the
-    PyQt6 and numpy already listed here. No GPU, no OpenGL, no extra packages.
+  * anything for the avatar — the Rem portrait renderer uses the existing
+    PyQt6 stack. No GPU, no OpenGL, no extra packages.
 """
 import platform
 import subprocess
@@ -57,11 +57,11 @@ def _check_python() -> None:
 
 
 def _check_assets() -> None:
-    """The avatar's face is a shipped file; a truncated clone should say so."""
-    face = HERE / "core" / "face_model.obj"
-    if not face.exists() or face.stat().st_size < 4096:
+    """Check that the active particle portrait is present."""
+    portrait = HERE / "gui" / "assets" / "rem_particle_portrait.png"
+    if not portrait.exists() or portrait.stat().st_size < 4096:
         print(
-            "\n⚠️  core/face_model.obj is missing or truncated — the avatar will "
+            "\n⚠️  gui/assets/rem_particle_portrait.png is missing or truncated — the avatar will "
             "fall back to the plain glowing core.\n"
             "    Re-clone the repository, or fetch that one file again."
         )

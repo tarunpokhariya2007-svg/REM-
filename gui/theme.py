@@ -60,9 +60,9 @@ from PyQt6.QtWidgets import (
 )
 
 try:
-    from core.avatar import HoloAvatar
+    from core.rem_avatar import RemParticleAvatar
 except Exception:      # pragma: no cover — HUD must never die over cosmetics
-    HoloAvatar = None
+    RemParticleAvatar = None
 
 
 def _base_dir() -> Path:

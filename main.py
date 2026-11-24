@@ -44,6 +44,7 @@ except Exception as _e:
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import os
 import re
 import threading
 import time
@@ -149,8 +150,8 @@ def _pcm_level(samples) -> float:
 # The avatar's mouth used to be driven by one RMS value per ~200 ms write batch,
 # which is five updates a second averaged over a fifth of a second — it could
 # only ever flap. These read the *shape* of each 20 ms slice straight from the
-# spectrum of the audio being played, so no transcript, no forced alignment and
-# no language assumption: it works the same for Turkish and English.
+# speaker PCM. Transcript-derived classes add rough language-aware articulation;
+# neither source provides phoneme-level recognition/alignment.
 #
 # Two numbers come out. Openness tracks the first formant — F1 climbs as the jaw
 # drops, so /a/ reads open and /i/ or /u/ read closed. Width tracks the second —
@@ -188,6 +189,19 @@ _FIRST_SOUND = CHUNK_SIZE / RECEIVE_SAMPLE_RATE      # ~43 ms
 # is re-anchored. The buffer is the hard limit on how much audio can be queued
 # ahead, so anything beyond it plus a margin for clock error is impossible.
 _CURSOR_SLACK = 0.15
+
+# Keep the avatar speaking through short Live chunk gaps. A real playback
+# cursor and the audio queue remain the primary completion check; this grace is
+# only for gaps while a turn is still arriving.
+try:
+    _AVATAR_AUDIO_GAP_GRACE = float(os.environ.get(
+        "REM_AVATAR_AUDIO_GAP_GRACE", "1.0"))
+except ValueError:
+    _AVATAR_AUDIO_GAP_GRACE = 1.0
+_AVATAR_AUDIO_GAP_GRACE = max(0.9, min(1.2, _AVATAR_AUDIO_GAP_GRACE))
+_AVATAR_DEBUG = os.environ.get("REM_AVATAR_DEBUG", "").lower() in {
+    "1", "true", "yes", "on",
+}
 
 # Erring early is the safe direction. A viewer tolerates a mouth that moves
 # slightly before the sound far better than one that moves after it — the
@@ -1246,9 +1260,19 @@ class RemLive:
         """True while the speakers may still be finishing our last sentence."""
         return time.monotonic() < self._tail_until
 
-    def set_speaking(self, value: bool):
+    def set_speaking(self, value: bool, reason: str = "playback"):
         with self._speaking_lock:
+            changed = self._is_speaking != bool(value)
             self._is_speaking = value
+        if changed and _AVATAR_DEBUG:
+            qsize = self.audio_in_queue.qsize() if self.audio_in_queue is not None else 0
+            remain = max(0.0, self._play_cursor - time.time())
+            state = ("INTERRUPTED" if reason == "interrupted" else
+                     ("SPEAKING" if value else "IDLE"))
+            print(f"[Avatar] state={state} reason={reason} audio_queue={qsize} "
+                  f"playback_cursor_remaining_ms={remain * 1000:.0f} "
+                  f"device_latency_ms={self._out_latency * 1000:.0f} "
+                  "sync=text-viseme+playback-PCM")
         if value:
             self._tail_until = 0.0
         else:
@@ -1347,10 +1371,11 @@ class RemLive:
                     break
             if drained:
                 print(f"[REM] ✋ Interrupted — {drained} audio chunks discarded")
-        self.set_speaking(False)
+        self.set_speaking(False, reason="interrupted")
         # The words we were about to mouth are never going to be spoken now.
         self._visemes.reset()
         self._play_cursor = 0.0     # next batch starts a fresh timeline
+        self.ui.reset_avatar_motion()
         if self._turn_done_event:
             self._turn_done_event.clear()
         # Draining the queue stops the speakers, but a local engine is still
@@ -2139,6 +2164,7 @@ class RemLive:
         except Exception:
             pass
 
+        last_audio_write = time.monotonic()
         try:
             while True:
                 try:
@@ -2152,8 +2178,29 @@ class RemLive:
                         and self._turn_done_event.is_set()
                         and self.audio_in_queue.empty()
                     ):
-                        self.set_speaking(False)
-                        self._turn_done_event.clear()
+                        # turn_complete means generation ended, not that the
+                        # final PCM has left the speaker buffer. Keep the avatar
+                        # active through the queued playback cursor, while
+                        # remaining responsive to new chunks or interruption.
+                        while (
+                            self._turn_done_event
+                            and self._turn_done_event.is_set()
+                            and self.audio_in_queue.empty()
+                            and not self._interrupted
+                            and time.time() < self._play_cursor
+                        ):
+                            await asyncio.sleep(min(0.025, max(
+                                0.001, self._play_cursor - time.time())))
+                        if (self._turn_done_event
+                                and self._turn_done_event.is_set()
+                                and self.audio_in_queue.empty()
+                                and not self._interrupted):
+                            self.set_speaking(False, reason="playback-drained")
+                            self._turn_done_event.clear()
+                    elif (self._is_speaking and self.audio_in_queue.empty()
+                          and time.monotonic() - last_audio_write >= _AVATAR_AUDIO_GAP_GRACE
+                          and time.time() >= self._play_cursor):
+                        self.set_speaking(False, reason="audio-gap-timeout")
                     continue
 
                 self.set_speaking(True)
@@ -2220,13 +2267,14 @@ class RemLive:
 
                 try:
                     await asyncio.to_thread(stream.write, bytes(batch))
+                    last_audio_write = time.monotonic()
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
         except Exception as e:
             print(f"[REM] ❌ Play: {e}")
             raise
         finally:
-            self.set_speaking(False)
+            self.set_speaking(False, reason="playback-stopped")
             stream.stop()
             stream.close()
 
