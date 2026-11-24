@@ -14,6 +14,7 @@ def get_base_dir() -> Path:
 BASE_DIR    = get_base_dir()
 CONFIG_DIR  = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "api_keys.json"
+_LEGACY_ASSISTANT_NAMES = {"jarvis"}
 
 def ensure_config_dir() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -103,7 +104,13 @@ def load_api_keys() -> dict:
     for attempt in range(3):
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
+            # Normalize only historical built-in names in memory; preserve
+            # stored data on disk and leave all custom assistant names intact.
+            if str(data.get("assistant_name", "")).strip().casefold() in _LEGACY_ASSISTANT_NAMES:
+                data["assistant_name"] = "REM"
+            return data
         except Exception as e:
             if attempt == 2:
                 # Plain text: an emoji here raised UnicodeEncodeError on a
@@ -120,10 +127,21 @@ def is_configured() -> bool:
     key = get_gemini_key()
     return bool(key and len(key) > 15)
 
+def normalize_assistant_name(name: str = "") -> str:
+    """Normalize legacy assistant names to REM while preserving custom names."""
+    name = str(name or "").strip()
+
+    if not name or name.casefold() in _LEGACY_ASSISTANT_NAMES:
+        return "REM"
+
+    return name
+
 
 def get_assistant_name() -> str:
-    """Return the configured assistant name, or 'JARVIS' if not set."""
-    return load_api_keys().get("assistant_name", "JARVIS") or "JARVIS"
+    """Return the configured assistant name, or REM if not set."""
+    return normalize_assistant_name(
+        load_api_keys().get("assistant_name", "REM")
+    )
 
 
 def get_user_name() -> str:
@@ -136,7 +154,7 @@ def save_assistant_config(assistant_name: str, user_name: str) -> None:
     """Persist assistant name and user name to config."""
     ensure_config_dir()
     data = _read_for_write()
-    data["assistant_name"] = assistant_name.strip() or "JARVIS"
+    data["assistant_name"] = assistant_name.strip() or "REM"
     data["user_name"] = user_name.strip()
     _write_config(data)
 
@@ -145,8 +163,7 @@ def save_assistant_config(assistant_name: str, user_name: str) -> None:
 # Gemini Live prebuilt voices. Names are proper nouns — identical in every
 # language, so this list is safe to show verbatim in any locale.
 AVAILABLE_VOICES = ["Charon", "Puck", "Kore", "Fenrir", "Aoede"]
-DEFAULT_VOICE    = "Charon"
-
+DEFAULT_VOICE = "Aoede"
 
 def get_voice() -> str:
     """Return the configured Live voice, falling back to the default if unset
@@ -167,7 +184,7 @@ def save_voice(voice_name: str) -> None:
 
 
 def get_wake_word_enabled() -> bool:
-    """Whether local wake-word gating is on (assistant sleeps until 'Hey Jarvis')."""
+    """Whether local wake-word gating is on (assistant sleeps until its wake phrase)."""
     return load_api_keys().get("wake_word_enabled", False)
 
 

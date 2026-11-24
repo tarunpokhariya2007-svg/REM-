@@ -88,6 +88,10 @@ from gui.providers_panel import (
 
 from PyQt6.QtWidgets import QGridLayout
 
+_LEGACY_AUTOSTART_WINDOWS = "JARVIS_AI"
+_LEGACY_AUTOSTART_MAC = "com.jarvis.assistant.plist"
+_LEGACY_AUTOSTART_LINUX = "jarvis.desktop"
+
 from gui.style import DISPLAY_CSS, btn_css, hud_font, px_font, scroll_css
 from gui.widgets import (ArcLogo, CommandFrame, DataRow, HeaderBar, HoloPanel, IconButton,
                          PanelText, RingGauge, RoutineRow, Sparkline, StateChip, StatusStrip,
@@ -124,7 +128,7 @@ class MainWindow(QMainWindow):
 
         # Load customization from config
         _cfg = _read_full_config()
-        self._assistant_name: str = (_cfg.get("assistant_name") or "JARVIS").strip()
+        self._assistant_name: str = (_cfg.get("assistant_name") or "REM").strip()
         _display = self._assistant_name.upper()
 
         # Apply the saved UI colour BEFORE panels/stylesheets are built
@@ -144,13 +148,13 @@ class MainWindow(QMainWindow):
 
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
-        self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
+        self.on_interrupt      = None   # callable: () -> None — stop REM mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
-        self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
-        self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
-        self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
+        self.get_plugins       = None   # callable: () -> list[dict], set by RemLive
+        self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by RemLive
+        self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by RemLive
         self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
         self.on_push_to_talk   = None   # callable: (enable: bool) -> str scope
         self.ptt_hold          = None   # callable: (held: bool) -> None — windowed chord
@@ -223,7 +227,7 @@ class MainWindow(QMainWindow):
         # inventing a second mechanism means the avatar, the camera and a video
         # can never be on screen at once.
         self._video_split = False        # is the sound a separate stream?
-        self._video_auto_muted = False   # did JARVIS close the mic, or the user?
+        self._video_auto_muted = False   # did REM close the mic, or the user?
         # A plain flag rather than reading the widget. video_is_playing() is
         # called from plugin threads, and reading a widget's state from one is
         # not something to rely on; an attribute is.
@@ -255,7 +259,7 @@ class MainWindow(QMainWindow):
             return b
 
         # Muted is the default and the button says so, because a soundtrack
-        # talking over JARVIS is the one way this feature could make the
+        # talking over REM is the one way this feature could make the
         # assistant worse rather than better.
         self._video_mute_btn = _vid_btn("🔇  SOUND OFF")
         self._video_mute_btn.clicked.connect(self._toggle_video_mute)
@@ -663,7 +667,7 @@ class MainWindow(QMainWindow):
     def _sync_mic_for_video(self) -> None:
         """Close the microphone while the video is making sound.
 
-        JARVIS subtracts its OWN output from the microphone — that is what
+        REM subtracts its OWN output from the microphone — that is what
         core/echo.py does — but a video plays through a different output
         entirely, so the guard has never heard of it and the assistant answers
         the film. There is no arrangement in which an open microphone and a
@@ -671,7 +675,7 @@ class MainWindow(QMainWindow):
 
         So the microphone closes for exactly as long as the sound is on, and
         opens again by itself the moment it goes off or the video is closed.
-        Only if JARVIS closed it: a microphone the user muted themselves stays
+        Only if REM closed it: a microphone the user muted themselves stays
         muted, and pressing the mute key during a video hands the decision back
         to them for good.
         """
@@ -784,9 +788,9 @@ class MainWindow(QMainWindow):
     # Icon generation — arc-reactor style, rendered with Pillow
     # ------------------------------------------------------------------
     @staticmethod
-    def _build_jarvis_icon(out_path: Path) -> bool:
+    def _build_rem_icon(out_path: Path) -> bool:
         """
-        Render a JARVIS arc-reactor icon at 4× resolution and downsample
+        Render a REM arc-reactor icon at 4× resolution and downsample
         for crisp results at all sizes. Saves a multi-res .ico to out_path.
         Returns True on success.
         """
@@ -899,7 +903,7 @@ class MainWindow(QMainWindow):
             sc.TargetPath       = target
             sc.Arguments        = f'"{args}"'
             sc.WorkingDirectory = work_dir
-            sc.Description      = "J.A.R.V.I.S AI Assistant"
+            sc.Description      = "REM AI Assistant"
             sc.IconLocation     = icon_loc
             sc.save()
             return
@@ -914,7 +918,7 @@ class MainWindow(QMainWindow):
             f'sc.TargetPath = "{target}"',
             f'sc.Arguments = Chr(34) & "{args}" & Chr(34)',
             f'sc.WorkingDirectory = "{work_dir}"',
-            'sc.Description = "J.A.R.V.I.S AI Assistant"',
+            'sc.Description = "REM AI Assistant"',
             f'sc.IconLocation = "{icon_loc}"',
             'sc.Save',
         ])
@@ -1026,9 +1030,9 @@ class MainWindow(QMainWindow):
         desktop = self._get_desktop_dir()
 
         # Arc-reactor icon (.ico — also exported as .png for Linux/macOS)
-        ico_path = Path(__file__).resolve().parent.parent / "config" / "jarvis.ico"
+        ico_path = Path(__file__).resolve().parent.parent / "config" / "rem.ico"
         if not ico_path.exists():
-            self._build_jarvis_icon(ico_path)
+            self._build_rem_icon(ico_path)
 
         try:
             _os = platform.system()
@@ -1037,14 +1041,14 @@ class MainWindow(QMainWindow):
             if _os == "Windows":
                 pythonw  = python.parent / "pythonw.exe"
                 target   = str(pythonw if pythonw.exists() else python)
-                lnk      = str(desktop / "J.A.R.V.I.S.lnk")
+                lnk      = str(desktop / "REM.lnk")
                 icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
                 self._create_lnk_windows(lnk, target, str(script),
                                          str(script.parent), icon_loc)
 
             # ── macOS — proper .app bundle (no Terminal window) ───────────────
             elif _os == "Darwin":
-                app     = desktop / "J.A.R.V.I.S.app"
+                app     = desktop / "REM.app"
                 mac_dir = app / "Contents" / "MacOS"
                 res_dir = app / "Contents" / "Resources"
                 mac_dir.mkdir(parents=True, exist_ok=True)
@@ -1052,7 +1056,7 @@ class MainWindow(QMainWindow):
 
                 # Launcher executable (bash — runs as background process,
                 # macOS does NOT open Terminal for executables inside .app bundles)
-                launcher = mac_dir / "JARVIS"
+                launcher = mac_dir / "REM"
                 launcher.write_text(
                     "#!/usr/bin/env bash\n"
                     f'cd "{script.parent}"\n'
@@ -1067,10 +1071,10 @@ class MainWindow(QMainWindow):
                     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
                     '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
                     '<plist version="1.0"><dict>\n'
-                    '  <key>CFBundleExecutable</key><string>JARVIS</string>\n'
+                    '  <key>CFBundleExecutable</key><string>REM</string>\n'
                     '  <key>CFBundleIdentifier</key>'
-                    '<string>com.jarvis.assistant</string>\n'
-                    '  <key>CFBundleName</key><string>J.A.R.V.I.S</string>\n'
+                    '<string>com.rem.assistant</string>\n'
+                    '  <key>CFBundleName</key><string>REM</string>\n'
                     '  <key>CFBundlePackageType</key><string>APPL</string>\n'
                     '  <key>CFBundleVersion</key><string>1.0</string>\n'
                     '</dict></plist>\n'
@@ -1108,10 +1112,10 @@ class MainWindow(QMainWindow):
                         png_path = ico_path  # fallback to .ico
 
                 icon_line = f"Icon={png_path}\n" if png_path.exists() else ""
-                desk = desktop / "J.A.R.V.I.S.desktop"
+                desk = desktop / "REM.desktop"
                 desk.write_text(
                     "[Desktop Entry]\n"
-                    "Name=J.A.R.V.I.S\n"
+                    "Name=REM\n"
                     f"Exec={python} {script}\n"
                     f"Path={script.parent}\n"
                     "Type=Application\n"
@@ -1284,7 +1288,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _subtitle(display: str) -> str:
         return ("Just A Rather Very Intelligent System"
-                if display.replace(".", "") == "JARVIS" else "Personal AI Assistant")
+                if display.replace(".", "") == "REM" else "Personal AI Assistant")
 
     def _fit_side_columns(self) -> None:
         """Side columns grow with the window, within limits, so the centre keeps
@@ -1651,8 +1655,8 @@ class MainWindow(QMainWindow):
         # The button is built here with the rest of the drawer; the panel behind
         # it — and the whole providers package — is imported on the click. The
         # drawer used to stutter for a measured 2.104 seconds because a state
-        # check imported openwakeword while it was being built, and adding a
-        # second thing that does that would undo the fix rather than repeat it.
+        # check imported the former wake engine while it was being built. The
+        # current phrase detector only checks package/model paths here.
         # "&&": a single & in a button label is Qt's shortcut marker, and it
         # was being drawn as an underscore — "ENGINE _PROVIDERS".
         _btn("🔌  ENGINE && PROVIDERS", self._open_providers)
@@ -1688,7 +1692,7 @@ class MainWindow(QMainWindow):
         self._wake_sleep_btn = _row(QPushButton())
         self._wake_sleep_btn.clicked.connect(self._tap_wake_manual)
         # Neutral until the real state lands from the background warm-up.
-        self._wake_btn.setText("🎙  WAKE WORD")
+        self._wake_btn.setText("🎙  WAKE PHRASE")
         self._wake_btn.setStyleSheet(self._BTN_DIM)
         self._wake_sleep_btn.hide()
 
@@ -1708,7 +1712,7 @@ class MainWindow(QMainWindow):
 
         It used to be resolved when the drawer opened, and that made opening the
         drawer take two seconds the first time — measured at 2.10s, all of it
-        `import openwakeword` dragging in onnxruntime behind it. The button
+        importing the former wake engine and its runtime. The button
         count had nothing to do with it; the Qt thread was simply waiting on an
         import. Afterwards the same check costs about a millisecond, so it only
         ever needed to happen somewhere other than in front of the user.
@@ -1974,7 +1978,7 @@ class MainWindow(QMainWindow):
     # while translating the tag would mean a table per language, which is worse.
     # A shape carries it in every language, and shape plus colour still reads
     # for someone who cannot separate red from amber. What the marks mean
-    # arrives the way everything else does: JARVIS says it out loud.
+    # arrives the way everything else does: REM says it out loud.
     _REVIEW_MARKS = {"serious": ("RED", "▲"), "caution": ("ACC2", "●"), "note": ("PRI_DIM", "·")}
 
     @staticmethod
@@ -2045,7 +2049,7 @@ class MainWindow(QMainWindow):
     # An interactive twin of the content panel. The plugin only ever hands over
     # questions; everything about asking, marking and reporting happens here,
     # and the finished result is pushed back into the conversation the same way
-    # a dropped file is — as a message JARVIS reads and responds to. That keeps
+    # a dropped file is — as a message REM reads and responds to. That keeps
     # the tool call short (it returns the moment the board is up) and leaves the
     # talking to the assistant, in the user's own language.
 
@@ -2202,7 +2206,7 @@ class MainWindow(QMainWindow):
         elif verdict is False:
             mark, colour = "✕  " + str(q.get("answer", "")), C.RED
         else:
-            # Open answers and near-miss gap-fills are JARVIS's to judge. Saying
+            # Open answers and near-miss gap-fills are REM's to judge. Saying
             # so is honest; marking it wrong here would be a guess.
             mark, colour = "…  noted — I'll go over this one with you", C.ACC2
         note = q.get("note") or ""
@@ -2237,7 +2241,7 @@ class MainWindow(QMainWindow):
 
         self._log.append_log(f"QUIZ: {topic or 'quiz'} — {right}/{total} correct")
 
-        # Hand it back to JARVIS as a message, not as a tool return: the tool
+        # Hand it back to REM as a message, not as a tool return: the tool
         # call ended minutes ago. This is the same channel a dropped file uses.
         lines = [f"[QUIZ_DONE] topic={topic or 'general'} | "
                  f"auto-marked {right}/{total} correct"
@@ -2342,23 +2346,31 @@ class MainWindow(QMainWindow):
 
     def _check_autostart(self) -> bool:
         """Returns True if auto-start is currently registered on this OS."""
+        # Accept both generations of OS registration IDs so the setting can
+        # find and remove an existing startup entry after the rename.
         try:
             if _OS == "Windows":
                 import winreg
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                     r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
                 try:
-                    winreg.QueryValueEx(key, "JARVIS_AI")
-                    return True
-                except FileNotFoundError:
+                    for name in ("REM_AI", _LEGACY_AUTOSTART_WINDOWS):
+                        try:
+                            winreg.QueryValueEx(key, name)
+                            return True
+                        except FileNotFoundError:
+                            continue
                     return False
                 finally:
                     winreg.CloseKey(key)
             elif _OS == "Darwin":
-                return (Path.home() / "Library" / "LaunchAgents"
-                        / "com.jarvis.assistant.plist").exists()
+                agents = Path.home() / "Library" / "LaunchAgents"
+                return any((agents / name).exists() for name in
+                           ("com.rem.assistant.plist", _LEGACY_AUTOSTART_MAC))
             else:
-                return (Path.home() / ".config" / "autostart" / "jarvis.desktop").exists()
+                autostart = Path.home() / ".config" / "autostart"
+                return any((autostart / name).exists() for name in
+                           ("rem.desktop", _LEGACY_AUTOSTART_LINUX))
         except Exception:
             return False
 
@@ -2371,26 +2383,31 @@ class MainWindow(QMainWindow):
                 reg = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                     r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
                 if currently_on:
-                    winreg.DeleteValue(reg, "JARVIS_AI")
+                    for name in ("REM_AI", _LEGACY_AUTOSTART_WINDOWS):
+                        try:
+                            winreg.DeleteValue(reg, name)
+                        except FileNotFoundError:
+                            pass
                 else:
                     pythonw = Path(sys.executable).parent / "pythonw.exe"
                     exe = str(pythonw if pythonw.exists() else sys.executable)
-                    winreg.SetValueEx(reg, "JARVIS_AI", 0, winreg.REG_SZ,
+                    winreg.SetValueEx(reg, "REM_AI", 0, winreg.REG_SZ,
                                       f'"{exe}" "{script}"')
                 winreg.CloseKey(reg)
             elif _OS == "Darwin":
                 plist_dir = Path.home() / "Library" / "LaunchAgents"
                 plist_dir.mkdir(parents=True, exist_ok=True)
-                plist = plist_dir / "com.jarvis.assistant.plist"
+                plist = plist_dir / "com.rem.assistant.plist"
                 if currently_on:
                     plist.unlink(missing_ok=True)
+                    (plist_dir / _LEGACY_AUTOSTART_MAC).unlink(missing_ok=True)
                 else:
                     plist.write_text(
                         '<?xml version="1.0" encoding="UTF-8"?>\n'
                         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
                         '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
                         '<plist version="1.0"><dict>\n'
-                        '  <key>Label</key><string>com.jarvis.assistant</string>\n'
+                        '  <key>Label</key><string>com.rem.assistant</string>\n'
                         '  <key>ProgramArguments</key><array>\n'
                         f'    <string>{sys.executable}</string>\n'
                         f'    <string>{script}</string>\n'
@@ -2401,9 +2418,10 @@ class MainWindow(QMainWindow):
             else:
                 desk_dir = Path.home() / ".config" / "autostart"
                 desk_dir.mkdir(parents=True, exist_ok=True)
-                desk = desk_dir / "jarvis.desktop"
+                desk = desk_dir / "rem.desktop"
                 if currently_on:
                     desk.unlink(missing_ok=True)
+                    (desk_dir / _LEGACY_AUTOSTART_LINUX).unlink(missing_ok=True)
                 else:
                     desk.write_text(
                         "[Desktop Entry]\n"
@@ -2437,29 +2455,35 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[Routines] briefing switch not mirrored: {e}")
 
-    # ── Wake word settings ───────────────────────────────────────────────────
+    # ── Wake phrase settings ─────────────────────────────────────────────────
 
     def _wake_state(self) -> dict:
-        """Combined state for the two wake-word buttons. Readiness is a cheap,
-        deterministic on-disk check now (see core.wake_word.is_ready), so there
+        """Combined state for the wake-phrase buttons. Readiness is a cheap,
+        deterministic on-disk check now (see core.wake_phrase.is_ready), so there
         is nothing to cache — the button never flickers to a stale value."""
         if self.wake_get_state:
             try:
                 s = self.wake_get_state()
                 return {"ready": bool(s.get("ready")),
                         "enabled": bool(s.get("enabled")),
-                        "awake": bool(s.get("awake"))}
+                        "awake": bool(s.get("awake")),
+                        "phrase": s.get("phrase", "REM, where are you?")}
             except Exception:
                 pass
-        # Before JarvisLive has wired its callback (drawer built at startup).
+        # Before RemLive has wired its callback (drawer built at startup).
         ready, enabled = False, False
         try:
-            from core.wake_word import is_ready
+            from core.wake_phrase import WAKE_PHRASE, is_ready
             from memory.config_manager import get_wake_word_enabled
             ready, enabled = is_ready(), get_wake_word_enabled()
         except Exception:
             pass
-        return {"ready": ready, "enabled": enabled, "awake": True}
+        try:
+            from core.wake_phrase import WAKE_PHRASE
+        except Exception:
+            WAKE_PHRASE = "REM, where are you?"
+        return {"ready": ready, "enabled": enabled, "awake": True,
+                "phrase": WAKE_PHRASE}
 
     def _refresh_wake_btns(self):
         if not hasattr(self, '_wake_btn'):
@@ -2467,18 +2491,22 @@ class MainWindow(QMainWindow):
         st = self._wake_state()
         _on, _off = btn_css("on"), btn_css("off")
         self._wake_btn.setEnabled(True)
+        phrase = st.get("phrase", "REM, where are you?")
+        self._wake_btn.setToolTip(
+            f"Local wake phrase: {phrase}. While REM sleeps, speech is processed locally and not sent to Gemini.")
+        self._wake_sleep_btn.setToolTip(f"Say ‘{phrase}’ to wake REM.")
         if not st["ready"]:
-            self._wake_btn.setText("⬇  WAKE WORD: DOWNLOAD")
+            self._wake_btn.setText("⬇  WAKE PHRASE: DOWNLOAD")
             self._wake_btn.setStyleSheet(_off)
             self._wake_sleep_btn.hide()
         elif st["enabled"]:
-            self._wake_btn.setText("🎙  WAKE WORD: ON")
+            self._wake_btn.setText("🎙  WAKE PHRASE: ON")
             self._wake_btn.setStyleSheet(_on)
             self._wake_sleep_btn.show()
             self._wake_sleep_btn.setText("😴  SLEEP NOW" if st["awake"] else "👂  WAKE NOW")
             self._wake_sleep_btn.setStyleSheet(_off)
         else:
-            self._wake_btn.setText("🎙  WAKE WORD: OFF")
+            self._wake_btn.setText("🎙  WAKE PHRASE: OFF")
             self._wake_btn.setStyleSheet(_off)
             self._wake_sleep_btn.hide()
 
@@ -2507,7 +2535,7 @@ class MainWindow(QMainWindow):
                               else "◉  HUD: REACTOR CORE")
         self._hud_btn.setStyleSheet(btn_css("choice"))
         self._hud_btn.setToolTip(
-            "An animated head that speaks your words and shows what JARVIS is "
+            "An animated head that speaks your words and shows what REM is "
             "doing. Tap to switch to the reactor core."
             if face else
             "A 3-D reactor core that turns with the state and moves with your "
@@ -2592,12 +2620,12 @@ class MainWindow(QMainWindow):
     def _toggle_wake_word(self):
         st = self._wake_state()
         if not st["ready"]:
-            # First time: download openwakeword + model in a worker thread.
+            # First time: download the local phrase recognizer and model in a worker thread.
             self._wake_btn.setText("⬇  DOWNLOADING… (one-time)")
             self._wake_btn.setEnabled(False)
             def _work():
                 try:
-                    from core.wake_word import install_and_download
+                    from core.wake_phrase import install_and_download
                     ok, msg = install_and_download(
                         logger=lambda m: self._log_sig.emit(f"SYS: {m}"))
                 except Exception as e:
@@ -2610,7 +2638,7 @@ class MainWindow(QMainWindow):
                 self._wake_dl_sig.emit(ok, msg)
             threading.Thread(target=_work, daemon=True).start()
             return
-        # Already downloaded → just flip enabled/disabled through JarvisLive.
+        # Already downloaded → just flip enabled/disabled through RemLive.
         if self.on_wake_toggle:
             try:
                 self.on_wake_toggle(not st["enabled"])
@@ -2619,7 +2647,7 @@ class MainWindow(QMainWindow):
         self._refresh_wake_btns()
 
     def _on_wake_install_done(self, ok: bool, msg: str):
-        self._log_sig.emit(f"SYS: {'Wake word ready.' if ok else 'Wake word setup failed: ' + msg}")
+        self._log_sig.emit(f"SYS: {'Wake phrase model ready.' if ok else 'Wake phrase setup failed: ' + msg}")
         self._refresh_wake_btns()
 
     def _tap_wake_manual(self):
@@ -2642,7 +2670,7 @@ class MainWindow(QMainWindow):
             self._customize_overlay.hide()
         cw = self.centralWidget()
         ov = CustomizeOverlay(
-            cfg.get("assistant_name", "JARVIS") or "JARVIS",
+            cfg.get("assistant_name", "REM") or "REM",
             cfg.get("user_name", ""),
             cfg.get("ui_color", "") or DEFAULT_UI_COLOR,
             cfg.get("voice_name", ""),
@@ -2669,7 +2697,7 @@ class MainWindow(QMainWindow):
     def _apply_name_update(self, name: str, user_name: str, ui_color: str = "",
                            voice: str = ""):
         """Update all name/theme-dependent UI elements and persist to config."""
-        self._assistant_name = name.strip() or "JARVIS"
+        self._assistant_name = name.strip() or "REM"
         display = self._assistant_name.upper()
         self.setWindowTitle(f"{display} — {APP_VERSION}")
         self._title_lbl.setText(display)
@@ -2954,7 +2982,7 @@ class MainWindow(QMainWindow):
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
-        self._assistant_name = _read_full_config().get("assistant_name", "JARVIS") or "JARVIS"
+        self._assistant_name = _read_full_config().get("assistant_name", "REM") or "REM"
         self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
 
 

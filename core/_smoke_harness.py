@@ -1,7 +1,7 @@
 """
 Loads a project's changed Python code in a throwaway process, under the
 project's own interpreter, and prints one JSON report. Works for any project;
-the JARVIS profile adds running changed plugins the way the app runs them.
+the REM profile adds running changed plugins the way the app runs them.
 Started by core/code_checks.py — never imported by the app.
 
     python _smoke_harness.py <project folder> <json: {"imports": [...], "plugins": [...]}>
@@ -88,7 +88,7 @@ def _sample(schema: dict) -> dict:
 
 
 class Player:
-    """Stands in for JarvisUI. Records every call; every method is safe to call
+    """Stands in for RemUI. Records every call; every method is safe to call
     from any thread, as the real ones are."""
 
     def __init__(self):
@@ -114,11 +114,11 @@ class Player:
 
 
 def main() -> None:
-    # The JARVIS profile recreates the app's arrangement: one QApplication on
+    # The REM profile recreates the app's arrangement: one QApplication on
     # this thread, model calls stubbed. Any other project gets neither — its
     # own `core` package, if it has one, is not ours to import.
     app = None
-    if SPEC.get("profile") == "jarvis":
+    if SPEC.get("profile") == "rem":
         try:
             from PyQt6.QtCore import qInstallMessageHandler
             from PyQt6.QtWidgets import QApplication

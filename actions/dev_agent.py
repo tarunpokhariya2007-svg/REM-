@@ -17,7 +17,11 @@ def get_base_dir():
 
 BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
-PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
+_DESKTOP         = Path.home() / "Desktop"
+_LEGACY_PROJECTS_DIR = _DESKTOP / "JarvisProjects"
+_REM_PROJECTS_DIR = _DESKTOP / "RemProjects"
+PROJECTS_DIR     = (_REM_PROJECTS_DIR if _REM_PROJECTS_DIR.exists()
+                    or not _LEGACY_PROJECTS_DIR.exists() else _LEGACY_PROJECTS_DIR)
 MAX_FIX_ATTEMPTS = 5
 # Model choice, timeout and fallback ladder all live in core/gemini.py.
 from core import gemini
@@ -490,7 +494,7 @@ def _build_project(
         if speak: speak(msg)
         return msg
 
-    proj_name    = project_name or plan.get("project_name", "jarvis_project")
+    proj_name    = project_name or plan.get("project_name", "rem_project")
     proj_name    = re.sub(r"[^\w\-]", "_", proj_name)
     project_dir  = PROJECTS_DIR / proj_name
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -641,32 +645,40 @@ def _build_project(
 #     mistake that is not cheap to undo, so the plan cannot ask for it.
 #   * Run the project. A folder somebody hands over may be a server, a GUI or a
 #     script that sends email. What IS run, in a separate process: changed
-#     modules are imported, and in a JARVIS project each changed plugin is
+#     modules are imported, and in a REM project each changed plugin is
 #     called the way the app calls it — unless its code can act on the world
 #     (send, delete, launch), in which case it is only loaded and validated.
 #     See core/code_checks.py.
 #
 # WHAT IT READS FIRST
 #   The project's own rules (AGENTS.md, CLAUDE.md or CONTRIBUTING.md) and, for
-#   JARVIS itself, the thread-safe `player` methods read out of ui.py. Without
+#   REM itself, the thread-safe `player` methods read out of ui.py. Without
 #   them a model writes code that is valid and wrong for this app — widgets
 #   built off the Qt thread, a separate window instead of the quiz board.
 #
 # WHAT MAKES IT SAFE TO SAY YES TO
-#   Every file is copied to .jarvis_backup/<time>/ inside the folder before it
+#   Every file is copied to .rem_backup/<time>/ inside the folder before it
 #   is changed, and the whole job is one entry on the shared undo stack: "undo"
 #   puts every file back and removes the ones it created.
 
+_LEGACY_BACKUP_DIR = ".jarvis_backup"
 _SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "venv", ".venv", "env",
               "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
-              ".idea", ".vscode", ".next", "target", ".jarvis_backup"}
-_BACKUP_DIR     = ".jarvis_backup"
+              ".idea", ".vscode", ".next", "target", ".rem_backup", _LEGACY_BACKUP_DIR}
+_BACKUP_DIR     = ".rem_backup"
 _MAX_FILE_CHARS = 120_000     # bigger than this is generated or data, not code
 _CONTEXT_CHARS  = 350_000     # file text sent to plan; MiniMax M3.1 takes 512K tokens
 _MAX_TREE       = 1500        # paths listed for the model
 _MAX_CHANGES    = 12          # files one request may touch
 _FIX_ROUNDS     = 2
 _TEST_ROUNDS    = 2           # test → fix → test again
+
+
+def _backup_dir_for(folder: Path) -> str:
+    """Prefer REM backups; reuse the legacy directory if that is all it has."""
+    current = folder / _BACKUP_DIR
+    legacy = folder / _LEGACY_BACKUP_DIR
+    return _BACKUP_DIR if current.exists() or not legacy.exists() else _LEGACY_BACKUP_DIR
 
 # One folder job at a time. Two at once would write the same files from two
 # plans and leave a backup folder that restores neither.
@@ -1358,7 +1370,8 @@ def _improve_folder(folder: Path, instruction: str, player=None) -> str:
         _log(player, f"  {c['action']:6} {c['path']}")
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = folder / _BACKUP_DIR / stamp
+    backup_dir = _backup_dir_for(folder)
+    backup = folder / backup_dir / stamp
     edited: list[str] = []
     created: list[str] = []
     written: dict[str, str] = {}
@@ -1499,7 +1512,7 @@ def _improve_folder(folder: Path, instruction: str, player=None) -> str:
     elif written:
         msg += " Every changed file loaded and passed its test."
     if edited:
-        msg += f" Originals are in {_BACKUP_DIR}/{stamp}; say 'undo' to restore them."
+        msg += f" Originals are in {backup_dir}/{stamp}; say 'undo' to restore them."
     else:
         msg += " Say 'undo' to remove the new files."
     _log(player, msg)

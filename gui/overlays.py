@@ -76,7 +76,7 @@ class SetupOverlay(QWidget):
             return w
 
         layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
-        layout.addWidget(_lbl("Configure J.A.R.V.I.S. before first boot.", 9, color=C.PRI_DIM))
+        layout.addWidget(_lbl("Configure REM before first boot.", 9, color=C.PRI_DIM))
         layout.addSpacing(6)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -288,7 +288,7 @@ class CustomizeOverlay(QWidget):
     saved = pyqtSignal(str, str, str, str)   # assistant_name, user_name, ui_color, voice
     _OW, _OH = 400, 588
 
-    def __init__(self, assistant_name="JARVIS", user_name="",
+    def __init__(self, assistant_name="REM", user_name="",
                  ui_color=DEFAULT_UI_COLOR, voice="", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -494,7 +494,7 @@ class CustomizeOverlay(QWidget):
         self.hide()
 
     def _save(self):
-        name = self._name_input.text().strip() or "JARVIS"
+        name = self._name_input.text().strip() or "REM"
         user = self._user_input.text().strip()
         self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, self._sel_voice)
         self.hide()
@@ -714,11 +714,11 @@ class ConfirmBanner(_HudOverlay):
 
 
 class AudioDeviceOverlay(_HudOverlay):
-    """Choose which microphone JARVIS listens to and which speakers it uses.
+    """Choose which microphone REM listens to and which speakers it uses.
 
     Both audio streams used to open with no `device=` at all, so they always
     took the OS default — which on Windows moves by itself the moment a headset
-    is plugged in. 'JARVIS can't hear me' is usually 'JARVIS is listening to the
+    is plugged in. 'REM can't hear me' is usually 'REM is listening to the
     webcam'."""
 
     picked = pyqtSignal()      # emitted after Apply, when something changed
@@ -818,7 +818,7 @@ class AudioDeviceOverlay(_HudOverlay):
             # speaking into it.
             #
             # So the button is here, beside the dropdown, in the panel somebody
-            # opens when JARVIS cannot hear them. It replaces a loose
+            # opens when REM cannot hear them. It replaces a loose
             # `ses_testi.py` in the project root that nobody would ever find.
             btn_row = QHBoxLayout(); btn_row.setSpacing(6)
             btn_row.addWidget(box, 1)
@@ -864,10 +864,10 @@ class AudioDeviceOverlay(_HudOverlay):
         self._level_seen.connect(self._on_level)
         self._test_result.connect(self._on_result)
 
-        self._in_box  = _row("MICROPHONE — what JARVIS hears you with",
+        self._in_box  = _row("MICROPHONE — what REM hears you with",
                              "input", get_input_device())
         lay.addSpacing(4)
-        self._out_box = _row("SPEAKERS — what JARVIS talks through",
+        self._out_box = _row("SPEAKERS — what REM talks through",
                              "output", get_output_device())
 
         # ── Output volume, beside the output device ──────────────────────────
@@ -1074,7 +1074,7 @@ class AudioDeviceOverlay(_HudOverlay):
 
 
 class MemoryOverlay(_HudOverlay):
-    """Everything JARVIS has stored about you, and when it learned it.
+    """Everything REM has stored about you, and when it learned it.
 
     Memory used to be a 2200-character store that deleted its oldest entries
     when full and mentioned it only on stdout. The cap is gone; this panel is
@@ -1168,7 +1168,7 @@ class MemoryOverlay(_HudOverlay):
 
         from memory.memory_manager import all_entries_for_ui
 
-        hdr = QLabel("🧠  WHAT JARVIS REMEMBERS")
+        hdr = QLabel("🧠  WHAT REM REMEMBERS")
         hdr.setFont(hud_font(12, QFont.Weight.Bold))
         hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         self._lay.addWidget(hdr)
@@ -1299,7 +1299,7 @@ class _ScrollSafeCombo(QComboBox):
 
 
 class ClipboardPanel(QWidget):
-    """Floating panel shown when text is copied — offers quick Jarvis actions."""
+    """Floating panel shown when text is copied — offers quick Rem actions."""
 
     action_requested = pyqtSignal(str)
     _W, _H = 326, 112
@@ -1727,7 +1727,7 @@ class RemoteKeyOverlay(QWidget):
         if _blocked:
             warn = _lbl(
                 "⚠  Windows is blocking incoming connections to this copy of "
-                "Python, so your phone cannot reach this page. Restart JARVIS "
+                "Python, so your phone cannot reach this page. Restart REM "
                 "and accept the Windows prompt, or remove the rules named "
                 + ", ".join(sorted({n for n, _ in _blocked}))
                 + " under Windows Defender Firewall → Inbound Rules.",
@@ -1866,7 +1866,7 @@ class RemoteKeyOverlay(QWidget):
         self._qr_label.setStyleSheet(
             "color: #00ff88; background: #001a0d; border-radius: 10px;"
         )
-        self._timer_lbl.setText("Phone connected — JARVIS ready")
+        self._timer_lbl.setText("Phone connected — REM ready")
         self._timer_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
 
     def _refresh_key(self):

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>JARVIS Dashboard</title>
+  <title>REM Dashboard</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -143,7 +143,7 @@
   </header>
   <main id="feed"></main>
   <footer>
-    <input id="inp" placeholder="Send a command to JARVIS…" autocomplete="off">
+    <input id="inp" placeholder="Send a command to REM…" autocomplete="off">
     <label class="btn-attach" for="file-inp" title="Send file">📎</label>
     <input type="file" id="file-inp" multiple accept="*/*" style="display:none">
     <button id="mic-btn" onclick="doMic()" title="Voice command">🎤</button>
@@ -153,8 +153,10 @@
 
   <script>
     // ── Auth — bearer token ───────────────────────────────────────────────────
-    const _authToken  = sessionStorage.getItem('jarvis_token');
-    const _sessionKey = sessionStorage.getItem('jarvis_key');
+    const _AUTH_TOKEN_STORAGE_KEY = 'jarvis_token';
+    const _SESSION_KEY_STORAGE_KEY = 'jarvis_key';
+    const _authToken  = sessionStorage.getItem(_AUTH_TOKEN_STORAGE_KEY);
+    const _sessionKey = sessionStorage.getItem(_SESSION_KEY_STORAGE_KEY);
 
     if (!_authToken) {
       location.replace('/login');
@@ -247,7 +249,7 @@
     const _wsUrl   = `${_wsProto}://${location.host}/ws?token=${encodeURIComponent(_authToken)}`;
     const ws       = new WebSocket(_wsUrl);
 
-    ws.onopen    = () => { sys('Remote session active.'); toast('Connected to JARVIS'); };
+    ws.onopen    = () => { sys('Remote session active.'); toast('Connected to REM'); };
     ws.onclose   = () => sys('Connection lost — refresh to reconnect.');
     ws.onerror   = () => sys('Connection error.');
     ws.onmessage = (e) => {
@@ -269,9 +271,9 @@
 
     function append(speaker, text) {
       const d = document.createElement('div');
-      if (speaker === 'jarvis') {
+      if (speaker === 'rem') {
         d.className = 'msg msg-j';
-        d.innerHTML = `<div class="lbl">Jarvis</div>${esc(text)}`;
+        d.innerHTML = `<div class="lbl">Rem</div>${esc(text)}`;
       } else {
         d.className = 'msg msg-u';
         d.innerHTML = `<div class="lbl">You</div>${esc(text)}`;

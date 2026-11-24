@@ -1,5 +1,10 @@
 """
-Local wake-word detection for JARVIS ("Hey Jarvis").
+Legacy rollback implementation retained until the REM phrase detector passes
+real microphone validation. No application entry point imports or activates it.
+The third-party pretrained model identifier `hey_jarvis` is preserved here only
+because that downloaded model recognizes its fixed phrase; it is not REM's
+intended activation phrase. Remove this isolated module after microphone
+validation of `core.wake_phrase`.
 
 Design goals:
   • ZERO cost when the feature is off — openwakeword is imported ONLY inside
@@ -13,7 +18,7 @@ Design goals:
     network call except the one-time model download the user triggers from the UI.
 
 openwakeword ships small ONNX models (a few MB each) and runs comfortably on a
-CPU. The pretrained wake phrase used here is "Hey Jarvis".
+CPU. It uses the fixed phrase documented above.
 """
 from __future__ import annotations
 
@@ -24,8 +29,8 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-# Pretrained openwakeword model that listens for "Hey Jarvis".
-WAKE_MODEL = "hey_jarvis"
+# Third-party openWakeWord model; its model identifier and phrase are fixed.
+WAKE_MODEL = "hey_jarvis"  # Fixed pretrained model; changing this needs a real model.
 # Score in [0,1]; above this counts as a detection. Tunable per environment.
 DEFAULT_THRESHOLD = 0.5
 # Mic frames arrive at 16 kHz int16; this is just the detector's input rate.
@@ -147,7 +152,7 @@ class WakeWordDetector:
         self._ready = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="WakeWordThread")
         self._thread.start()
-        self._logger("Wake word: listening for 'Hey Jarvis'.")
+        self._logger("Wake word: listening for the bundled model's phrase.")
         return True
 
     def stop(self) -> None:
@@ -172,7 +177,7 @@ class WakeWordDetector:
 
     def _reset_model(self) -> None:
         # The model keeps its recent audio features and scores. Left alone, one
-        # "Hey Jarvis" fired a dozen times in a row (measured: 12), and audio
+        # The wake model fired a dozen times in a row (measured: 12), and audio
         # from before the assistant woke was still in there when it went back
         # to sleep — so it could wake again on words said minutes earlier.
         try:
@@ -207,9 +212,9 @@ class WakeWordDetector:
                 scores = self._model.predict(np.asarray(frame, dtype=np.int16))
                 score = 0.0
                 if isinstance(scores, dict):
-                    # match the jarvis model regardless of exact key suffix
+                    # Match the configured third-party model regardless of key suffix.
                     for k, v in scores.items():
-                        if "jarvis" in k.lower():
+                        if WAKE_MODEL.lower() in k.lower():
                             score = max(score, float(v))
                     if score == 0.0 and scores:
                         score = max(float(v) for v in scores.values())

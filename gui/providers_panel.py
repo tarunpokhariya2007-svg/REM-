@@ -886,7 +886,7 @@ class ProvidersOverlay(_HudOverlay):
         w, lay = self._box([head])
         lay.addWidget(self._label(
             "The model that plans, writes and fixes projects when you ask the "
-            "assistant to build something. Saved to Desktop/JarvisProjects.",
+            "assistant to build something. Saved to your projects folder.",
             7, C.TEXT_DIM))
 
         sid = self._coding

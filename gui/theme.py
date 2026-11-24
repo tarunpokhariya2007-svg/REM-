@@ -42,7 +42,7 @@ from PyQt6.QtGui import (
 # Video playback for the HUD. Part of PyQt6, so it costs no new dependency —
 # but the multimedia plugins are a separate piece of the Qt install and can be
 # absent on a stripped-down system, so a failure here disables one feature
-# rather than stopping JARVIS from starting.
+# rather than stopping REM from starting.
 try:
     from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
     from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -78,7 +78,11 @@ API_FILE   = CONFIG_DIR / "api_keys.json"
 def _read_full_config() -> dict:
     """Read api_keys.json config dict. Returns {} on any error."""
     try:
-        return json.loads(API_FILE.read_text(encoding="utf-8"))
+        data = json.loads(API_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "assistant_name" in data:
+            from memory.config_manager import normalize_assistant_name
+            data["assistant_name"] = normalize_assistant_name(data["assistant_name"])
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 

@@ -104,11 +104,11 @@ def trim_turns(turns: list, limit: int = _CONTEXT_CHARS,
 def default_context() -> dict:
     """assistant_name, user_name, language. A context_fn may add `now`, a datetime
     in the user's clock, when that is not this machine's (a server on UTC)."""
-    ctx = {"assistant_name": "JARVIS", "user_name": "", "language": ""}
+    ctx = {"assistant_name": "REM", "user_name": "", "language": ""}
     try:
         from memory.config_manager import load_api_keys
         cfg = load_api_keys()
-        ctx["assistant_name"] = (cfg.get("assistant_name") or "JARVIS").strip() or "JARVIS"
+        ctx["assistant_name"] = (cfg.get("assistant_name") or "REM").strip() or "REM"
         ctx["user_name"] = (cfg.get("user_name") or "").strip()
     except Exception:
         pass

@@ -1,4 +1,4 @@
-# Rules for coding agents working on JARVIS
+# Rules for coding agents working on REM
 
 The built-in coding agent (`actions/dev_agent.py`) reads this file before every
 change it makes to this project, and so should any other agent or contributor.
@@ -24,7 +24,7 @@ anything else from `PyQt6.QtWidgets` or `PyQt6.QtGui`. Creating a widget from a
 worker thread prints `QObject::setParent: Cannot set parent, new parent is in a
 different thread` and nothing appears on screen.
 
-To show something, call the **thread-safe methods on `player`** (the `JarvisUI`
+To show something, call the **thread-safe methods on `player`** (the `RemUI`
 object passed to every tool). They hand the work to the Qt thread for you. The
 current list, with signatures, is appended below this file by the coding agent
 automatically. The ones plugins usually need:
@@ -88,11 +88,11 @@ a small built-in fallback — instead of crashing.
 
 - The window is the `gui/` package: `window.py` (MainWindow — columns, drawers,
   content panel), `widgets.py`, `overlays.py`, `providers_panel.py`, `hud.py`.
-  `ui.py` keeps only `JarvisUI` and re-exports every older name.
+  `ui.py` keeps only `RemUI` and re-exports every older name.
 - Widgets are created and changed only on the Qt thread.
 - To let other threads trigger a change: add a `pyqtSignal` to `MainWindow` in
   `gui/window.py`, connect it to a slot in its `__init__`, and add a thin public
-  method on `JarvisUI` in `ui.py` that only emits the signal. `show_content` /
+  method on `RemUI` in `ui.py` that only emits the signal. `show_content` /
   `_content_sig` / `_show_content` is the pattern to copy.
 - Colours come from the `C` palette in `gui/theme.py`; stylesheets use only its
   hex values, so the live re-theme can repaint them. Fonts come from
