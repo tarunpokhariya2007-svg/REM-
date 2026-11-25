@@ -73,11 +73,13 @@ def _message(update):
             save_plugin_config("telegram_remote",{"allowed_chat_ids":",".join(map(str,sorted(set(approved)))),"pairing_code":""})
             _enqueue(cid,"This chat is paired with REM. Keep the pairing code private.")
         return
-    if _player is None or not callable(getattr(_player,"on_text_command",None)):
+    external_command = (getattr(_player, "on_external_text_command", None)
+                        if _player is not None else None)
+    if not callable(external_command):
         _enqueue(cid,"REM is not accepting commands right now."); return
     with _lock:
         _state.update(turn_chat=int(cid),turn_open=True,turn_at=time.monotonic(),seen=int(_state.get("seen",0))+1)
-    try: _player.on_text_command(text)
+    try: external_command(text)
     except Exception as exc:
         print(f"[Telegram] command dispatch failed: {type(exc).__name__}")
         _enqueue(cid,"That command could not be handed to REM.")

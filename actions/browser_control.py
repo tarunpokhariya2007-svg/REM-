@@ -4,11 +4,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import importlib.util
+import ipaddress
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
+from urllib.parse import parse_qsl, urlsplit
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -105,6 +108,41 @@ def _profile_path(name: str, legacy_name: str | None = None) -> Path:
         return legacy
     return _profile_root() / name
 
+
+def _configured_chrome_cdp_endpoint(value: str | None = None) -> str | None:
+    """Return an explicitly configured loopback-only Chrome CDP endpoint.
+
+    REM never starts a browser with a debugging port. Users may point this at
+    a Chrome instance they have already launched with remote debugging enabled.
+    A public or LAN endpoint is rejected because CDP grants broad browser
+    authority to anyone who can reach it.
+    """
+    endpoint = (os.environ.get("REM_CHROME_CDP_URL", "") if value is None
+                else str(value)).strip()
+    if not endpoint:
+        return None
+    try:
+        parsed = urlsplit(endpoint)
+        if (parsed.scheme.lower() not in {"http", "https", "ws", "wss"}
+                or not parsed.hostname or parsed.username or parsed.password
+                or parsed.query or parsed.fragment):
+            raise ValueError
+        host = parsed.hostname.casefold().rstrip(".")
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host == "localhost"
+        if not loopback:
+            raise ValueError
+        if parsed.port is None:
+            raise ValueError
+    except (ValueError, UnicodeError):
+        raise ValueError(
+            "REM_CHROME_CDP_URL must be an explicit HTTP or WebSocket endpoint "
+            "on localhost/127.0.0.1/::1 with a port and no credentials or query."
+        ) from None
+    return endpoint
+
 def _normalize_url(url: str) -> str:
     """
     Bare words like "instagram" → "https://instagram.com"
@@ -121,7 +159,28 @@ def _normalize_url(url: str) -> str:
     if not url:
         return "about:blank"
     if "://" in url:
+        try:
+            parsed = urlsplit(url)
+            valid = (parsed.scheme.lower() in {"http", "https"}
+                     and bool(parsed.hostname)
+                     and not parsed.username and not parsed.password)
+            _ = parsed.port  # validate malformed ports before handing off
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("Only valid HTTP or HTTPS browser URLs are supported.")
         return url
+    prefix = url.split(":", 1)[0]
+    if ":" in url and prefix.isalpha():
+        if prefix.casefold() != "localhost":
+            raise ValueError("Only HTTP or HTTPS browser URLs are supported.")
+    host = url.split("/", 1)[0].split(":", 1)[0].strip("[]").casefold()
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = host == "localhost"
+    if is_loopback:
+        return "http://" + url
     # No dot at all → assume .com  (e.g. "instagram" → "instagram.com")
     if "." not in url:
         url = url + ".com"
@@ -635,6 +694,7 @@ class _BrowserSession:
         self._pw:      Playwright     | None = None
         self._context: BrowserContext | None = None
         self._page:    Page           | None = None
+        self._browser = None
         # "real" when the user's own browser profile was opened, "separate"
         # when their browser was already running and a private automation
         # profile had to be used instead. The difference is every sign-in they
@@ -683,7 +743,16 @@ class _BrowserSession:
             asyncio.run_coroutine_threadsafe(self._async_close(), self._loop).result(10)
 
     async def _async_close(self):
-        if self._context:
+        if self._browser is not None:
+            # Browser.close() on a CDP-connected Playwright Browser disconnects
+            # from the browser server; closing the attached default context
+            # would instead close the user's actual Chrome tabs.
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        elif self._context:
             try:
                 await self._context.close()
             except Exception:
@@ -711,7 +780,54 @@ class _BrowserSession:
         Does nothing if the context is already open.
         """
         if self._context is not None:
-            return
+            try:
+                if (self._browser is not None
+                        and callable(getattr(self._browser, "is_connected", None))
+                        and not self._browser.is_connected()):
+                    raise RuntimeError("attached browser disconnected")
+                pages = [page for page in self._context.pages if not page.is_closed()]
+                if self._page is None or self._page.is_closed():
+                    self._page = pages[-1] if pages else None
+                return
+            except Exception:
+                # Drop stale handles. The configured CDP endpoint or the
+                # existing REM-owned persistent profile is reopened below;
+                # never silently switch an attached session to another profile.
+                self._browser = self._context = self._page = None
+
+        if self.browser_name == "chrome":
+            endpoint = _configured_chrome_cdp_endpoint()
+            if endpoint:
+                browser = None
+                try:
+                    browser = await self._pw.chromium.connect_over_cdp(
+                        endpoint, timeout=5_000, no_defaults=True)
+                    contexts = browser.contexts
+                    if not contexts:
+                        raise RuntimeError("the attached Chrome session exposed no browser context")
+                    context = contexts[0]
+                    pages = [page for page in context.pages if not page.is_closed()]
+                    self._browser = browser
+                    self._context = context
+                    # CDP does not report a reliable foreground-tab identity;
+                    # use the most recently listed live tab and expose its URL
+                    # through the ordinary browser read tools before acting.
+                    self._page = pages[-1] if pages else None
+                    self.profile_kind = "attached"
+                    print("[Browser] Attached to explicitly configured local Chrome CDP session")
+                    return
+                except Exception as exc:
+                    if browser is not None:
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                    raise RuntimeError(
+                        "Could not attach to the configured local Chrome CDP endpoint; "
+                        "no browser action was taken. Check that Chrome was explicitly "
+                        "started with a loopback-only debugging port and that "
+                        "REM_CHROME_CDP_URL is correct."
+                    ) from exc
 
         if self._spec is None:
             raise RuntimeError(
@@ -1018,6 +1134,14 @@ class _BrowserSession:
     async def smart_click(self, description: str) -> str:
         page = await self._get_page()
         before = await self._page_state(page)
+        ordinal = re.search(r"\b(first|second|third|last)\s+videos?\b",
+                            str(description or ""), re.IGNORECASE)
+        try:
+            host = (urlsplit(page.url).hostname or "").casefold().rstrip(".")
+        except Exception:
+            host = ""
+        if ordinal and (host == "youtube.com" or host.endswith(".youtube.com")):
+            return await self._click_youtube_video_ordinal(page, ordinal.group(1), before)
         for role in ("button", "link", "searchbox", "textbox", "menuitem", "tab"):
             try:
                 loc = page.get_by_role(role, name=description)
@@ -1040,6 +1164,62 @@ class _BrowserSession:
             except Exception:
                 continue
         return f"Could not find element: '{description}'"
+
+    async def _click_youtube_video_ordinal(self, page, ordinal: str, before: tuple) -> str:
+        """Select a real visible YouTube video card, excluding ads and chrome."""
+        try:
+            cards = await page.locator("ytd-video-renderer, ytd-rich-item-renderer").evaluate_all("""els => {
+              const seen = new Set();
+              return els.flatMap(card => {
+                const r = card.getBoundingClientRect(), s = getComputedStyle(card);
+                if (r.width < 2 || r.height < 2 || s.display === 'none' || s.visibility === 'hidden') return [];
+                if (card.hasAttribute('is-ad') || card.querySelector('ytd-ad-slot-renderer, #ad-badge, [id*=ad-badge]')) return [];
+                // Prefer the actual result-title anchor. A card's first watch
+                // link in DOM order is often its aria-hidden thumbnail, whose
+                // text is only a duration overlay such as "Now playing".
+                const a = card.querySelector('a#video-title[href*="/watch"]')
+                    || card.querySelector('a[href*="/watch?v="]:not([aria-hidden="true"])');
+                if (!a) return [];
+                const ar = a.getBoundingClientRect();
+                if (ar.width < 2 || ar.height < 2) return [];
+                const u = new URL(a.href, location.href);
+                const id = u.pathname === '/watch' ? u.searchParams.get('v') : null;
+                const title = (a.getAttribute('title')
+                    || a.querySelector('yt-formatted-string')?.innerText
+                    || a.innerText || a.textContent || '').trim();
+                if (!id || !title || seen.has(id)) return [];
+                seen.add(id);
+                return [{id, title: title.slice(0,160)}];
+              });
+            }""")
+            index = {"first": 0, "second": 1, "third": 2}.get(ordinal)
+            if ordinal == "last":
+                index = len(cards) - 1
+            if index is None or index < 0 or index >= len(cards):
+                return f"I found {len(cards)} visible non-ad YouTube video results; {ordinal} is unavailable, so nothing was clicked."
+            selected = cards[index]
+            video_id = str(selected.get("id", ""))
+            title = str(selected.get("title", ""))
+            if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id) or not title:
+                return "The selected result did not have a verifiable video identity; nothing was clicked."
+            # Use the video identity from the inspected result, never a generic
+            # page text/role match which could resolve to the YouTube logo.
+            loc = page.locator(f'a#video-title[href*="watch?v={video_id}"]')
+            count = await loc.count()
+            if count != 1 or not await loc.is_visible() or not await loc.is_enabled():
+                return "The inspected YouTube video target is no longer unique and visible; nothing was clicked."
+            await loc.click(timeout=8_000)
+            try:
+                await page.wait_for_url(re.compile(r"https?://(?:www\\.)?youtube\\.com/watch\\?.*\\bv=" + re.escape(video_id) + r"(?:&|$)"), timeout=6_000)
+            except Exception:
+                pass
+            current = urlsplit(page.url)
+            opened_id = next((value for key, value in parse_qsl(current.query) if key == "v"), "")
+            if current.path == "/watch" and opened_id == video_id:
+                return f"Opened and verified the {ordinal} YouTube video: {title!r}."
+            return f"Clicked the {ordinal} video target {title!r}, but the resulting page did not verify as that video."
+        except Exception as exc:
+            return outcome.failed("browser_control", f"YouTube video targeting failed safely: {type(exc).__name__}: {exc}")
 
     async def _click_unique(self, page, loc, before: tuple, label: str) -> str:
         count = await loc.count()
@@ -1413,7 +1593,13 @@ def _browser_control_impl(
             try:
                 sess.run(sess.go_to(last))
             except Exception as e:
-                print(f"[Browser] Could not resume last page ({last}): {e}")
+                try:
+                    parsed = urlsplit(last)
+                    safe_origin = (f"{parsed.scheme}://{parsed.hostname}"
+                                   if parsed.scheme and parsed.hostname else "stored page")
+                except Exception:
+                    safe_origin = "stored page"
+                print(f"[Browser] Could not resume {safe_origin} ({type(e).__name__})")
 
         if action == "click":
             result = sess.run(sess.click(params.get("selector"), params.get("text")))

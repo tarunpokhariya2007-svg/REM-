@@ -27,10 +27,10 @@ from PyQt6.QtGui import (
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QGraphicsScene, QGraphicsView, QGraphicsPixmapItem,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QSlider,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QSlider, QMessageBox,
 )
 
 from gui.theme import (
@@ -1382,8 +1382,8 @@ class MainWindow(QMainWindow):
         # remains available while a worker is performing a computer action.
         self._computer_panel = HoloPanel("COMPUTER USE", "ON-DEMAND")
         self._computer_rows = {}
-        for label in ("SCREEN", "ACTIVE APP", "ACTION", "LAST ACTION",
-                      "INPUT", "VERIFICATION"):
+        for label in ("SCREEN", "UI AUTOMATION", "OCR", "BROWSER", "MEMORY",
+                      "ACTIVE APP", "ACTION", "LAST ACTION", "INPUT", "VERIFICATION"):
             row = DataRow(label, "OFF" if label == "SCREEN" else "—")
             self._computer_rows[label] = row
             self._computer_panel.body.addWidget(row)
@@ -1399,6 +1399,30 @@ class MainWindow(QMainWindow):
             f"border: 1px solid {C.BORDER}; padding: 4px; }}")
         self._desktop_mode.currentTextChanged.connect(self._on_desktop_mode_changed)
         self._computer_panel.body.addWidget(self._desktop_mode)
+        from memory.config_manager import (
+            get_persistent_desktop_observation_enabled, get_cloud_screen_vision_enabled,
+            get_desktop_observation_exclusions,
+        )
+        self._persistent_observation = QCheckBox("PERSISTENT LOCAL UIA OBSERVATION")
+        self._persistent_observation.setToolTip(
+            "With your consent, REM checks accessible window structure locally at a low rate. "
+            "This does not capture or upload screenshots.")
+        self._persistent_observation.setChecked(get_persistent_desktop_observation_enabled())
+        self._persistent_observation.toggled.connect(self._on_persistent_observation_toggled)
+        self._computer_panel.body.addWidget(self._persistent_observation)
+        self._cloud_screen_vision = QCheckBox("ALLOW SCREEN IMAGES TO SELECTED CLOUD MODEL")
+        self._cloud_screen_vision.setToolTip(
+            "Separate permission for on-demand screen images. Local UIA observation does not need this.")
+        self._cloud_screen_vision.setChecked(get_cloud_screen_vision_enabled())
+        self._cloud_screen_vision.toggled.connect(self._on_cloud_screen_vision_toggled)
+        self._computer_panel.body.addWidget(self._cloud_screen_vision)
+        self._observation_exclusions = QLineEdit(", ".join(get_desktop_observation_exclusions()))
+        self._observation_exclusions.setPlaceholderText("Excluded app/window names (comma separated)")
+        self._observation_exclusions.setToolTip(
+            "Excluded names are matched locally against the foreground process and title. "
+            "Windows sign-in, credential, lock, and consent surfaces are excluded automatically.")
+        self._observation_exclusions.editingFinished.connect(self._save_observation_exclusions)
+        self._computer_panel.body.addWidget(self._observation_exclusions)
         control_buttons = QHBoxLayout()
         control_buttons.setSpacing(4)
         self._desktop_pause = QPushButton("PAUSE")
@@ -1507,6 +1531,65 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log.append_log(f"SYS: Could not change computer-use mode: {exc}")
 
+    def _on_persistent_observation_toggled(self, enabled: bool) -> None:
+        if enabled:
+            answer = QMessageBox.question(
+                self, "Enable persistent local observation?",
+                "REM will periodically read the foreground window's UI Automation "
+                "structure locally. It will not take screenshots or send screen "
+                "content to a cloud model. You can turn this off here or use Emergency Stop.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._persistent_observation.blockSignals(True)
+                self._persistent_observation.setChecked(False)
+                self._persistent_observation.blockSignals(False)
+                return
+        try:
+            from memory.config_manager import save_persistent_desktop_observation_enabled
+            from core import desktop_control
+            save_persistent_desktop_observation_enabled(enabled)
+            desktop_control.set_persistent_observation(enabled)
+            self._set_desktop_control_status(desktop_control.snapshot())
+        except Exception as exc:
+            self._log.append_log(
+                f"SYS: Could not update persistent observation ({type(exc).__name__}).")
+            self._persistent_observation.blockSignals(True)
+            self._persistent_observation.setChecked(not enabled)
+            self._persistent_observation.blockSignals(False)
+
+    def _on_cloud_screen_vision_toggled(self, enabled: bool) -> None:
+        if enabled:
+            answer = QMessageBox.question(
+                self, "Allow cloud screen vision?",
+                "When you explicitly ask REM to inspect the screen, the screenshot and "
+                "visible text may be sent to the cloud model selected in REM settings. "
+                "This setting is separate from local observation and desktop actions.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._cloud_screen_vision.blockSignals(True)
+                self._cloud_screen_vision.setChecked(False)
+                self._cloud_screen_vision.blockSignals(False)
+                return
+        try:
+            from memory.config_manager import save_cloud_screen_vision_enabled
+            save_cloud_screen_vision_enabled(enabled)
+        except Exception as exc:
+            self._log.append_log(f"SYS: Could not update cloud screen vision: {exc}")
+            self._cloud_screen_vision.blockSignals(True)
+            self._cloud_screen_vision.setChecked(not enabled)
+            self._cloud_screen_vision.blockSignals(False)
+
+    def _save_observation_exclusions(self) -> None:
+        try:
+            from memory.config_manager import save_desktop_observation_exclusions
+            save_desktop_observation_exclusions(self._observation_exclusions.text())
+        except Exception as exc:
+            self._log.append_log(f"SYS: Could not save desktop observation exclusions: {type(exc).__name__}")
+
     def _toggle_desktop_pause(self) -> None:
         try:
             from core import desktop_control
@@ -1539,7 +1622,8 @@ class MainWindow(QMainWindow):
             self._desktop_mode.setCurrentText(mode)
             self._desktop_mode.blockSignals(False)
         self._computer_rows["SCREEN"].set_value(
-            "ACCESS ACTIVE" if status.get("screen_access") else "OFF",
+            ("LOCAL UIA ACTIVE" if status.get("persistent_observation") else
+             "ACCESS ACTIVE" if status.get("screen_access") else "OFF"),
             "GREEN" if status.get("screen_access") else "DIM")
         self._computer_rows["ACTIVE APP"].set_value(str(status.get("active_app") or "—")[:22])
         self._computer_rows["ACTION"].set_value(str(status.get("current_action") or "None")[:22])
@@ -1548,8 +1632,39 @@ class MainWindow(QMainWindow):
             "MOUSE/KEYBOARD ACTIVE" if status.get("mouse_keyboard") else "IDLE",
             "ACC2" if status.get("mouse_keyboard") else "DIM")
         self._computer_rows["VERIFICATION"].set_value(str(status.get("verification") or "Not run")[:22])
+        try:
+            from core import screenview
+            caps = screenview.capabilities()
+            self._computer_rows["UI AUTOMATION"].set_value(
+                "AVAILABLE" if caps.get("accessibility_available") else "UNAVAILABLE",
+                "GREEN" if caps.get("accessibility_available") else "DIM")
+            self._computer_rows["OCR"].set_value(
+                "AVAILABLE" if caps.get("ocr_available") else "UNAVAILABLE",
+                "GREEN" if caps.get("ocr_available") else "DIM")
+        except Exception:
+            pass
+        try:
+            from actions.browser_control import _registry
+            browser_active = _registry.has()
+            self._computer_rows["BROWSER"].set_value(
+                "SESSION ACTIVE" if browser_active else "NOT CONNECTED",
+                "GREEN" if browser_active else "DIM")
+        except Exception:
+            self._computer_rows["BROWSER"].set_value("STATUS UNKNOWN")
+        try:
+            from memory.memory_manager import MEMORY_PATH
+            self._computer_rows["MEMORY"].set_value(
+                "LOCAL STORE READY" if MEMORY_PATH.exists() else "LOCAL STORE EMPTY",
+                "GREEN" if MEMORY_PATH.exists() else "DIM")
+        except Exception:
+            self._computer_rows["MEMORY"].set_value("STATUS UNKNOWN")
         self._desktop_pause.setText("RESUME" if status.get("paused") or status.get("stopped") else "PAUSE")
         self._desktop_pause.setEnabled(True)
+        persistent = bool(status.get("persistent_observation"))
+        if self._persistent_observation.isChecked() != persistent:
+            self._persistent_observation.blockSignals(True)
+            self._persistent_observation.setChecked(persistent)
+            self._persistent_observation.blockSignals(False)
 
     def _flip_tasks_panel(self) -> None:
         to_routines = self._tasks_stack.currentIndex() == 0

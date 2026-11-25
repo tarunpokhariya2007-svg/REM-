@@ -84,11 +84,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import platform
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Optional
 
 from core.appidentity import fold
@@ -109,12 +110,31 @@ _HAS_MSS = installed("mss")
 _HAS_PIL = installed("PIL")
 _HAS_PYAUTOGUI = installed("pyautogui")
 
-# OCR is the last-resort backend. Two packages are accepted because the ONNX
-# build installs everywhere without a compiler and the full PaddleOCR does not,
-# and a user who already has one should not be asked for the other.
-_HAS_RAPIDOCR = installed("rapidocr_onnxruntime")
+# OCR is the last-resort backend. Prefer the actively maintained `rapidocr`
+# API with the CPU ONNX Runtime engine; retain compatibility with older local
+# installs and PaddleOCR without making any of them mandatory.
+_HAS_RAPIDOCR = installed("rapidocr")
+_HAS_RAPIDOCR_LEGACY = installed("rapidocr_onnxruntime")
 _HAS_PADDLEOCR = installed("paddleocr")
-_HAS_OCR = _HAS_RAPIDOCR or _HAS_PADDLEOCR
+_HAS_OCR = _HAS_RAPIDOCR or _HAS_RAPIDOCR_LEGACY or _HAS_PADDLEOCR
+
+
+def _uia_diagnostic(event: str, **fields) -> None:
+    """Opt-in structured UIA diagnostics; never include values or screenshots.
+
+    Control names and window titles can still reveal screen context, so this
+    logger is silent unless REM_UIA_DIAGNOSTICS=1 is set explicitly. Sensitive
+    field names are dropped as a defense in depth against accidental callers.
+    """
+    if os.environ.get("REM_UIA_DIAGNOSTICS", "").strip() != "1":
+        return
+    blocked = ("value", "password", "secret", "token", "credential", "screenshot", "content")
+    safe = {key: val for key, val in fields.items()
+            if not any(part in key.casefold() for part in blocked)}
+    logging.getLogger("rem.screenview.uia").warning(
+        "REM_UIA_DIAGNOSTIC %s",
+        json.dumps({"event": event, **safe}, ensure_ascii=False, default=str),
+    )
 
 
 def _mss():
@@ -356,6 +376,17 @@ class Element:
     # one of these" is a rule that has to hold in all of them. core/screenact.py
     # refuses to type into a protected element even when told to.
     protected: bool = False
+    value_read_only: Optional[bool] = None
+    # UIA identity is local-only. It is used to re-find a control in a fresh
+    # foreground tree before invoking a semantic pattern; it is not a durable
+    # wrapper and is never sent to a model.
+    automation_id: str = ""
+    control_type: str = ""
+    runtime_id: tuple[int, ...] = ()
+    parent_name: str = ""
+    patterns: tuple[str, ...] = ()
+    window_pid: int = 0
+    window_title: str = ""
 
     @property
     def center(self) -> tuple[int, int]:
@@ -407,6 +438,14 @@ class Element:
             d["scrollable"] = True
         if self.protected:
             d["protected"] = True
+        if self.automation_id:
+            d["automation_id"] = self.automation_id
+        if self.control_type:
+            d["control_type"] = self.control_type
+        if self.parent_name:
+            d["parent"] = self.parent_name
+        if self.patterns:
+            d["patterns"] = list(self.patterns)
         if verbose:
             d["depth"] = self.depth
         return d
@@ -920,18 +959,43 @@ def _foreground_linux() -> tuple[str, str, int, Any]:
 # gone. We walk UIAElementInfo ourselves, which is the layer underneath, and
 # check the clock at every node.
 # ---------------------------------------------------------------------------
-def _scan_windows(hwnd: Any, scale: float, deadline: float) -> list[Element]:
+def _scan_windows_pywinauto(hwnd: Any, scale: float, deadline: float) -> list[Element]:
     from pywinauto.uia_element_info import UIAElementInfo
 
-    root = UIAElementInfo(hwnd)
+    try:
+        root = UIAElementInfo(hwnd)
+    except Exception as exc:
+        _uia_diagnostic("root_error", hwnd=hex(int(hwnd)),
+                        backend="pywinauto.uia", error=type(exc).__name__)
+        raise
+    try:
+        root_meta = {
+            "name": str(getattr(root, "name", "") or "")[:120],
+            "control_type": str(getattr(root, "control_type", "") or "")[:80],
+            "automation_id": str(getattr(root, "automation_id", "") or "")[:120],
+            "process_id": int(getattr(root, "process_id", 0) or 0),
+            "runtime_id": tuple(int(x) for x in root.element.GetRuntimeId()),
+        }
+    except Exception as exc:
+        root_meta = {"metadata_error": type(exc).__name__}
+    _uia_diagnostic("root_connected", hwnd=hex(int(hwnd)),
+                    backend="pywinauto.uia", **root_meta)
     out: list[Element] = []
     # Breadth first, so that when the budget runs out what we have is the
     # shallow, big, obvious controls rather than one deep branch of a sidebar.
     frontier: list[tuple[Any, int]] = [(root, 0)]
 
     visited = 0
+    filtered = 0
+    children_errors: dict[str, int] = {}
+    discovered: list[dict[str, Any]] = []
     while frontier and len(out) < MAX_ELEMENTS:
         if time.monotonic() > deadline:
+            _uia_diagnostic(
+                "enumeration_timeout", hwnd=hex(int(hwnd)),
+                backend="pywinauto.uia", visited=visited, returned=len(out),
+                filtered=filtered, control_types=sorted({x.get("control_type", "") for x in discovered}),
+            )
             raise TimeoutError("accessibility scan exceeded its budget")
 
         # Let everything else breathe, every so often.
@@ -950,17 +1014,145 @@ def _scan_windows(hwnd: Any, scale: float, deadline: float) -> list[Element]:
         node, depth = frontier.pop(0)
         try:
             children = node.children() if depth < MAX_DEPTH else []
-        except Exception:
+        except Exception as exc:
+            key = type(exc).__name__
+            children_errors[key] = children_errors.get(key, 0) + 1
             children = []
+
+        try:
+            protected = bool(getattr(getattr(node, "element", None),
+                                     "CurrentIsPassword", False))
+            item = {
+                "control_type": str(getattr(node, "control_type", "") or "")[:80],
+                "name": "[REDACTED]" if protected else str(getattr(node, "name", "") or "")[:120],
+                "automation_id": str(getattr(node, "automation_id", "") or "")[:120],
+                "runtime_id": tuple(int(x) for x in node.element.GetRuntimeId()),
+                "child_count": len(children),
+            }
+            discovered.append(item)
+        except Exception as exc:
+            discovered.append({"metadata_error": type(exc).__name__,
+                               "child_count": len(children)})
 
         el = _element_from_uia(node, len(out), depth, scale)
         if el is not None:
             out.append(el)
+        else:
+            filtered += 1
 
         for child in children:
             frontier.append((child, depth + 1))
 
+    _uia_diagnostic(
+        "enumeration_complete", hwnd=hex(int(hwnd)), backend="pywinauto.uia",
+        raw_element_count=visited, returned_count=len(out), filtered_count=filtered,
+        control_types=sorted({x.get("control_type", "") for x in discovered}),
+        controls=discovered[:200], child_errors=children_errors,
+    )
     return out
+
+
+def _scan_windows(hwnd: Any, scale: float, deadline: float,
+                  pid: int = 0, title: str = "") -> list[Element]:
+    """Use CUIAutomation8 on an isolated MTA worker for Windows UIA scans.
+
+    Pywinauto remains a compatibility fallback if the COM client is missing.
+    A successful top-level-only query is surfaced as a permission/provider
+    limitation instead of being reported as a complete observation.
+    """
+    try:
+        if not pid or not title:
+            import win32gui
+            import win32process
+            found_pid = int(win32process.GetWindowThreadProcessId(int(hwnd))[1])
+            found_title = str(win32gui.GetWindowText(int(hwnd)) or "")
+            pid = int(pid or found_pid)
+            title = str(title or found_title)
+        from core import windows_uia
+        elements = windows_uia.scan(int(hwnd), int(pid), str(title), scale, deadline)
+        _uia_diagnostic(
+            "enumeration_complete", hwnd=hex(int(hwnd)), backend="CUIAutomation8",
+            process_id=int(pid), window_title=title[:160], returned_count=len(elements),
+            control_types=sorted({element.control_type for element in elements}),
+        )
+        if len(elements) <= 1:
+            raise PermissionError(
+                "CUIAutomation8 found the window but no child controls; "
+                "the current process may lack desktop UI access"
+            )
+        return elements
+    except ImportError as exc:
+        _uia_diagnostic("cui_automation_unavailable", hwnd=hex(int(hwnd)),
+                        error=type(exc).__name__)
+        return _scan_windows_pywinauto(hwnd, scale, deadline)
+
+
+_UIA_PATTERN_IDS = {
+    "invoke": (10000, "IUIAutomationInvokePattern", "Invoke"),
+    "selection": (10001, "IUIAutomationSelectionPattern", "GetCurrentSelection"),
+    "value": (10002, "IUIAutomationValuePattern", "SetValue"),
+    "range_value": (10003, "IUIAutomationRangeValuePattern", "SetValue"),
+    "scroll": (10004, "IUIAutomationScrollPattern", "Scroll"),
+    "expand_collapse": (10005, "IUIAutomationExpandCollapsePattern", "Expand"),
+    "collapse": (10005, "IUIAutomationExpandCollapsePattern", "Collapse"),
+    "selection_item": (10010, "IUIAutomationSelectionItemPattern", "Select"),
+    "toggle": (10015, "IUIAutomationTogglePattern", "Toggle"),
+}
+_UIA_PATTERNS_BY_ROLE = {
+    ROLE_BUTTON: ("invoke",), ROLE_MENUITEM: ("invoke",),
+    ROLE_CHECKBOX: ("toggle",), ROLE_RADIO: ("selection_item",),
+    ROLE_TAB: ("selection_item",), ROLE_LISTITEM: ("selection_item",),
+    ROLE_TREE: ("selection_item",), ROLE_ROW: ("selection_item",),
+    ROLE_COMBOBOX: ("value", "expand_collapse"), ROLE_EDIT: ("value",),
+    ROLE_SLIDER: ("range_value",), ROLE_LIST: ("selection", "scroll"),
+    ROLE_TABLE: ("selection", "scroll"), ROLE_GROUP: ("scroll",),
+}
+
+
+def perform_uia_pattern(target: Element, pattern_name: str, value=None) -> tuple[bool, str]:
+    """Re-find a UIA element in the current foreground tree and invoke a pattern.
+
+    Runtime IDs and window identity must still match the observation. A stale
+    or unsupported reference returns False so the caller can choose a guarded
+    physical fallback (or refuse); this function never uses screen coordinates.
+    """
+    if _OS != "windows" or target is None or not target.runtime_id:
+        return False, "UI Automation identity is unavailable or stale"
+    from core import desktop_control
+    if desktop_control.should_stop():
+        return False, "desktop control is paused or emergency-stopped"
+    requested_pattern = str(pattern_name or "").lower()
+    # SetFocus is a UIA element operation, not a control pattern. Supporting
+    # it here avoids synthesizing a mouse click to focus a discovered field.
+    if requested_pattern == "focus":
+        spec = None
+    else:
+        spec = _UIA_PATTERN_IDS.get(requested_pattern)
+        capability = ("expand_collapse" if requested_pattern == "collapse"
+                      else requested_pattern)
+        if not spec or capability not in target.patterns:
+            return False, f"the control does not support the {pattern_name} pattern"
+    try:
+        app, title, pid, hwnd = _foreground()
+        if not hwnd or (target.window_pid and int(pid) != target.window_pid):
+            return False, "the foreground application changed since observation"
+        if target.window_title and title != target.window_title:
+            return False, "the foreground window changed since observation"
+        if target.window_pid and target.window_pid != int(pid):
+            return False, "the target belongs to a different application"
+        from core import windows_uia
+        return windows_uia.perform(
+            int(hwnd), int(pid), str(title), target.runtime_id,
+            target.automation_id, target.name, target.control_type,
+            target.protected, requested_pattern, value,
+            stop=desktop_control.should_stop,
+        )
+    except Exception as exc:
+        hresult = getattr(exc, "hresult", None)
+        suffix = (f" (HRESULT 0x{hresult & 0xFFFFFFFF:08X})"
+                  if isinstance(hresult, int) else "")
+        return False, (f"UI Automation pattern failed: {type(exc).__name__}"
+                       f"{suffix}")
 
 
 # UIA pattern ids. Numbers rather than names because the constants live in a
@@ -1083,12 +1275,49 @@ def _element_from_uia(info: Any, eid: int, depth: int, scale: float) -> Optional
         ctrl = str(getattr(info, "control_type", "") or "")
     except Exception:
         ctrl = ""
+    role = _UIA_ROLES.get(ctrl.replace(" ", "").lower(), ROLE_OTHER)
     try:
         enabled = bool(getattr(info, "enabled", True))
     except Exception:
         enabled = True
 
-    role = _UIA_ROLES.get(ctrl.replace(" ", "").lower(), ROLE_OTHER)
+    try:
+        automation_id = str(getattr(info, "automation_id", "") or "")
+    except Exception:
+        automation_id = ""
+    try:
+        focused = bool(getattr(info, "has_keyboard_focus", False))
+    except Exception:
+        focused = False
+    try:
+        raw = getattr(info, "element", None)
+        runtime_id = tuple(int(x) for x in raw.GetRuntimeId()) if raw is not None else ()
+    except Exception:
+        runtime_id = ()
+    try:
+        window_pid = int(getattr(info, "process_id", 0) or 0)
+    except Exception:
+        window_pid = 0
+    parent_name = ""
+    try:
+        parent = info.parent
+        parent_name = str(getattr(parent, "name", "") or "")
+    except Exception:
+        pass
+
+    patterns = []
+    try:
+        raw = getattr(info, "element", None)
+        if raw is not None:
+            for pattern_name in _UIA_PATTERNS_BY_ROLE.get(role, ()):
+                pattern_id = _UIA_PATTERN_IDS[pattern_name][0]
+                try:
+                    if raw.GetCurrentPattern(pattern_id):
+                        patterns.append(pattern_name)
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
     # UIA answers "is this a password box" directly, and it answers in the same
     # way whatever language the box is labelled in. Read through the raw COM
@@ -1121,9 +1350,12 @@ def _element_from_uia(info: Any, eid: int, depth: int, scale: float) -> Optional
         eid=eid, role=role, name=name, value=value,
         left=int(round(left * scale)), top=int(round(top * scale)),
         width=int(round(width * scale)), height=int(round(height * scale)),
-        enabled=enabled, focused=False,
+        enabled=enabled, focused=focused,
         scrollable=role in (ROLE_LIST, ROLE_TABLE, ROLE_TREE, ROLE_GROUP),
         depth=depth, protected=protected,
+        automation_id=automation_id, control_type=ctrl,
+        runtime_id=runtime_id, parent_name=parent_name,
+        patterns=tuple(patterns), window_pid=window_pid,
     )
 
 
@@ -1378,6 +1610,9 @@ def _ocr_reader() -> Optional[Callable[[Any], Any]]:
             return _ocr_engine
         try:
             if _HAS_RAPIDOCR:
+                from rapidocr import RapidOCR
+                _ocr_engine = RapidOCR()
+            elif _HAS_RAPIDOCR_LEGACY:
                 from rapidocr_onnxruntime import RapidOCR
                 _ocr_engine = RapidOCR()
             elif _HAS_PADDLEOCR:
@@ -1394,7 +1629,7 @@ def _scan_ocr(monitor: dict, deadline: float) -> list[Element]:
     engine = _ocr_reader()
     if engine is None:
         raise RuntimeError(
-            "no OCR engine is installed; install rapidocr-onnxruntime to read "
+            "no OCR engine is installed; install rapidocr with onnxruntime to read "
             "surfaces that expose no accessibility information"
         )
     if not (_HAS_MSS and _HAS_PIL):
@@ -1408,9 +1643,21 @@ def _scan_ocr(monitor: dict, deadline: float) -> list[Element]:
         raise TimeoutError("OCR exceeded its budget before it started")
 
     result = engine(np.array(image))
-    # RapidOCR returns (results, elapsed); PaddleOCR returns a nested list. The
-    # shapes differ, the useful part does not: a box and a string.
-    rows = result[0] if isinstance(result, tuple) else result
+    # Current RapidOCR returns boxes/texts/scores as named fields. Its legacy
+    # wrapper returns (rows, elapsed), while PaddleOCR returns nested rows.
+    # Normalize the current API to the same internal (box, (text, score)) rows.
+    if all(hasattr(result, name) for name in ("boxes", "txts", "scores")):
+        boxes = result.boxes
+        texts = result.txts
+        scores = result.scores
+        boxes = [] if boxes is None else boxes
+        texts = [] if texts is None else texts
+        rows = [
+            (box, (text, scores[index] if scores is not None and index < len(scores) else 0.0))
+            for index, (box, text) in enumerate(zip(boxes, texts))
+        ]
+    else:
+        rows = result[0] if isinstance(result, tuple) else result
     if rows and isinstance(rows[0], list) and rows and not isinstance(rows[0][0], (list, tuple)):
         rows = rows
 
@@ -1549,6 +1796,70 @@ def _digest_pixels() -> str:
         return hashlib.blake2b(coarse, digest_size=12).hexdigest()
     except Exception:
         return ""
+
+
+_ALWAYS_EXCLUDED_APPS = frozenset({
+    "logonui.exe", "credentialuibroker.exe", "consent.exe", "lockapp.exe",
+})
+
+
+def observation_exclusion(app: str, title: str) -> str:
+    """Return a local exclusion reason for secure or user-excluded windows."""
+    app_text, title_text = str(app or "").casefold(), str(title or "").casefold()
+    if any(name in app_text for name in _ALWAYS_EXCLUDED_APPS):
+        return "Windows sign-in, credential, lock, and consent surfaces are excluded."
+    try:
+        from memory.config_manager import get_desktop_observation_exclusions
+        exclusions = get_desktop_observation_exclusions()
+    except Exception:
+        exclusions = []
+    if any(item.casefold() in app_text or item.casefold() in title_text
+           for item in exclusions if item.strip()):
+        return "This application or window is on the user's desktop-observation exclusion list."
+    return ""
+
+
+def assert_observation_allowed() -> tuple[str, str, int]:
+    """Fail closed before screenshot capture for excluded/secure windows."""
+    app, title, _pid, _handle = _foreground()
+    reason = observation_exclusion(app, title)
+    if reason:
+        raise PermissionError(reason)
+    if _OS == "windows":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            user32.OpenInputDesktop.restype = wintypes.HANDLE
+            user32.GetUserObjectInformationW.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+                wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+            user32.GetUserObjectInformationW.restype = wintypes.BOOL
+            user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+            user32.CloseDesktop.restype = wintypes.BOOL
+            desktop = user32.OpenInputDesktop(0, False, 0x0001)
+            if not desktop:
+                raise PermissionError("Windows input desktop could not be verified; capture is refused.")
+            try:
+                needed = wintypes.DWORD()
+                user32.GetUserObjectInformationW(desktop, 2, None, 0, ctypes.byref(needed))
+                if not needed.value:
+                    raise PermissionError("Windows input desktop could not be identified; capture is refused.")
+                name = ctypes.create_unicode_buffer(max(2, needed.value // ctypes.sizeof(ctypes.c_wchar)))
+                if not user32.GetUserObjectInformationW(desktop, 2, name,
+                        ctypes.sizeof(name), ctypes.byref(needed)):
+                    raise PermissionError("Windows input desktop could not be identified; capture is refused.")
+                if name.value.casefold() != "default":
+                    raise PermissionError("Secure Windows desktop content is excluded.")
+            finally:
+                user32.CloseDesktop(desktop)
+        except PermissionError:
+            raise
+        except Exception as exc:
+            raise PermissionError(
+                f"Windows input desktop verification failed ({type(exc).__name__}); capture is refused.") from None
+    return app, title, int(_pid or 0)
 
 
 def changed(before: Optional[View], after: Optional[View]) -> bool:
@@ -1983,7 +2294,8 @@ def missing_packages() -> list[str]:
     return out
 
 
-def look(*, budget_s: float = SCAN_BUDGET_S, allow_ocr: bool = True) -> View:
+def look(*, budget_s: float = SCAN_BUDGET_S, allow_ocr: bool = True,
+         allow_pixel_digest: bool = True) -> View:
     """Read the screen. Never raises.
 
     The accessibility tree is tried first on every platform. If it is absent,
@@ -1997,7 +2309,31 @@ def look(*, budget_s: float = SCAN_BUDGET_S, allow_ocr: bool = True) -> View:
     bounds = _logical_screen()
 
     app, title, pid, handle = _foreground()
+    if _OS == "windows":
+        _uia_diagnostic("foreground", hwnd=(hex(int(handle)) if handle else None),
+                        process=app, process_id=int(pid or 0), window_title=title[:160],
+                        backend="pywinauto.uia")
     view = View(os_name=_OS, app=app, title=title, pid=pid, bounds=bounds)
+    excluded = observation_exclusion(app, title)
+    if excluded:
+        view.source = "excluded"
+        view.degraded = True
+        view.reason = excluded
+        view.digest = view.stable_digest = f"excluded:{fold(app)}:{fold(title)}"
+        view.scan_ms = (time.monotonic() - started) * 1000.0
+        return view
+    if _OS == "windows":
+        try:
+            identity = assert_observation_allowed()
+            if identity != (app, title, int(pid or 0)):
+                raise PermissionError("Foreground window changed during inspection; refresh and try again.")
+        except PermissionError as exc:
+            view.source = "excluded"
+            view.degraded = True
+            view.reason = str(exc)
+            view.digest = view.stable_digest = f"excluded:{fold(app)}:{fold(title)}"
+            view.scan_ms = (time.monotonic() - started) * 1000.0
+            return view
     # Carried by every reading, including the ones that return early, because
     # "is the right thing open somewhere" has to stay answerable even when the
     # front window is unreadable or is our own.
@@ -2045,7 +2381,10 @@ def look(*, budget_s: float = SCAN_BUDGET_S, allow_ocr: bool = True) -> View:
         try:
             elements: list[Element] = []
             if _OS == "windows" and _HAS_PYWINAUTO and handle:
-                elements = _scan_windows(handle, scale, deadline)
+                elements = _scan_windows(handle, scale, deadline, pid=pid,
+                                         title=title)
+                elements = [replace(el, window_title=title)
+                            for el in elements]
                 view.source = "uia"
             elif _OS == "mac" and _HAS_PYOBJC and pid:
                 elements, ax_title = _scan_mac(pid, deadline)
@@ -2128,7 +2467,7 @@ def look(*, budget_s: float = SCAN_BUDGET_S, allow_ocr: bool = True) -> View:
         view.source = "none"
         view.degraded = True
         view.reason = reason or "nothing could be read from this screen"
-        view.digest = _digest_pixels()
+        view.digest = _digest_pixels() if allow_pixel_digest else ""
         view.stable_digest = view.digest
     view.scan_ms = (time.monotonic() - started) * 1000.0
     return view

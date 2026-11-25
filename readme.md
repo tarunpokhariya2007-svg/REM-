@@ -159,10 +159,40 @@ modes, plus pause/resume and an emergency stop. LIVE ASSIST locally polls
 accessible control metadata with an adaptive interval; it does not stream a
 screenshot or continuously send screen content to Gemini. A user request is
 still required for an action. Browser page controls go through Playwright DOM
-roles and labels. If a browser profile is already locked by the user's open
-Chrome, the existing browser controller can use a separate profile; it does
-not attach to arbitrary Chrome processes through CDP. Consequential browser
-buttons and messages require the on-screen confirmation gate.
+roles and labels. By default, REM does not attach to a running browser. To use
+an existing Chrome session, configure `REM_CHROME_CDP_URL` to an explicitly
+enabled loopback-only Chrome DevTools endpoint such as
+`http://127.0.0.1:9222`. REM will not start Chrome with remote debugging or
+accept a LAN/public debugging endpoint. When attached, it uses an existing tab
+(the last live tab listed by Chrome); check its URL before interacting. Without
+that setting, the existing separate REM-profile fallback remains. Consequential
+browser buttons and messages require the on-screen confirmation gate. Once a
+confirmation is resolved, REM forwards its outcome to the requesting assistant
+session when that session is still connected. The development agent does not
+automatically run newly generated Python code: it shows the exact script command
+and working directory for confirmation first. Its bounded runner captures but
+does not forward raw program output; approved code still runs with the user's
+normal Windows permissions, so review generated files before approving a run.
+
+The COMPUTER USE panel also has **PERSISTENT LOCAL UIA OBSERVATION**. Enabling
+it asks for consent once and saves the choice locally; it polls accessibility
+metadata at a low rate and does not capture screenshots or share screen content.
+Emergency Stop disables and clears that saved preference. **ALLOW SCREEN IMAGES
+TO SELECTED CLOUD MODEL** is a separate, off-by-default setting with its own
+consent. `screen_process` captures and sends a screenshot only after that cloud
+permission is enabled and a direct screen-inspection request is authorized.
+User-configured app/window exclusions and Windows sign-in, credential, lock,
+and consent surfaces are skipped. Local observation does not grant action
+permission.
+
+On Windows, UIA controls now include local runtime identity and exposed pattern
+metadata. A single left-click uses a fresh `Invoke` pattern when the control
+supports it; `select`, `toggle`, `expand`, and `collapse` require their matching
+fresh UIA patterns. Stale targets fail closed. Other mouse actions still use
+guarded physical input. UIA event subscriptions are not implemented yet, so
+persistent awareness uses bounded polling rather than event-driven updates.
+The existing local memory store is `memory/long_term.json`; this update does not
+create a second SQLite database or migrate user records.
 
 The accessibility tree is not universal: canvas apps, remote desktops, games,
 and some custom Electron surfaces may expose few or no controls. Those are
@@ -1091,10 +1121,11 @@ Engineered by a developer building a real-world REM-style assistant.
 
 ## Reconstructed plugin suite
 
-The plugin loader discovers 26 tools in `plugins/` and loads optional integrations without importing their third-party clients during startup. Plugins are enabled by default; disable individual tools from the existing plugin manager. Integration credentials are entered under Settings → Plugin Settings and stored through the existing configuration manager.
+The plugin loader discovers 27 tools in `plugins/` and loads optional integrations without importing their third-party clients during startup. Plugins are enabled by default; disable individual tools from the existing plugin manager. Integration credentials are entered under Settings → Plugin Settings and stored through the existing configuration manager.
 
 | Capability | Tool name | Setup and limits |
 |---|---|---|
+| Nearby aircraft | `aircraft_report` | Optional location setting; user-initiated queries use public ADS-B feeds, and place-name lookup uses OpenStreetMap Nominatim. Location is sent to those configured public services; coordinates and usage counters are stored locally. Aircraft coverage is incomplete, background checks are rate-limited, and adsb.fi data is for personal non-commercial use. Attribution: [adsb.lol](https://www.adsb.lol/docs/open-data/api), [adsb.fi](https://github.com/adsbfi/opendata), and [OpenStreetMap Nominatim](https://operations.osmfoundation.org/policies/nominatim/). |
 | Screen control | `screen_agent` | Uses `core.screenview` UI Automation first and the existing screen action verification. The `desktop_ui` action remains available; this plugin supports bounded desktop sequences and routes existing tools such as `browser_control`, `open_app`, and `web_search`. |
 | WhatsApp calls and chat | `whatsapp_call`, `whatsapp_guard`, `chat_takeover` | Uses accessible WhatsApp UI; message sending goes through `send_message` confirmation. UI Automation must expose an exact chat/contact. Guard checks only the visible window and does not run a background call monitor or auto-answer. |
 | Telegram | `telegram_remote` | Configure bot token and authorized chat IDs or a one-time pairing code. Only paired chats reach the cloud task engine; no shell or Python execution is provided. |

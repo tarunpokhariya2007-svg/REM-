@@ -63,12 +63,17 @@ _lock = threading.Lock()
 _show_cb: Optional[Callable[[str, str], None]] = None
 _hide_cb: Optional[Callable[[], None]] = None
 _log_cb:  Optional[Callable[[str], None]] = None
+_result_cb: Optional[Callable[[str, str, str], None]] = None
 
 
-def bind(show, hide, log=None) -> None:
-    """Wire this module to the HUD. Called once from main.py at startup."""
-    global _show_cb, _hide_cb, _log_cb
-    _show_cb, _hide_cb, _log_cb = show, hide, log
+def bind(show, hide, log=None, result=None) -> None:
+    """Wire the HUD and optional assistant-result callback at startup.
+
+    ``result(title, status, detail)`` is called after the user has resolved a
+    request. It must be safe to call from a worker thread.
+    """
+    global _show_cb, _hide_cb, _log_cb, _result_cb
+    _show_cb, _hide_cb, _log_cb, _result_cb = show, hide, log, result
 
 
 def _log(msg: str) -> None:
@@ -77,6 +82,16 @@ def _log(msg: str) -> None:
             _log_cb(msg)
         except Exception:
             pass
+
+
+def _report_result(p: _Pending, status: str, detail: str = "") -> None:
+    """Report the terminal result without copying action details into logs."""
+    callback = _result_cb
+    if callback is not None:
+        try:
+            callback(p.title, status, str(detail or ""))
+        except Exception as exc:
+            _log(f"ERR: Confirmation outcome delivery failed ({type(exc).__name__})")
 
 
 def request(key: str, title: str, detail: str, run: Callable[[], str]) -> str:
@@ -134,18 +149,22 @@ def resolve(accepted: bool) -> None:
 
     if time.monotonic() - p.at > TIMEOUT_SECONDS:
         _log(f"SYS: Confirmation expired — {p.title}")
+        _report_result(p, "expired", "The request expired before it was approved; the action was not run.")
         return
 
     if not accepted:
         _log(f"SYS: Cancelled — {p.title}")
+        _report_result(p, "denied", "The user cancelled the request; the action was not run.")
         return
 
     def _worker():
         try:
             result = p.run() or "Done."
-            _log(f"SYS: Confirmed — {p.title}. {result}")
+            _log(f"SYS: Confirmed — {p.title}")
+            _report_result(p, "approved", str(result))
         except Exception as e:
-            _log(f"ERR: {p.title} failed — {e}")
+            _log(f"ERR: Confirmed action failed — {type(e).__name__}")
+            _report_result(p, "failed", f"The approved action failed ({type(e).__name__}).")
 
     threading.Thread(target=_worker, daemon=True,
                      name=f"confirm-{p.key}").start()

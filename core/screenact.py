@@ -406,6 +406,28 @@ def click(target: Target, *, button: str = "left", clicks: int = 1,
     if not ok:
         return _fail(action, why)
 
+    # UIA Invoke is the primary left-click path when the freshly observed
+    # control advertises that pattern. The helper re-finds its runtime ID in
+    # the current foreground tree; it never invokes a wrapper retained from a
+    # previous scan. Physical input remains the fallback for controls without
+    # Invoke (or for right/double-click semantics).
+    if (button == "left" and clicks == 1 and isinstance(target, Element)
+            and "invoke" in getattr(target, "patterns", ())):
+        try:
+            from core import screenview
+            ok, detail = screenview.perform_uia_pattern(target, "invoke")
+            if ok:
+                return Act(ok=True, action=action, target=target.label,
+                           origin="element", detail=detail)
+            # A failed semantic Invoke can have an unknown completion state
+            # (for example, a COM timeout after the provider received it).
+            # Never turn that into a second physical click.
+            return _fail(action, detail, target=target.label, origin="element")
+        except Exception as exc:
+            # An optional pattern backend must not make a supported physical
+            # fallback unavailable; the normal input guards still apply.
+            pass
+
     point, refusal = _resolve(target, action)
     if refusal is not None:
         return refusal
@@ -480,6 +502,88 @@ def hover(target: Target) -> Act:
                point=(point.x, point.y))
 
 
+def move_cursor(target: Target) -> Act:
+    """Move to a freshly resolved semantic element without clicking it."""
+    ok, why = available()
+    if not ok:
+        return _fail("move", why)
+    point, refusal = _resolve(target, "move")
+    if refusal is not None:
+        return refusal
+    assert point is not None
+    try:
+        _move_to(point)
+        ok, why = available()
+        if not ok:
+            return _fail("move", why, target=point.label, origin=point.origin,
+                         point=(point.x, point.y))
+    except Exception as exc:
+        return _fail("move", f"the cursor could not be moved: {exc}",
+                     target=point.label, origin=point.origin)
+    return Act(ok=True, action="move", target=point.label, origin=point.origin,
+               point=(point.x, point.y))
+
+
+def move_relative(dx: int, dy: int, *, limit: int = 200) -> Act:
+    """Move a small, explicit distance from the current cursor position."""
+    try:
+        dx, dy = int(dx), int(dy)
+    except (TypeError, ValueError):
+        return _fail("move_relative", "offsets must be integers")
+    if abs(dx) > limit or abs(dy) > limit:
+        return _fail("move_relative", f"offsets are limited to {limit} pixels")
+    ok, why = available()
+    if not ok:
+        return _fail("move_relative", why)
+    try:
+        x, y = pyautogui.position()
+        nx, ny = int(x) + dx, int(y) + dy
+        if not _on_screen(nx, ny):
+            return _fail("move_relative", "the resulting position is outside the desktop",
+                         point=(nx, ny))
+        _move_to(Point(nx, ny, origin="relative", label="relative cursor position"))
+        ok, why = available()
+        if not ok:
+            return _fail("move_relative", why, point=(nx, ny))
+        return Act(ok=True, action="move_relative", point=(nx, ny), origin="relative")
+    except Exception as exc:
+        return _fail("move_relative", f"the cursor could not be moved: {exc}")
+
+
+def move_to_screen_position(position: str) -> Act:
+    """Move to a named position derived from the measured virtual desktop."""
+    name = str(position or "").casefold().replace(" ", "_")
+    try:
+        from core import screenview
+        rect = screenview.virtual_rect()
+        left, top = int(rect["left"]), int(rect["top"])
+        width, height = int(rect["width"]), int(rect["height"])
+    except Exception:
+        return _fail("move", "the desktop bounds could not be measured")
+    points = {
+        "center": (left + width // 2, top + height // 2),
+        "middle": (left + width // 2, top + height // 2),
+        "top_left": (left + 8, top + 8),
+        "top_right": (left + width - 9, top + 8),
+        "bottom_left": (left + 8, top + height - 9),
+        "bottom_right": (left + width - 9, top + height - 9),
+    }
+    if name not in points:
+        return _fail("move", "position must be center, top_left, top_right, bottom_left, or bottom_right")
+    x, y = points[name]
+    ok, why = available()
+    if not ok:
+        return _fail("move", why)
+    try:
+        _move_to(Point(x, y, origin="user", label=name))
+        ok, why = available()
+        if not ok:
+            return _fail("move", why, point=(x, y))
+        return Act(ok=True, action="move", target=name, origin="user", point=(x, y))
+    except Exception as exc:
+        return _fail("move", f"the cursor could not be moved: {exc}")
+
+
 def drag(start: Target, end: Target, *, duration: float = 0.45) -> Act:
     ok, why = available()
     if not ok:
@@ -493,6 +597,7 @@ def drag(start: Target, end: Target, *, duration: float = 0.45) -> Act:
         return refusal
     assert a is not None and b is not None
 
+    held = False
     try:
         # The destination is checked before anything is pressed: a drag that
         # has started cannot be taken back halfway.
@@ -505,11 +610,41 @@ def drag(start: Target, end: Target, *, duration: float = 0.45) -> Act:
         ok, why = available()
         if not ok:
             return _fail("drag", why, target=a.label, origin=a.origin)
-        pyautogui.dragTo(b.x, b.y, duration=max(0.1, duration), button="left")
+
+        # A monolithic dragTo() cannot observe the stop latch until the whole
+        # trajectory ends. Deliver bounded segments so emergency-stop releases
+        # the held button and prevents any remaining segments from running.
+        duration = max(0.1, min(float(duration), 5.0))
+        steps = max(2, min(100, int(duration / 0.03) + 1))
+        pyautogui.mouseDown(button="left")
+        held = True
+        for step in range(1, steps + 1):
+            ok, why = available()
+            if not ok:
+                return _fail("drag", f"cancelled safely: {why}",
+                             target=a.label, origin=a.origin)
+            ratio = step / steps
+            x = round(a.x + (b.x - a.x) * ratio)
+            y = round(a.y + (b.y - a.y) * ratio)
+            pyautogui.moveTo(x, y, duration=duration / steps)
+            time.sleep(duration / steps)
+        pyautogui.mouseUp(button="left")
+        held = False
     except Exception as e:
         if type(e).__name__ == "FailSafeException":
             return _fail("drag", "aborted by the mouse-corner failsafe")
         return _fail("drag", f"the drag could not be delivered: {e}",
+                     target=a.label, origin=a.origin)
+    finally:
+        if held:
+            try:
+                pyautogui.mouseUp(button="left")
+            except Exception:
+                pass
+
+    ok, why = available()
+    if not ok:
+        return _fail("drag", f"cancelled safely: {why}",
                      target=a.label, origin=a.origin)
     return Act(ok=True, action="drag", target=a.label, origin=a.origin,
                point=(b.x, b.y), detail=f"{a.x},{a.y} -> {b.x},{b.y}")

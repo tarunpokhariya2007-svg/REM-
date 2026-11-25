@@ -8,15 +8,18 @@ from __future__ import annotations
 
 
 _DESKTOP_ACTIONS = {
-    "observe", "find", "click", "type", "press", "scroll", "focus_window",
+    "observe", "find", "click", "right_click", "double_click", "select", "toggle", "expand", "collapse", "hover", "move", "move_relative", "type", "press", "scroll", "focus_window",
     "pause", "resume", "stop", "emergency_stop", "set_mode",
 }
 
 PLUGIN = {
     "name": "screen_agent",
     "description": (
-        "Operate the active desktop through fresh UI Automation observations, "
-        "semantic control matching, safe actions, and follow-up verification. "
+        "Use screen_process for read-only visual questions about visible content, "
+        "errors, or project files; it sends a screenshot to the vision model. "
+        "Operate the active desktop through fresh UI Automation observations and "
+        "supported Invoke/Selection/Toggle/ExpandCollapse patterns before guarded "
+        "physical input fallback, then verify the result. "
         "Use bounded steps for multi-part native desktop tasks; route application "
         "launches to open_app and web page work to browser_control. Ambiguous "
         "targets are refused, protected fields are never typed into, and "
@@ -25,15 +28,18 @@ PLUGIN = {
     "parameters": {
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "description": "observe | find | click | type | press | scroll | focus_window | pause | resume | stop | set_mode | task | tool"},
+            "action": {"type": "STRING", "description": "observe | find | click | right_click | double_click | select | toggle | expand | collapse | hover | move | move_relative | type | press | scroll | focus_window | pause | resume | stop | set_mode | task | tool"},
             "target": {"type": "STRING", "description": "Visible control or application window name."},
             "text": {"type": "STRING", "description": "Text for a named, non-protected field."},
             "key": {"type": "STRING", "description": "Safe allowlisted key or shortcut."},
             "direction": {"type": "STRING", "description": "Scroll direction: up, down, left, or right."},
             "amount": {"type": "INTEGER", "description": "Scroll amount."},
+            "dx": {"type": "INTEGER", "description": "Bounded cursor offset in pixels for move_relative (maximum 200 each direction)."},
+            "dy": {"type": "INTEGER", "description": "Bounded cursor offset in pixels for move_relative (maximum 200 each direction)."},
+            "position": {"type": "STRING", "description": "Named desktop position for move: center, top_left, top_right, bottom_left, bottom_right."},
             "clear_first": {"type": "BOOLEAN", "description": "Clear a target field before typing when requested."},
             "mode": {"type": "STRING", "description": "Desktop control mode."},
-            "steps": {"type": "ARRAY", "description": "For task: up to eight sequential desktop or existing-tool steps. Tool steps also specify tool_name and tool_parameters.", "items": {"type": "OBJECT", "properties": {"action": {"type": "STRING"}, "target": {"type": "STRING"}, "text": {"type": "STRING"}, "key": {"type": "STRING"}, "direction": {"type": "STRING"}, "amount": {"type": "INTEGER"}, "clear_first": {"type": "BOOLEAN"}, "mode": {"type": "STRING"}, "tool_name": {"type": "STRING"}, "tool_parameters": {"type": "OBJECT"}}}},
+            "steps": {"type": "ARRAY", "description": "For task: up to eight sequential desktop or existing-tool steps. Tool steps also specify tool_name and tool_parameters.", "items": {"type": "OBJECT", "properties": {"action": {"type": "STRING"}, "target": {"type": "STRING"}, "text": {"type": "STRING"}, "key": {"type": "STRING"}, "direction": {"type": "STRING"}, "amount": {"type": "INTEGER"}, "dx": {"type": "INTEGER"}, "dy": {"type": "INTEGER"}, "position": {"type": "STRING"}, "clear_first": {"type": "BOOLEAN"}, "mode": {"type": "STRING"}, "tool_name": {"type": "STRING"}, "tool_parameters": {"type": "OBJECT"}}}},
             "tool_name": {"type": "STRING", "description": "For action=tool, an existing tool name from tool_catalog."},
             "tool_parameters": {"type": "OBJECT", "description": "Arguments for the selected existing tool."},
         },
@@ -119,12 +125,15 @@ def run(parameters, player=None, session_memory=None) -> str:
                         or "status=unverified" in result):
                     break
             summary = " ".join(results)
-            _log(player, summary)
+            _log(player, f"screen_agent task finished {len(results)} step(s)")
             return summary
         if action not in _DESKTOP_ACTIONS:
             return "Unsupported action. Use a desktop action, task, or tool."
         result = _one({**params, "action": action}, player, session_memory)
-        _log(player, f"screen_agent {action}: {result}")
+        if action in {"observe", "find"}:
+            _log(player, f"screen_agent {action}: observation returned")
+        else:
+            _log(player, f"screen_agent {action}: completed")
         return str(result)
     except Exception as exc:
         message = f"Screen agent failed safely: {type(exc).__name__}: {exc}"

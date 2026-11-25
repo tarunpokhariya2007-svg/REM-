@@ -1,0 +1,5 @@
+target=unset
+framework=4.0.30319.42000
+legacy47=False
+legacy472=False
+legacy48=False

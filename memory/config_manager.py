@@ -188,6 +188,53 @@ def get_wake_word_enabled() -> bool:
     return load_api_keys().get("wake_word_enabled", False)
 
 
+def get_persistent_desktop_observation_enabled() -> bool:
+    """User's saved consent for low-frequency local UIA observation only."""
+    return bool(load_api_keys().get("persistent_desktop_observation_enabled", False))
+
+
+@_locked
+def save_persistent_desktop_observation_enabled(enabled: bool) -> None:
+    data = _read_for_write()
+    data["persistent_desktop_observation_enabled"] = bool(enabled)
+    _write_config(data)
+
+
+def get_cloud_screen_vision_enabled() -> bool:
+    """Separate opt-in for sending on-demand screen images to the chosen model."""
+    return bool(load_api_keys().get("cloud_screen_vision_enabled", False))
+
+
+@_locked
+def save_cloud_screen_vision_enabled(enabled: bool) -> None:
+    data = _read_for_write()
+    data["cloud_screen_vision_enabled"] = bool(enabled)
+    _write_config(data)
+
+
+def get_desktop_observation_exclusions() -> list[str]:
+    values = load_api_keys().get("desktop_observation_exclusions", [])
+    if isinstance(values, str):
+        values = values.split(",")
+    if not isinstance(values, (list, tuple)):
+        return []
+    return [str(value).strip()[:100] for value in values if str(value).strip()]
+
+
+@_locked
+def save_desktop_observation_exclusions(values) -> None:
+    if isinstance(values, str):
+        values = values.split(",")
+    cleaned = []
+    for value in values if isinstance(values, (list, tuple, set)) else ():
+        item = str(value or "").strip()[:100]
+        if item and item.casefold() not in {entry.casefold() for entry in cleaned}:
+            cleaned.append(item)
+    data = _read_for_write()
+    data["desktop_observation_exclusions"] = cleaned[:100]
+    _write_config(data)
+
+
 @_locked
 def save_wake_word_enabled(enabled: bool) -> None:
     ensure_config_dir()

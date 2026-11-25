@@ -3,6 +3,7 @@ import sys
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import threading
 import time
@@ -269,37 +270,12 @@ Code for {file_path}:"""
 def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     if not dependencies:
         return "No external dependencies."
-
-    to_install = []
-    for dep in dependencies:
-        pkg_name = re.split(r"[>=<!]", dep)[0].strip()
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "show", pkg_name],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            to_install.append(dep)
-        else:
-            print(f"[DevAgent] ✓ Already installed: {pkg_name}")
-
-    if not to_install:
-        return f"All dependencies already installed: {', '.join(dependencies)}"
-
-    print(f"[DevAgent] 📦 Installing: {to_install}")
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install"] + to_install,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=120, cwd=str(project_dir)
-        )
-        if result.returncode == 0:
-            return f"Installed: {', '.join(to_install)}"
-        return f"Install warning (non-fatal): {result.stderr[:200]}"
-    except subprocess.TimeoutExpired:
-        return "Dependency install timed out (non-fatal)."
-    except Exception as e:
-        return f"Install error (non-fatal): {e}"
+    # A project plan is model output, not user approval to change the Python
+    # environment. Record the requested packages and let the user approve a
+    # separate install step explicitly.
+    names = [str(dep).strip()[:100] for dep in dependencies[:30] if str(dep).strip()]
+    return ("Dependencies were not installed. Explicit user approval is required before "
+            "changing the Python environment: " + ", ".join(names))
 
 def _open_vscode(project_dir: Path) -> bool:
     vscode_candidates = [
@@ -322,60 +298,88 @@ def _open_vscode(project_dir: Path) -> bool:
             continue
     return False
 
-def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
-    print(f"[DevAgent] 🚀 Running: {run_command}")
+def _project_python_command(run_command: str, project_dir: Path) -> list[str]:
+    """Resolve a planner command to one project-contained Python script."""
     try:
-        parts = run_command.split()
-        if parts[0].lower() == "python":
-            parts[0] = sys.executable
+        parts = shlex.split(str(run_command or ""), posix=True)
+    except ValueError as exc:
+        raise ValueError("the proposed run command has invalid quoting") from exc
+    if len(parts) < 2 or len(parts) > 32:
+        raise ValueError("only a Python script entry point can be approved here")
+    executable = Path(parts[0]).name.casefold()
+    if executable not in {"python", "python.exe", "python3", "python3.exe"}:
+        raise ValueError("only Python script execution is supported by this approval gate")
+    script_arg = parts[1]
+    if script_arg.startswith("-") or "\x00" in script_arg:
+        raise ValueError("interpreter flags and inline code are not allowed")
+    root = project_dir.resolve()
+    script = (root / script_arg).resolve()
+    try:
+        script.relative_to(root)
+    except ValueError:
+        raise ValueError("the run script must stay inside the generated project directory") from None
+    if script.suffix.casefold() != ".py" or not script.is_file():
+        raise ValueError("the run target must be an existing Python file inside the project")
+    if any("\x00" in part for part in parts[2:]):
+        raise ValueError("the command contains an invalid argument")
+    if any(any(char in part for char in ";&|><`$") for part in parts):
+        raise ValueError("shell metacharacters are not allowed in the run command")
+    return [sys.executable, str(script), *parts[2:]]
 
-        result = subprocess.run(
-            parts,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout,
-            cwd=str(project_dir)
+
+def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
+    """Run a prevalidated project script only after the confirmation gate calls it."""
+    try:
+        parts = _project_python_command(run_command, project_dir)
+    except ValueError as exc:
+        return f"Project was not run: {exc}."
+    timeout = max(1, min(300, int(timeout)))
+    process = None
+    cancel = None
+    try:
+        process = subprocess.Popen(
+            parts, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            cwd=str(project_dir),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-
-        combined_parts = []
-        if stdout:
-            combined_parts.append(f"STDOUT:\n{stdout}")
-        if stderr:
-            combined_parts.append(f"STDERR:\n{stderr}")
-
-        return "\n\n".join(combined_parts) if combined_parts else "Ran with no output."
-
-    except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
-    except FileNotFoundError as e:
-        return f"Command not found: {e}"
+        cancel = process.terminate
+        from core import desktop_control
+        desktop_control.register_cancel(cancel)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            return (f"Project run timed out after {timeout}s and the process was stopped; "
+                    f"exit code {process.returncode}. Output was captured locally and withheld.")
+        except Exception:
+            if desktop_control.should_stop():
+                return "Project run was interrupted by desktop-control stop; no success is claimed."
+            raise
+        if desktop_control.should_stop():
+            return "Project run was interrupted by desktop-control stop; no success is claimed."
+        output_chars = len(stdout or "") + len(stderr or "")
+        return (f"Project process exited with code {process.returncode}; "
+                f"{output_chars} output characters were captured locally and withheld from the assistant.")
+    except FileNotFoundError:
+        return "Project run failed because the Python interpreter could not be started."
     except Exception as e:
-        return f"Run error: {e}"
+        return f"Project run failed ({type(e).__name__}); output was withheld."
+    finally:
+        if cancel is not None:
+            try:
+                desktop_control.unregister_cancel(cancel)
+            except Exception:
+                pass
 
 def _try_auto_install(error_output: str, project_dir: Path) -> bool:
-    """If there is a ModuleNotFoundError, tries to auto-install the missing package."""
-    pattern = re.compile(
-        r"No module named ['\"]([a-zA-Z0-9_\-\.]+)['\"]", re.IGNORECASE
-    )
-    match = pattern.search(error_output)
-    if not match:
-        return False
-
-    pkg = match.group(1).replace("_", "-").split(".")[0]
-    print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", pkg],
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=60, cwd=str(project_dir)
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    """Deprecated compatibility hook: never install generated dependencies."""
+    return False
 
 def _fix_files(
     error_output: str,
@@ -562,72 +566,37 @@ def _build_project(
         return msg
 
     if dependencies:
-        _update("installing")
-        log(f"Installing {', '.join(dependencies)}...")
+        _update("dependencies")
+        log(f"Checking declared dependencies; automatic installation is disabled: {', '.join(dependencies)}")
         install_result = _install_dependencies(dependencies, project_dir)
         log(install_result)
 
     _open_vscode(project_dir)
+    try:
+        _project_python_command(run_command, project_dir)
+    except ValueError as exc:
+        msg = (f"Project '{proj_name}' was saved to {project_dir}, but I did not run it. "
+               f"The proposed command is not supported by the safe run gate: {exc}.")
+        if speak: speak(msg)
+        return msg
 
-    last_output   = ""
-    auto_installs = 0  
-
-    _update("testing")
-    for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
-        log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
-        last_output = _run_project(run_command, project_dir, timeout)
-        log(f"Output preview: {last_output[:150]}")
-
-        if not _has_error(last_output, run_command):
-            msg = (
-                f"Project '{proj_name}' is working, sir. "
-                f"Built in {attempt} attempt{'s' if attempt > 1 else ''}. "
-                f"Saved to: {project_dir}"
-            )
-            if speak: speak(msg)
-            return f"{msg}\n\nOutput:\n{last_output}"
-
-        if attempt == MAX_FIX_ATTEMPTS:
-            break
-
-        error_type = _classify_error(last_output)
-        if error_type == "dependency_error" and auto_installs < 3:
-            installed = _try_auto_install(last_output, project_dir)
-            if installed:
-                auto_installs += 1
-                log("Missing dependency installed, retrying...")
-                time.sleep(1)
-                continue
-
-        log(f"Fixing errors (type: {error_type})...")
-        try:
-            updated = _fix_files(
-                error_output=last_output,
-                project_description=description,
-                all_files=files,
-                file_codes=file_codes,
-                language=language,
-                project_dir=project_dir,
-                entry_point=entry_point,
-            )
-            file_codes.update(updated)
-            for fixed in updated:
-                _update(file=fixed, file_state="done")
-                log(f"Fixed {fixed}")
-            time.sleep(1)
-        except RateLimitError:
-            msg = "Rate limit reached during fix. Project saved, check it manually in VSCode."
-            if speak: speak(msg)
-            return msg
-        except Exception as e:
-            log(f"Fix step failed: {e}")
-
-    msg = (
-        f"I couldn't fully fix '{proj_name}' after {MAX_FIX_ATTEMPTS} attempts, sir. "
-        f"Project is saved at {project_dir} — open it in VSCode and check manually."
+    _update("awaiting confirmation")
+    from core import confirm
+    detail = (
+        f"Command: {run_command[:300]}\n"
+        f"Working directory: {project_dir}\n"
+        "This runs generated Python code. Dependencies were not installed. "
+        "Captured program output will not be sent to the assistant."
     )
+    pending = confirm.request(
+        key="dev-agent-run-generated-project",
+        title=f"Approve running generated Python project '{proj_name}'?",
+        detail=detail,
+        run=lambda: _run_project(run_command, project_dir, timeout),
+    )
+    msg = f"Project '{proj_name}' was saved to {project_dir}. {pending}"
     if speak: speak(msg)
-    return f"{msg}\n\nLast error:\n{last_output[:600]}"
+    return msg
 
 
 # ─────────────────────────────────────────────────────────────────────────────

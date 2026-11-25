@@ -56,6 +56,10 @@ __pycache__/
 .env.*
 !.env.example
 config/api_keys.json
+data/plugins/aircraft_report_cache.json
+data/plugins/aircraft_report_usage.json
+data/plugins/aircraft_report/
+data/plugins/shopping_list.json
 .venv/
 venv/
 __pycache__/

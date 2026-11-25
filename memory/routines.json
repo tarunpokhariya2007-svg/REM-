@@ -25,8 +25,8 @@
    "source": "",
    "created": 1795455140.0279953,
    "next_ts": 0.0,
-   "last_run": 1795513586.5209358,
-   "runs": 13,
+   "last_run": 1795594399.4037242,
+   "runs": 22,
    "last_result": "ran"
   },
   {
@@ -84,10 +84,10 @@
    "enabled": true,
    "source": "",
    "created": 1795455140.0378277,
-   "next_ts": 1795514400.0,
-   "last_run": 1795513606.561683,
-   "runs": 8,
-   "last_result": "ran"
+   "next_ts": 1795595400.0,
+   "last_run": 1795539625.5583618,
+   "runs": 13,
+   "last_result": "skipped: missed by 883 min"
   }
  ],
  "seeded": true

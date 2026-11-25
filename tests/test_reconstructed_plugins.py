@@ -15,7 +15,7 @@ class ReconstructedPluginTests(unittest.TestCase):
         actions = discover_actions(ROOT / "actions", logger=lambda _m: None)
         registry = discover_plugins(ROOT / "plugins", actions.names(), logger=lambda _m: None)
         rows = registry.list_for_ui()
-        self.assertEqual(len(rows), 26)
+        self.assertEqual(len(rows), 27)
         self.assertTrue(all(row["valid"] for row in rows), rows)
         names = [row["name"] for row in rows]
         self.assertEqual(len(names), len(set(names)))

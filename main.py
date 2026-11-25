@@ -92,6 +92,7 @@ from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
+from core.request_context      import RequestContext
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
 from core.wake_phrase          import (
@@ -419,9 +420,12 @@ TOOL_DECLARATIONS = [
     {
         "name": "screen_process",
         "description": (
-            "Captures the screen or webcam image and lets you analyze it. "
-            "MUST be called when user asks what is on screen, what you see, "
-            "look at camera, analyze my screen, etc. "
+            "Read-only screen observation: captures the current desktop, identifies the "
+            "foreground application and window, and supplies available UI Automation/OCR "
+            "text plus the screenshot for visual analysis. Call this for 'check my screen', "
+            "'what is on my screen', 'describe the current window', visible error messages, "
+            "or looking at a project. No target, click, or coordinate is needed. "
+            "Also captures webcam images when explicitly requested. "
             "You have NO visual ability without this tool. "
             "After the image is captured it is sent directly to you — describe what you see and answer the user's question. "
             "When using camera: the live view stays open until user says close it or calls close_camera."
@@ -614,16 +618,27 @@ class RemLive:
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
+        self._audio_queue_overflows = 0
+        self._audio_overflow_notice_at = 0.0
         self._loop                     = None
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
+        self._realtime_input_lock  = None    # serialize microphone input with one-frame vision delivery
         self._vision_cam_active    = False   # True if camera was opened for vision → auto-close after response
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
+        self._vision_state_lock    = threading.Lock()
+        self._vision_generation    = 0       # invalidates late completions from an old session/request
+        self._vision_waiting_generation = None
+        self._vision_waiting_angle = "screen"
         self._last_user_command    = ""      # direct input transcript; never page/document text
+        self._last_user_command_source = ""  # voice | typed | dashboard; tool output is never a source
+        self._request_context_lock = threading.Lock()
+        self._request_context = None
+        self._dispatch_context_local = threading.local()
         self._interrupted          = False   # True while draining audio after user interrupt
         # Which engine is holding the conversation, and what it can do.
         # None means Gemini Live — the default and, unless somebody has gone to
@@ -663,6 +678,7 @@ class RemLive:
         self.ui.on_push_to_talk   = self.set_push_to_talk
         self.ui.ptt_hold          = self._on_ptt
         self.ui.on_text_command   = self._on_text_command
+        self.ui.on_external_text_command = self._on_external_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
@@ -738,6 +754,17 @@ class RemLive:
         # through run_in_executor from its own side.
         self.ui.tool_catalog = self._tool_catalog
         self.ui.run_tool     = self._run_tool_for_plugin
+
+        # Restore only saved local UIA observation consent. This never grants
+        # cloud image sharing or desktop action authority.
+        try:
+            from memory.config_manager import get_persistent_desktop_observation_enabled
+            if get_persistent_desktop_observation_enabled():
+                from core import desktop_control
+                self.ui.set_desktop_control_status(
+                    desktop_control.set_persistent_observation(True))
+        except Exception as exc:
+            print(f"[Desktop] Persistent local observation was not started: {type(exc).__name__}")
 
         # Background tasks (core/tasks). Attached once request_say exists, so a
         # finished task can speak; attaching is also what resumes any task a
@@ -933,8 +960,12 @@ class RemLive:
                              "browser_control", "screen_process", "open_app", "send_message"}
             if name in control_tools:
                 from core import desktop_control
+                context = getattr(self._dispatch_context_local, "context", None)
+                if context is None:
+                    context = self._current_request_context()
+                user_request, request_source = self._usable_request_context(context)
                 allowed, reason = desktop_control.authorize_user_request(
-                    self._last_user_command, name, parameters)
+                    user_request, name, parameters, source=request_source)
                 if not allowed:
                     return outcome.failed(name, reason)
             if self._action_registry.has(name):
@@ -947,6 +978,142 @@ class RemLive:
         except Exception as e:
             return outcome.failed(name, f"the tool raised an error: {e}")
         return outcome.failed(name, "no tool with this name is available")
+
+    def _record_user_request(self, text: str, source: str) -> None:
+        """Record direct user input only; tool results never pass through here."""
+        if source not in {"voice", "typed", "dashboard", "telegram"}:
+            raise ValueError("invalid direct request source")
+        with self._request_context_lock:
+            self._last_user_command = str(text or "").strip()
+            self._last_user_command_source = source
+            self._request_context = RequestContext.create(self._last_user_command, source)
+
+    def _current_user_request(self) -> tuple[str, str]:
+        """Read the direct request and its trust source as one atomic snapshot."""
+        with self._request_context_lock:
+            return self._last_user_command, self._last_user_command_source
+
+    def _current_request_context(self):
+        """Return the immutable authorization context for the latest user turn."""
+        with self._request_context_lock:
+            context = getattr(self, "_request_context", None)
+            # Compatibility for older embedders/test fixtures that initialize
+            # the pre-context request fields directly. Production instances
+            # always create the context in __init__ and _record_user_request.
+            if context is None:
+                instruction = str(getattr(self, "_last_user_command", "") or "")
+                source = str(getattr(self, "_last_user_command_source", "untrusted") or "untrusted")
+                if instruction:
+                    context = RequestContext.create(instruction, source)
+                    self._request_context = context
+            return context
+
+    @staticmethod
+    def _usable_request_context(context):
+        if context is None or context.is_expired():
+            return "", "untrusted"
+        return context.instruction, context.source
+
+    def _run_with_request_context(self, context, fn):
+        """Bind a snapshot to a worker and its nested plugin tool routes."""
+        local = getattr(self, "_dispatch_context_local", None)
+        if local is None:
+            local = self._dispatch_context_local = threading.local()
+        previous = getattr(local, "context", None)
+        local.context = context
+        try:
+            return fn()
+        finally:
+            if previous is None:
+                try:
+                    del local.context
+                except AttributeError:
+                    pass
+            else:
+                local.context = previous
+
+    def _confirmation_result(self, title: str, status: str, detail: str) -> None:
+        """Feed a human's later confirmation decision into the active session.
+
+        The confirmation worker calls this from a background thread. The result
+        is a system event, not a new user request or fresh authorization.
+        """
+        session, loop = self.session, self._loop
+        if session is None or loop is None or loop.is_closed():
+            self.ui.write_log("SYS: Confirmation finished; the assistant session is unavailable for its result.")
+            return
+        status = str(status or "failed")
+        safe_title = str(title or "the pending action")[:180]
+        safe_detail = str(detail or "No further result was provided.")[:1200]
+        text = (
+            "SYSTEM EVENT: A pending user confirmation has finished. This event is "
+            "not a new user request and grants no permission for additional actions. "
+            "Do not call tools. Tell the user the outcome truthfully, and ask what "
+            "they want next if more work is needed.\n"
+            f"Action: {safe_title}\nOutcome: {status}\nResult: {safe_detail}"
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            self._send_confirmation_result(session, text), loop)
+
+        def _delivery_done(done):
+            try:
+                done.result()
+            except Exception as exc:
+                self.ui.write_log(
+                    "ERR: Confirmation outcome could not reach the assistant "
+                    f"session ({type(exc).__name__})."
+                )
+
+        future.add_done_callback(_delivery_done)
+
+    async def _send_confirmation_result(self, session, text: str) -> None:
+        """Send a resolved confirmation only to the session that requested it."""
+        if session is not self.session:
+            raise RuntimeError("the requesting assistant session has ended")
+        lock = self._realtime_input_lock
+        if lock is None:
+            raise RuntimeError("the realtime input channel is unavailable")
+        async with lock:
+            if session is not self.session:
+                raise RuntimeError("the requesting assistant session has ended")
+            await session.send_realtime_input(text=text)
+            self._arm_stall()
+
+    def _begin_vision(self, cooldown: float = 4.0):
+        """Atomically claim the single vision slot and retain its cooldown."""
+        now = time.monotonic()
+        with self._vision_state_lock:
+            remaining = cooldown - (now - self._vision_last_time)
+            if self._vision_busy or remaining > 0:
+                return None, max(0.0, remaining)
+            self._vision_generation += 1
+            self._vision_busy = True
+            self._vision_last_time = now
+            return self._vision_generation, 0.0
+
+    def _finish_vision(self, generation: int) -> bool:
+        """Release only the matching operation; stale tasks cannot clear newer state."""
+        with self._vision_state_lock:
+            if generation != self._vision_generation:
+                return False
+            self._vision_busy = False
+            self._pending_vision = None
+            self._vision_close_pending = False
+            self._vision_waiting_generation = None
+            self._vision_cam_active = False
+            return True
+
+    def _reset_vision_state(self, *, reset_cooldown: bool = True) -> None:
+        """Invalidate pending vision work when the Live session is replaced."""
+        with self._vision_state_lock:
+            self._vision_generation += 1
+            self._pending_vision = None
+            self._vision_busy = False
+            self._vision_cam_active = False
+            self._vision_close_pending = False
+            self._vision_waiting_generation = None
+            if reset_cooldown:
+                self._vision_last_time = 0.0
 
     # ── Leaving ─────────────────────────────────────────────────────────────────
     # Closing the window used to end the process on the spot: the thread holding
@@ -1246,7 +1413,7 @@ class RemLive:
         return (url, key, f"{url}/auto-login?key={key}", manual,
                 getattr(self._dashboard, "_bind_error", "") or "")
 
-    def _on_text_command(self, text: str):
+    def _on_text_command(self, text: str, *, source: str = "typed"):
         if not self._loop or not self.session:
             return
         # Respect wake-word sleep: a typed command must not be answered while
@@ -1257,6 +1424,9 @@ class RemLive:
                 f"SYS: REM is asleep — say ‘{WAKE_PHRASE}’ or tap WAKE NOW first."
             )
             return
+        # This text came directly from the user's input box/command surface.
+        # Keep it as the authorization context for the Live response it starts.
+        self._record_user_request(text, source)
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
@@ -1264,6 +1434,10 @@ class RemLive:
             ),
             self._loop
         )
+
+    def _on_external_text_command(self, text: str):
+        """Let external chat relay text without granting desktop authority."""
+        return self._on_text_command(text, source="telegram")
 
     def _tail_active(self) -> bool:
         """True while the speakers may still be finishing our last sentence."""
@@ -1611,18 +1785,22 @@ class RemLive:
 
         return out
 
-    async def _execute_tool(self, fc) -> types.FunctionResponse:
+    async def _execute_tool(self, fc, request_context=None) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
+        request_context = request_context or self._current_request_context()
+        user_request, request_source = self._usable_request_context(request_context)
 
         control_tools = {"screen_agent", "desktop_ui", "computer_control", "computer_settings",
                          "browser_control", "screen_process", "open_app", "send_message"}
         if name in control_tools:
             from core import desktop_control
             allowed, reason = desktop_control.authorize_user_request(
-                self._last_user_command, name, args)
+                user_request, name, args, source=request_source)
             if not allowed:
-                print(f"[REM] Refused computer action from unrelated context ({name}).")
+                task_id = getattr(request_context, "task_id", "missing")
+                age = (f"{request_context.age():.1f}s" if request_context else "unknown")
+                print(f"[REM] Desktop authorization refused task={task_id} tool={name} age={age} category=missing_or_unrelated_context")
                 return types.FunctionResponse(
                     id=fc.id, name=name, response={"result": reason})
 
@@ -1648,6 +1826,21 @@ class RemLive:
                 response={"result": "ok", "silent": True}
             )
 
+        if (name == "screen_process"
+                and str(args.get("angle", "screen")).strip().lower() == "screen"):
+            from memory.config_manager import get_cloud_screen_vision_enabled
+            if not get_cloud_screen_vision_enabled():
+                result = (
+                    "Cloud screen vision is disabled. Enable it in the COMPUTER USE "
+                    "settings after reviewing the separate screen-sharing consent. "
+                    "No screenshot was captured or sent."
+                )
+                if not self.ui.muted:
+                    self.ui.set_state("LISTENING")
+                print("[Vision] Refused cloud delivery: separate screen-vision permission is off")
+                return types.FunctionResponse(
+                    id=fc.id, name=name, response={"result": result})
+
         loop   = asyncio.get_event_loop()
         result = "Done."
 
@@ -1669,40 +1862,63 @@ class RemLive:
                     result = await loop.run_in_executor(None, undo_stack.undo_last)
 
             elif name == "screen_process":
-                import time as _t_mod
-                _now = _t_mod.monotonic()
                 _cooldown = 4.0  # seconds — covers echo window after speaking ends
-                if self._vision_busy or (_now - self._vision_last_time) < _cooldown:
-                    _wait = max(0, _cooldown - (_now - self._vision_last_time))
+                _vision_id, _wait = self._begin_vision(_cooldown)
+                if _vision_id is None:
                     print(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
                     result = "Vision is still processing the previous request. I will not call this again."
                 else:
-                    self._vision_busy      = True
-                    self._vision_last_time = _now
-                    angle     = args.get("angle", "screen").lower()
-                    user_text = args.get("text", "What do you see?")
-                    if angle == "camera":
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
-                        self.ui.start_camera_stream()
-                        self._vision_cam_active = True
-                        print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
-                        _stall = "camera"
-                    else:
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
-                        print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
-                        _stall = "screen"
-                    self._pending_vision = (img_b, mime_t, user_text, angle)
-                    # The image is attached to this same exchange, so there is
-                    # nothing to stall for and nothing to announce. Asking for an
-                    # acknowledgement here is what produced two spoken answers —
-                    # the model filled that turn by answering the question from
-                    # imagination, then answered it again once it could see.
-                    result = (
-                        f"[VISION_ACTIVE] {_stall.capitalize()} captured and attached to this "
-                        f"same exchange. Do not acknowledge and do not answer yet — the image "
-                        f"is arriving with this result. Reply once, from what you actually see "
-                        f"in it."
-                    )
+                    try:
+                        angle = str(args.get("angle", "screen")).strip().lower()
+                        user_text = str(args.get("text", "What do you see?")).strip()
+                        if angle == "camera":
+                            img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
+                            from core.screen_observation import prepare_image_for_live
+                            image_payload = prepare_image_for_live(img_b, mime_t)
+                            print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                            vision_text = user_text
+                        elif angle == "screen":
+                            from core import desktop_control, screenview
+                            from core.screen_observation import (
+                                capture_observation, prepare_image_for_live, vision_question,
+                            )
+                            with desktop_control.action("observe"):
+                                img_b, mime_t, observed = await loop.run_in_executor(
+                                    None,
+                                    lambda: capture_observation(
+                                        _capture_screen,
+                                        lambda: screenview.look(budget_s=1.2, allow_ocr=True),
+                                        preflight=screenview.assert_observation_allowed,
+                                    ),
+                                )
+                            image_payload = prepare_image_for_live(img_b, mime_t)
+                            vision_text = vision_question(
+                                user_text, observed,
+                                user_request=user_request,
+                            )
+                            print(f"[Vision] 🖥️  Screen captured ({len(img_b):,} bytes; observation metadata collected)")
+                        else:
+                            raise ValueError("angle must be 'screen' or 'camera'.")
+                        with self._vision_state_lock:
+                            if _vision_id != self._vision_generation:
+                                raise RuntimeError("The Live session changed during screen capture.")
+                            self._pending_vision = (
+                                _vision_id, self.session, image_payload, mime_t,
+                                vision_text, angle,
+                            )
+                        if angle == "camera":
+                            self.ui.start_camera_stream()
+                            self._vision_cam_active = True
+                        # This is deliberately pending, not attached. The image
+                        # is only reported as delivered after the Live send returns.
+                        result = (
+                            "[VISION_PENDING] The current frame was captured locally. "
+                            "The image and question will be sent next; wait for that "
+                            "input before describing any screen content."
+                        )
+                    except BaseException:
+                        self._finish_vision(_vision_id)
+                        raise
 
             elif name == "close_camera":
                 self.ui.stop_camera_stream()
@@ -1778,9 +1994,11 @@ class RemLive:
                     args["mode"] = "improve"
                 _ctx = {"player": self.ui, "speak": self.speak,
                         "response": None,
-                        "session_memory": ({"user_request": self._last_user_command}
+                        "session_memory": ({"user_request": user_request}
                                            if name in control_tools else None)}
-                r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
+                r = await loop.run_in_executor(
+                    None, lambda: self._run_with_request_context(
+                        request_context, lambda: self._action_registry.run(name, args, _ctx)))
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
                 if (name == "web_search" and r
@@ -1798,16 +2016,24 @@ class RemLive:
                 if self._plugin_registry.has(name):
                     r = await loop.run_in_executor(
                         None,
-                        lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+                        lambda: self._run_with_request_context(
+                            request_context,
+                            lambda: self._plugin_registry.run(
+                                name, args, player=self.ui, session_memory=None))
                     )
                     result = r or "Done."
                 else:
                     result = f"Unknown tool: {name}"
 
         except Exception as e:
-            result = f"Tool '{name}' failed: {e}"
-            traceback.print_exc()
-            self.speak_error(name, e)
+            if name == "screen_process":
+                result = ("Screen observation failed; no image was sent. "
+                          f"{type(e).__name__}: {e}")
+                print(f"[Vision] ⚠️ {result}")
+            else:
+                result = f"Tool '{name}' failed: {e}"
+                traceback.print_exc()
+                self.speak_error(name, e)
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -1841,12 +2067,50 @@ class RemLive:
             # mic / phone PCM through the new `audio` field instead. Queue items
             # are {"data": <bytes>, "mime_type": <str>} from _listen_audio and
             # the phone relay.
-            await self.session.send_realtime_input(
-                audio=types.Blob(
-                    data=msg["data"],
-                    mime_type=msg.get("mime_type", "audio/pcm"),
+            async with self._realtime_input_lock:
+                await self.session.send_realtime_input(
+                    audio=types.Blob(
+                        data=msg["data"],
+                        mime_type=msg.get("mime_type", "audio/pcm"),
+                    )
                 )
-            )
+
+    def _queue_realtime_audio(self, message: dict) -> bool:
+        """Enqueue live mic audio without blocking; keep the newest audio on overflow.
+
+        The event-loop consumer can stall briefly during network/tool traffic.
+        Retaining old microphone chunks would add conversational latency, so a
+        full queue sheds its oldest chunk and accepts the fresh one. The policy
+        is counted and rate-limited in logs; the audio callback never waits.
+        """
+        try:
+            self.out_queue.put_nowait(message)
+            return True
+        except asyncio.QueueFull:
+            self._audio_queue_overflows = getattr(self, "_audio_queue_overflows", 0) + 1
+            try:
+                self.out_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self.out_queue.put_nowait(message)
+            except asyncio.QueueFull:
+                # Defensive only: normal enqueue and dequeue are serialized on
+                # the asyncio loop, so another producer should not race here.
+                accepted = False
+            else:
+                accepted = True
+            now = time.monotonic()
+            last = getattr(self, "_audio_overflow_notice_at", 0.0)
+            if now - last >= 30.0:
+                self._audio_overflow_notice_at = now
+                try:
+                    self.ui.write_log(
+                        f"SYS: Audio input queue is full; replaced older audio with "
+                        f"the latest chunk (overflows: {self._audio_queue_overflows}).")
+                except Exception:
+                    pass
+            return accepted
 
     async def _listen_audio(self):
         print("[REM] 🎤 Mic started")
@@ -1915,7 +2179,7 @@ class RemLive:
             if not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
+                    self._queue_realtime_audio,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
                 # Feed the live mic level to the HUD so the waveform reacts to
@@ -1968,48 +2232,78 @@ class RemLive:
             print(f"[REM] ❌ Mic: {e}")
             raise
 
-    async def _flush_pending_vision(self) -> bool:
-        """Send a captured frame immediately after its tool response.
-
-        The frame is already in hand by the time `screen_process` returns — the
-        capture happened inside the tool call. The old flow still made the model
-        speak a turn first and only injected the image on that turn's
-        turn_complete, which cost a whole extra round trip AND produced two
-        spoken answers: one improvised without the picture, then the real one.
-        Sending it here means the model has the tool result and the image before
-        it generates anything, so the user gets one answer, sooner.
-        """
-        if not (self._pending_vision and self.session):
+    async def _flush_pending_vision(self, *, _input_lock_held: bool = False) -> bool:
+        """Send exactly one captured frame and its prompt through Live realtime input."""
+        pending = self._pending_vision
+        if not pending:
+            return False
+        generation, session, image_payload, mime_type, question, angle = pending
+        with self._vision_state_lock:
+            if (generation != self._vision_generation or session is not self.session):
+                valid = False
+            else:
+                valid = True
+                self._pending_vision = None
+        if not valid:
+            self._finish_vision(generation)
             return False
 
-        import base64 as _b64
-        img_b, mime_t, question, angle = self._pending_vision
-        self._pending_vision = None
-        b64 = _b64.b64encode(img_b).decode("ascii")
-        print(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
+        try:
+            # google-genai 2.34.0 documents `video` as the realtime image/frame
+            # input. It accepts one realtime field per call, so send the frame
+            # once, then its textual question in a second ordered call. This
+            # avoids mixing client_content into the continuously realtime audio
+            # session and uses the same active/resumable Live connection.
+            async def _send_frame_and_question():
+                await session.send_realtime_input(
+                    video=types.Blob(data=image_payload, mime_type=mime_type)
+                )
+                self._arm_stall()
+                await session.send_realtime_input(text=question)
 
-        # Label the source. Without it the image arrives carrying nothing but
-        # the user's own sentence, and a screenshot of this app — which has a
-        # face in the middle of it — got read as a photo of the user. What the
-        # label *means* is explained once, in the generated [SELF] block.
-        src = ("[IMAGE SOURCE: WEBCAM]" if angle == "camera"
-               else "[IMAGE SOURCE: SCREEN CAPTURE]")
-        await self.session.send_client_content(
-            turns={"role": "user", "parts": [
-                {"inline_data": {"mime_type": mime_t, "data": b64}},
-                {"text": f"{src}\n\n{question}"},
-            ]},
-            turn_complete=True,
-        )
-
-        if self._vision_cam_active:
-            # Camera: stay busy until REM has finished speaking the answer,
-            # then close the preview.
-            self._vision_cam_active    = False
-            self._vision_close_pending = True
-        else:
-            self._vision_busy = False
-        return True
+            if _input_lock_held:
+                await _send_frame_and_question()
+            else:
+                async with self._realtime_input_lock:
+                    await _send_frame_and_question()
+            with self._vision_state_lock:
+                if generation != self._vision_generation:
+                    return False
+                self._vision_waiting_generation = generation
+                self._vision_waiting_angle = angle
+                self._vision_cam_active = angle == "camera"
+                self._vision_close_pending = True
+            size = len(image_payload)
+            print(f"[Vision] 📤 Live accepted one {mime_type} frame ({size:,} bytes) and its question")
+            return True
+        except asyncio.CancelledError:
+            self._finish_vision(generation)
+            raise
+        except Exception as exc:
+            if (not self._finish_vision(generation)
+                    or session is not self.session):
+                return False
+            if angle == "camera":
+                try:
+                    self.ui.stop_camera_stream()
+                except Exception:
+                    pass
+            message = ("Screen image delivery failed; the model must not describe "
+                       "screen content because it did not receive a confirmed image. "
+                       f"{type(exc).__name__}: {exc}")
+            self.ui.write_log(f"ERR: screen_process — {message[:180]}")
+            # If the websocket still accepts input, give the model an explicit
+            # failure turn so it can tell the user honestly. If it does not, the
+            # local log remains authoritative and the next reconnect can recover.
+            try:
+                self._arm_stall()
+                await session.send_realtime_input(text=message)
+            except Exception as report_exc:
+                self.ui.write_log(
+                    f"ERR: screen_process failure notice could not be sent: "
+                    f"{type(report_exc).__name__}: {report_exc}"
+                )
+            return False
 
     async def _receive_audio(self):
         print("[REM] 👂 Recv started")
@@ -2073,6 +2367,11 @@ class RemLive:
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
+                                # A fresh direct voice turn invalidates any
+                                # prior typed/dashboard request before its own
+                                # transcript is complete.
+                                if not in_buf:
+                                    self._record_user_request("", "voice")
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
 
@@ -2087,11 +2386,17 @@ class RemLive:
                                 in_buf  = []
                                 out_buf = []
                                 self._visemes.reset()
+                                _vision_id = self._vision_waiting_generation
+                                _close_camera = self._vision_waiting_angle == "camera"
+                                if _vision_id is not None:
+                                    self._finish_vision(_vision_id)
+                                if _close_camera:
+                                    self.ui.stop_camera_stream()
                                 continue
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
-                                self._last_user_command = full_in
+                                self._record_user_request(full_in, "voice")
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
@@ -2123,27 +2428,43 @@ class RemLive:
                             out_buf = []
 
                             if self._vision_close_pending:
-                                # This turn_complete IS the vision answer — close camera + release busy flag
-                                self._vision_close_pending = False
-                                self._vision_busy = False
-                                async def _cam_close():
-                                    await asyncio.sleep(2.0)
-                                    self.ui.stop_camera_stream()
-                                self._keep_task(asyncio.create_task(_cam_close()))
+                                # Keep the slot occupied until this observation's
+                                # answer completes, then release only its generation.
+                                _vision_id = self._vision_waiting_generation
+                                _close_camera = self._vision_waiting_angle == "camera"
+                                if _vision_id is not None:
+                                    self._finish_vision(_vision_id)
+                                if _close_camera:
+                                    async def _cam_close():
+                                        await asyncio.sleep(2.0)
+                                        self.ui.stop_camera_stream()
+                                    self._keep_task(asyncio.create_task(_cam_close()))
 
                     if response.tool_call:
                         current_user_request = " ".join(in_buf).strip()
                         if current_user_request:
-                            self._last_user_command = current_user_request
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[REM] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
-                        await self._flush_pending_vision()
+                            self._record_user_request(current_user_request, "voice")
+                        # One Live function-call batch belongs to the request
+                        # snapshot that produced it. Capture once: typed or
+                        # remote input arriving while a worker runs must not
+                        # replace authority between calls in this batch.
+                        request_context = self._current_request_context()
+                        async with self._realtime_input_lock:
+                            try:
+                                fn_responses = []
+                                for fc in response.tool_call.function_calls:
+                                    print(f"[REM] 📞 {fc.name}")
+                                    fr = await self._execute_tool(fc, request_context)
+                                    fn_responses.append(fr)
+                                await self.session.send_tool_response(
+                                    function_responses=fn_responses
+                                )
+                                await self._flush_pending_vision(_input_lock_held=True)
+                            except BaseException:
+                                pending = self._pending_vision
+                                if pending:
+                                    self._finish_vision(pending[0])
+                                raise
         except Exception as e:
             print(f"[REM] ❌ Recv: {e}")
             traceback.print_exc()
@@ -2626,10 +2947,7 @@ class RemLive:
             with self._speaking_lock:
                 speaking = self._is_speaking
             if not speaking and not self.ui.muted:
-                try:
-                    self.out_queue.put_nowait(chunk)
-                except asyncio.QueueFull:
-                    pass
+                self._queue_realtime_audio(chunk)
 
     def _on_phone_connected(self) -> None:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
@@ -2655,6 +2973,9 @@ class RemLive:
                     # has no desktop WAKE button — so it wakes REM if asleep.
                     if self._wake_enabled and not self._awake:
                         self.wake(reason="remote command")
+                    # Dashboard text is direct user input. Never derive this
+                    # authorization context from tool or screen output.
+                    self._record_user_request(text, "dashboard")
                     await self.session.send_client_content(
                         turns={"role": "user", "parts": [{"text": text}]},
                         turn_complete=True,
@@ -2805,6 +3126,7 @@ class RemLive:
             show = self.ui.show_confirm,
             hide = self.ui.hide_confirm,
             log  = self.ui.write_log,
+            result = self._confirmation_result,
         )
         set_trim_notifier(self.ui.write_log)
 
@@ -2890,17 +3212,14 @@ class RemLive:
                     session.send_client_content = _send_and_arm
 
                     self.session          = session
+                    self._realtime_input_lock = asyncio.Lock()
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
                     self._rx_deadline     = None
 
                     # Reset transient state that must not carry over from a previous session
-                    self._pending_vision       = None
-                    self._vision_cam_active    = False
-                    self._vision_close_pending = False
-                    self._vision_busy          = False
-                    self._vision_last_time     = 0.0
+                    self._reset_vision_state(reset_cooldown=True)
                     self._interrupted          = False
 
                     print("[REM] Connected.")

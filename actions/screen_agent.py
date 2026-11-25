@@ -34,6 +34,16 @@ def _describe(view, cap=65):
             row = {"id": el.eid, "role": el.role,
                    "name": el.name or el.value or "(unnamed)",
                    "enabled": el.enabled}
+            if el.automation_id:
+                row["automation_id"] = el.automation_id
+            if el.control_type:
+                row["control_type"] = el.control_type
+            if el.parent_name:
+                row["parent"] = el.parent_name
+            if el.patterns:
+                row["patterns"] = list(el.patterns)
+            if el.focused:
+                row["focused"] = True
             if el.focused:
                 row["focused"] = True
             if el.protected:
@@ -106,7 +116,8 @@ _CONSEQUENTIAL_LABELS = ("send", "submit", "delete", "remove", "purchase",
                          "install", "allow access", "disable security")
 
 
-def _confirmed_click(target_label: str, app: str, title: str, player=None) -> str:
+def _confirmed_click(target_label: str, app: str, title: str, player=None,
+                     click_action: str = "click") -> str:
     """After a human approves, re-read and re-resolve the live target."""
     try:
         with desktop_control.action("confirmed click"):
@@ -116,7 +127,12 @@ def _confirmed_click(target_label: str, app: str, title: str, player=None) -> st
             target, why = _resolve(view, target_label)
             if why or target is None:
                 return why or "The target is no longer available; nothing was clicked."
-            result = screenact.click(target, expect_process=view.app)
+            if click_action == "right_click":
+                result = screenact.right_click(target, expect_process=view.app)
+            elif click_action == "double_click":
+                result = screenact.double_click(target, expect_process=view.app)
+            else:
+                result = screenact.click(target, expect_process=view.app)
             after, verification = _verified_after(view, target=target)
             desktop_control.report("confirmed click", verification, after.app)
             _publish(player)
@@ -165,8 +181,8 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
         _publish(player)
         return f"Computer-use mode is now {desktop_control.snapshot()['mode']}."
 
-    if action not in {"observe", "find", "click", "type", "press", "scroll", "focus_window"}:
-        return "Supported actions: observe, find, click, type, press, scroll, focus_window, pause, resume, stop, set_mode."
+    if action not in {"observe", "find", "click", "right_click", "double_click", "select", "toggle", "expand", "collapse", "hover", "move", "move_relative", "type", "press", "scroll", "focus_window"}:
+        return "Supported actions: observe, find, click, right_click, double_click, select, toggle, expand, collapse, hover, move, move_relative, type, press, scroll, focus_window, pause, resume, stop, set_mode."
 
     try:
         with desktop_control.action(action):
@@ -204,8 +220,25 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                 _publish(player)
                 return f"{result}; {verification}. Active: {after.app} — {after.title}"
 
-            if action in ("click", "type"):
+            if action == "move_relative":
+                dx, dy = int(params.get("dx", 0)), int(params.get("dy", 0))
+                outcome = screenact.move_relative(dx, dy)
+                verification = "cursor moved" if outcome.ok else f"failed: {outcome.error}"
+                desktop_control.report(action, verification, before.app)
+                _publish(player)
+                return str(outcome)
+
+            if action == "move" and not str(params.get("target", "")).strip():
+                outcome = screenact.move_to_screen_position(params.get("position", ""))
+                desktop_control.report(action, "cursor moved" if outcome.ok else
+                                       f"failed: {outcome.error}", before.app)
+                _publish(player)
+                return str(outcome)
+
+            if action in {"click", "right_click", "double_click", "select", "toggle", "expand", "collapse", "hover", "move", "type"}:
                 target_text = str(params.get("target", "")).strip()
+                if action in {"hover", "move"} and not target_text:
+                    return "Name a visible control to move the cursor to."
                 roles = ((screenview.ROLE_EDIT, screenview.ROLE_COMBOBOX)
                          if action == "type" else ())
                 target, why = _resolve(before, target_text, roles=roles,
@@ -224,19 +257,43 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                     desktop_control.report(action, "not executed: target ambiguous or missing", before.app)
                     _publish(player)
                     return why
+                if action in {"select", "toggle", "expand", "collapse"}:
+                    patterns = {"select": ("selection_item", None),
+                                "toggle": ("toggle", None),
+                                "expand": ("expand_collapse", "expand"),
+                                "collapse": ("expand_collapse", "collapse")}
+                    pattern, value = patterns[action]
+                    ok, detail = screenview.perform_uia_pattern(target, pattern, value)
+                    if not ok:
+                        desktop_control.report(action, f"not performed: {detail}", before.app)
+                        _publish(player)
+                        return f"I could not use the target's fresh UI Automation {pattern} pattern: {detail}. No coordinate action was attempted."
+                    after, verification = _verified_after(before, target=target)
+                    desktop_control.report(action, verification, after.app)
+                    _publish(player)
+                    return f"{action.title()} {target.label}; {verification}."
+                if action in {"click", "right_click", "double_click"} and any(
+                        word in fold(target.label) for word in _CONSEQUENTIAL_LABELS):
+                    from core import confirm
+                    if confirm.pending_title():
+                        return "Another confirmation is already waiting; no click was made."
+                    return confirm.request(
+                        key="desktop-consequential-click",
+                        title=f"Confirm desktop action: {target.label[:70]}?",
+                        detail=f"Review the active {before.app} window before approving.",
+                        run=lambda: _confirmed_click(target_text, before.app,
+                                                     before.title, player, action),
+                    )
                 if action == "click":
-                    if any(word in fold(target.label) for word in _CONSEQUENTIAL_LABELS):
-                        from core import confirm
-                        if confirm.pending_title():
-                            return "Another confirmation is already waiting; no click was made."
-                        return confirm.request(
-                            key="desktop-consequential-click",
-                            title=f"Confirm desktop action: {target.label[:70]}?",
-                            detail=f"Review the active {before.app} window before approving.",
-                            run=lambda: _confirmed_click(target_text, before.app,
-                                                         before.title, player),
-                        )
                     outcome = screenact.click(target, expect_process=before.app)
+                elif action == "right_click":
+                    outcome = screenact.right_click(target, expect_process=before.app)
+                elif action == "double_click":
+                    outcome = screenact.double_click(target, expect_process=before.app)
+                elif action == "hover":
+                    outcome = screenact.hover(target)
+                elif action == "move":
+                    outcome = screenact.move_cursor(target)
                 else:
                     text = str(params.get("text", ""))
                     if not text:
@@ -244,12 +301,15 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                     if target.protected:
                         return "That field is protected; enter the secret yourself."
                     outcome = screenact.type_text(text, target=target,
-                        clear_first=bool(params.get(
-                            "clear_first",
+                        clear_first=bool(params.get("clear_first",
                             any(term in fold(target.label) for term in
                                 ("search", "query", "address", "url")))))
                 if not outcome.ok:
                     desktop_control.report(action, f"failed: {outcome.error}", before.app)
+                    _publish(player)
+                    return str(outcome)
+                if action in {"hover", "move"}:
+                    desktop_control.report(action, "cursor moved to resolved control", before.app)
                     _publish(player)
                     return str(outcome)
                 after, verification = _verified_after(before, target=target,
@@ -330,7 +390,10 @@ TOOL = {
     "brief": "Observe desktop controls and act on fresh, verified UI elements.",
     "description": (
         "Closed-loop Windows/macOS/Linux desktop control. For native apps, use "
-        "this tool instead of raw-coordinate computer_control: each action reads "
+        "screen_process for read-only visual questions about what is on screen, "
+        "visible text, errors, or project contents; it includes the screenshot "
+        "for the vision model. "
+        "Use this tool instead of raw-coordinate computer_control: each action reads "
         "a fresh accessibility tree first, identifies real controls, refuses "
         "ambiguous targets, acts once, then re-reads the interface to verify. "
         "Use observe to inspect the active app and controls; find for a named "
@@ -344,12 +407,15 @@ TOOL = {
         "always stop/pause control from the visible REM desktop panel."
     ),
     "parameters": {"type": "OBJECT", "properties": {
-        "action": {"type": "STRING", "description": "observe | find | click | type | press | scroll | focus_window | set_mode | pause | resume | stop"},
+        "action": {"type": "STRING", "description": "observe | find | click | right_click | double_click | select | toggle | expand | collapse | hover | move | move_relative | type | press | scroll | focus_window | set_mode | pause | resume | stop"},
         "target": {"type": "STRING", "description": "Visible control name or app/window title. For search fields say search bar."},
         "text": {"type": "STRING", "description": "Text to type into the named, non-protected field."},
         "key": {"type": "STRING", "description": "Allowlisted key or shortcut (Enter, Escape, Tab, Ctrl+F, Alt+Tab, etc.)."},
         "direction": {"type": "STRING", "description": "up | down | left | right"},
         "amount": {"type": "INTEGER", "description": "Scroll notches, 1–20."},
+        "dx": {"type": "INTEGER", "description": "Bounded relative cursor offset, up to 200 pixels."},
+        "dy": {"type": "INTEGER", "description": "Bounded relative cursor offset, up to 200 pixels."},
+        "position": {"type": "STRING", "description": "Named position: center, top_left, top_right, bottom_left, bottom_right."},
         "clear_first": {"type": "BOOLEAN", "description": "Clear the named field before typing. Defaults true."},
         "mode": {"type": "STRING", "description": "ON-DEMAND | LIVE ASSIST | COMPUTER CONTROL."},
     }, "required": ["action"]},

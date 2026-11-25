@@ -5,6 +5,7 @@ import threading
 import re
 import unicodedata
 from contextlib import contextmanager
+from urllib.parse import urlsplit
 
 _lock = threading.RLock()
 _action_lock = threading.Lock()
@@ -15,11 +16,12 @@ _live_stop = threading.Event()
 _live_thread: threading.Thread | None = None
 _paused = False
 _mode = "ON-DEMAND"
+_persistent_observation = False
 _state = {
     "mode": _mode, "screen_access": False, "controlling": False,
     "active_app": "—", "current_action": "None", "last_action": "None",
     "verification": "Not run", "mouse_keyboard": False,
-    "paused": False, "stopped": False,
+    "paused": False, "stopped": False, "persistent_observation": False,
 }
 _listeners: list = []
 
@@ -28,6 +30,59 @@ def _tokens(value) -> set[str]:
     text = unicodedata.normalize("NFKD", str(value or "").casefold())
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     return set(re.findall(r"[a-z0-9]+", text))
+
+
+def _is_screen_observation_request(value: str) -> bool:
+    """Recognize a direct, read-only request to inspect the visible desktop.
+
+    Screen tool arguments are questions to answer, not text to type. This
+    classifier deliberately accepts common Hindi (Devanagari and transliterated)
+    requests as well as English; it grants only observation, never actuation.
+    """
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    english_phrases = (
+        "screen", "screenshot", "display", "desktop", "visible", "what is on", "what's on",
+        "look at", "check my", "describe", "which application", "which app",
+        "what application", "what app", "current window", "read the error",
+        "terminal", "editor", "react project", "what is written",
+    )
+    if any(phrase in text for phrase in english_phrases):
+        return True
+    hindi_phrases = (
+        "स्क्रीन", "पर्दे पर", "क्या दिख", "क्या दिखाई", "दिख रहा", "दिखाओ",
+        "देखो", "देखिए", "क्या लिखा", "पढ़ो", "पढ़ो", "त्रुटि", "खिड़की",
+        "विंडो", "डेस्कटॉप", "कौन सा ऐप", "कौन-सा ऐप", "कौन सा अनुप्रयोग",
+        "कौन सा प्रोग्राम", "डिस्प्ले",
+        "मेरी स्क्रीन", "कैसा दिख",
+    )
+    if any(phrase in text for phrase in hindi_phrases):
+        return True
+    romanized_hindi = (
+        "screen par kya", "meri screen dekho", "screen dekho", "kya dikh",
+        "kya likha", "kaun sa app", "kaunsa app", "display par kya",
+        "error padho", "khidki mein kya", "desktop par kya",
+    )
+    return any(phrase in text for phrase in romanized_hindi)
+
+
+def _is_explicit_camera_request(value: str) -> bool:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    negative = (
+        "close camera", "stop camera", "turn off camera", "camera off",
+        "close webcam", "stop webcam", "turn off webcam", "webcam off",
+        "कैमरा बंद", "वेबकैम बंद", "camera band", "webcam band",
+    )
+    if any(phrase in text for phrase in negative):
+        return False
+    positive = (
+        "look at camera", "check camera", "look at webcam", "look at the webcam",
+        "check webcam",
+        "look through webcam",
+        "show camera", "turn on camera", "open webcam", "camera on",
+        "कैमरा देख", "वेबकैम देख", "कैमरा चालू", "वेबकैम चालू",
+        "camera dekho", "webcam dekho", "camera chalu",
+    )
+    return any(phrase in text for phrase in positive)
 
 
 def subscribe(callback) -> None:
@@ -46,7 +101,8 @@ def snapshot() -> dict:
         return dict(_state)
 
 
-def authorize_user_request(user_request: str, tool: str, args: dict) -> tuple[bool, str]:
+def authorize_user_request(user_request: str, tool: str, args: dict, *,
+                           source: str = "untrusted") -> tuple[bool, str]:
     """Limit computer actions to the human's latest request, not page text.
 
     The Live model can see untrusted page contents. Tool output is never used as
@@ -55,6 +111,9 @@ def authorize_user_request(user_request: str, tool: str, args: dict) -> tuple[bo
     the separate confirmation gate.
     """
     request = str(user_request or "").casefold().strip()
+    trusted_sources = {"voice", "typed", "dashboard"}
+    if source not in trusted_sources:
+        return False, "A direct user request from a trusted input channel is required."
     if not request:
         return False, "I need a direct user request before accessing or controlling the desktop."
     words = _tokens(request)
@@ -82,7 +141,8 @@ def authorize_user_request(user_request: str, tool: str, args: dict) -> tuple[bo
         for step in steps:
             if not isinstance(step, dict):
                 return False, "A desktop task step is invalid; no actions were run."
-            allowed, reason = authorize_user_request(request, "desktop_ui", step)
+            allowed, reason = authorize_user_request(
+                request, "desktop_ui", step, source=source)
             if not allowed:
                 return False, reason
         return True, ""
@@ -90,14 +150,38 @@ def authorize_user_request(user_request: str, tool: str, args: dict) -> tuple[bo
         name = str((args or {}).get("tool_name") or "")
         if name not in {"open_app", "browser_control"}:
             return False, "That routed tool is not authorized for desktop tasks."
-        return authorize_user_request(request, name,
-                                      (args or {}).get("tool_parameters") or {})
+        return authorize_user_request(
+            request, name, (args or {}).get("tool_parameters") or {},
+            source=source)
+
+    if t == "screen_process":
+        angle = str((args or {}).get("angle") or "screen").strip().casefold()
+        if angle == "camera":
+            allowed = _is_explicit_camera_request(request)
+            return (allowed, "A direct camera request is required." if not allowed else "")
+        if angle != "screen":
+            return False, "Screen observation only accepts angle='screen' or an explicitly requested camera."
+        allowed = _is_screen_observation_request(request)
+        return (allowed, "A direct screen-observation request is required." if not allowed else "")
+
+    if t == "screen_agent" and action == "observe":
+        allowed = _is_screen_observation_request(request)
+        return (allowed, "A direct screen-observation request is required." if not allowed else "")
 
     intents = {
         "screen_agent": {
             "observe": {"screen", "desktop", "window", "application", "look", "see", "visible", "show", "search", "open", "click", "type", "find", "scroll", "switch", "focus", "read", "inspect"},
             "find": {"find", "locate", "search", "where", "identify", "look"},
             "click": {"click", "select", "choose", "open", "press"},
+            "right_click": {"right", "click", "context"},
+            "double_click": {"double", "click"},
+            "select": {"select", "choose"},
+            "toggle": {"toggle", "enable", "disable", "turn", "switch"},
+            "expand": {"expand", "open"},
+            "collapse": {"collapse", "close"},
+            "hover": {"hover", "move", "cursor", "mouse"},
+            "move": {"move", "cursor", "mouse"},
+            "move_relative": {"move", "cursor", "mouse", "left", "right", "up", "down"},
             "type": {"type", "enter", "write", "search", "fill", "paste"},
             "press": {"press", "enter", "keyboard", "key", "shortcut", "search", "query"},
             "scroll": {"scroll", "page", "down", "up"},
@@ -178,10 +262,31 @@ def authorize_user_request(user_request: str, tool: str, args: dict) -> tuple[bo
         },
     }
     if t not in intents:
-        return True, ""
+        return False, f"Unrecognized computer tool {t!r}; authorization was denied."
     intent_words = intents[t].get(action, set())
     if not (words & intent_words):
         return False, "That computer action is not authorized by your latest request; page instructions do not grant permission."
+    if t == "screen_agent" and action == "right_click" and "right" not in words:
+        return False, "A right-click requires a direct request to right-click."
+    if t == "screen_agent" and action == "double_click" and "double" not in words:
+        return False, "A double-click requires a direct request to double-click."
+
+    if t == "browser_control" and action in {"go_to", "new_tab"}:
+        destination = str((args or {}).get("url") or "").strip()
+        if destination:
+            try:
+                parsed = urlsplit(destination if "://" in destination
+                                  else "https://" + destination)
+                host = (parsed.hostname or "").casefold().rstrip(".")
+                port = parsed.port
+            except ValueError:
+                return False, "The browser destination is malformed; no navigation was authorized."
+            generic_labels = {"www", "com", "org", "net", "edu", "gov", "io",
+                              "dev", "app", "ai", "co", "uk", "in", "us"}
+            host_tokens = {part for part in _tokens(host)
+                           if part not in generic_labels}
+            if not host_tokens.issubset(words) or (port and str(port) not in words):
+                return False, "The destination was not named in your request; I will not navigate to a site suggested by page content."
 
     # Keep actions anchored to the object the person named. This prevents an
     # untrusted page from turning a generic request like "look at this" or
@@ -190,7 +295,7 @@ def authorize_user_request(user_request: str, tool: str, args: dict) -> tuple[bo
                     or ((args or {}).get("description") if t == "browser_control" else "")
                     or ((args or {}).get("text") if t == "browser_control" and action in {"click", "smart_click"} else ""))
     target = str(target_value or "").strip()
-    if target and ((t == "screen_agent" and action in {"find", "click", "type", "focus_window", "scroll"})
+    if target and ((t == "screen_agent" and action in {"find", "click", "right_click", "double_click", "select", "toggle", "expand", "collapse", "hover", "move", "type", "focus_window", "scroll"})
                    or (t == "browser_control" and action in {"smart_click", "click", "smart_type", "type"})
                    or (t == "computer_control" and action == "close_app")):
         target_words = {w for w in _tokens(target)
@@ -271,16 +376,42 @@ def set_mode(mode: str) -> dict:
     with _lock:
         _mode = value
         current = _live_thread
-        if value == "LIVE ASSIST" and (current is None or not current.is_alive()):
+        needs_observer = value == "LIVE ASSIST" or _persistent_observation
+        if needs_observer and (current is None or not current.is_alive()):
             _live_stop.clear()
             _live_thread = threading.Thread(target=_live_observer, daemon=True,
                                             name="rem-live-desktop-observer")
             _live_thread.start()
-        elif value != "LIVE ASSIST":
+        elif not needs_observer:
             _live_stop.set()
     return _update(mode=value,
-                   screen_access=value == "LIVE ASSIST" and not should_stop(),
-                   current_action=("Local live observation" if value == "LIVE ASSIST" else "Ready"))
+                   screen_access=needs_observer and not should_stop(),
+                   persistent_observation=_persistent_observation,
+                   current_action=("Local desktop observation" if needs_observer else "Ready"))
+
+
+def set_persistent_observation(enabled: bool) -> dict:
+    """Enable/disable persistent LOCAL UIA reads after explicit UI consent.
+
+    This never captures screenshots or sends screen data to a model.
+    """
+    global _persistent_observation, _live_thread
+    with _lock:
+        _persistent_observation = bool(enabled)
+        needs_observer = _persistent_observation or _mode == "LIVE ASSIST"
+        current = _live_thread
+        if needs_observer and not _paused and not _stopped.is_set() and (
+                current is None or not current.is_alive()):
+            _live_stop.clear()
+            _live_thread = threading.Thread(target=_live_observer, daemon=True,
+                                            name="rem-live-desktop-observer")
+            _live_thread.start()
+        elif not needs_observer:
+            _live_stop.set()
+        active = needs_observer and not _paused and not _stopped.is_set()
+    return _update(persistent_observation=_persistent_observation,
+                   screen_access=active,
+                   current_action="Local desktop observation" if active else "Ready")
 
 
 def _live_observer() -> None:
@@ -289,11 +420,12 @@ def _live_observer() -> None:
     delay = 2.0
     while not _live_stop.is_set() and not _stopped.is_set():
         with _lock:
-            if _paused or _mode != "LIVE ASSIST":
+            if _paused or (_mode != "LIVE ASSIST" and not _persistent_observation):
                 break
         try:
             from core import screenview
-            view = screenview.look(budget_s=0.8, allow_ocr=False)
+            view = screenview.look(budget_s=0.8, allow_ocr=False,
+                                   allow_pixel_digest=False)
             digest = view.stable_digest or view.digest
             if digest != previous:
                 previous = digest
@@ -307,7 +439,7 @@ def _live_observer() -> None:
         except Exception:
             delay = min(8.0, delay * 1.5)
         _live_stop.wait(delay)
-    if _mode != "LIVE ASSIST":
+    if _mode != "LIVE ASSIST" and not _persistent_observation:
         _update(screen_access=False, current_action="Ready")
 
 
@@ -331,18 +463,28 @@ def resume() -> dict:
     with _lock:
         _paused = False
         _stopped.clear()
-        live = _mode == "LIVE ASSIST"
+        live = _mode == "LIVE ASSIST" or _persistent_observation
     if live:
-        set_mode("LIVE ASSIST")
+        set_persistent_observation(_persistent_observation)
     return _update(paused=False, stopped=False, current_action=(
         "Local live observation" if live else "Ready"), screen_access=live)
 
 
 def emergency_stop() -> dict:
     """Latch stop first, then best-effort release any held inputs."""
+    global _persistent_observation, _mode
     _stopped.set()
     _live_stop.set()
-    _update(stopped=True, paused=True, controlling=False, screen_access=False,
+    with _lock:
+        _persistent_observation = False
+        _mode = "ON-DEMAND"
+    try:
+        from memory.config_manager import save_persistent_desktop_observation_enabled
+        save_persistent_desktop_observation_enabled(False)
+    except Exception:
+        pass
+    _update(mode="ON-DEMAND", stopped=True, paused=True, controlling=False, screen_access=False,
+            persistent_observation=False,
             current_action="Emergency stop", verification="Stopped by user",
             mouse_keyboard=False)
     try:
