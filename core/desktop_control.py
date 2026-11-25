@@ -65,7 +65,8 @@ def _is_screen_observation_request(value: str) -> bool:
     english_phrases = (
         "screen", "screenshot", "display", "desktop", "visible", "what is on", "what's on",
         "look at", "check my", "describe", "which application", "which app",
-        "what application", "what app", "current window", "read the error",
+        "what application", "what app", "current window", "current test window",
+        "read the current window", "read current window", "read the error",
         "terminal", "editor", "react project", "what is written",
     )
     if any(phrase in text for phrase in english_phrases):

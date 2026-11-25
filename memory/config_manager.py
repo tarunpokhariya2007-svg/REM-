@@ -189,15 +189,23 @@ def get_wake_word_enabled() -> bool:
 
 
 def get_persistent_desktop_observation_enabled() -> bool:
-    """User's saved consent for low-frequency local UIA observation only."""
+    """User's saved consent for low-frequency local UIA observation only.
+
+    ``local_screen_observation_enabled`` is the canonical key. The two older
+    names remain readable for compatibility with existing REM settings files.
+    """
     data = load_api_keys()
-    return bool(data.get("persistent_local_observation_enabled",
-                         data.get("persistent_desktop_observation_enabled", False)))
+    if "local_screen_observation_enabled" in data:
+        return bool(data["local_screen_observation_enabled"])
+    if "persistent_local_observation_enabled" in data:
+        return bool(data["persistent_local_observation_enabled"])
+    return bool(data.get("persistent_desktop_observation_enabled", False))
 
 
 @_locked
 def save_persistent_desktop_observation_enabled(enabled: bool) -> None:
     data = _read_for_write()
+    data["local_screen_observation_enabled"] = bool(enabled)
     data["persistent_local_observation_enabled"] = bool(enabled)
     # Retain the established key for older REM builds and external readers.
     data["persistent_desktop_observation_enabled"] = bool(enabled)

@@ -76,3 +76,7 @@ No implementation files were changed while preparing this audit.
 ## Phase 0 status after implementation work
 
 The Phase 0 findings remain the baseline for the implementation report. Controlled changes began only after the audit file was written and pre-edit copies were prepared. UIA pattern-based semantic interaction is now partially implemented; it has mocked coverage but not a real semantic control fixture. Persistent local observation and separate cloud screenshot consent have been added with local config storage and GUI controls. The existing UIA observer still polls rather than subscribing to UIA events. The memory store remains JSON; no duplicate SQLite database was created. See `PERSISTENT_DESKTOP_AND_MEMORY_REPORT.md` for test categories, real Windows smoke outcomes, modified files, and remaining work.
+
+## Latest memory/routine preservation check — 2026-11-25
+
+`memory/routines.json` was already modified in the worktree before this continuation began. It was not opened for editing or changed by the continuation. No migration, reset, routine execution, or credential/config overwrite occurred. The repository suite includes persistence/corrupt-data recovery tests against test fixtures, not the user's live memory files. Thus preservation is **PASS for this continuation**; a fresh live-memory round-trip or routine execution acceptance is **NOT TESTED**. Existing JSON architecture and missed-grace-period behavior remain in place.

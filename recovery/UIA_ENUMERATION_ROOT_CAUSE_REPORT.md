@@ -242,3 +242,7 @@ A failed semantic Invoke now fails closed. The action layer no longer retries a 
 Final validation after these changes: 107 automated tests passed; Python compilation passed for core/actions/plugins/memory/tests/Windows acceptance harnesses; `git diff --check` passed (only existing LF/CRLF conversion notices). No unrelated modified files were reverted. `memory/routines.json` remained as found in the initially dirty worktree; no staging, commit, or push occurred.
 
 Additional adapter coverage: UIA TextPattern reads bounded visible text where exposed; SelectionPattern reports selected-item count, and WindowPattern routes normal/restore/maximize/minimize requests through `SetWindowVisualState`. These latest pattern routes are compilation/mock-reviewed only; no real window-management or WindowPattern acceptance has been performed. The current overall suite is 117 passed.
+
+## Latest live integrated rerun — 2026-11-25
+
+The historical integrated REM adapter acceptance above passed in a normal medium-integrity desktop process. A fresh attempt in the current managed execution context launched the disposable fixture but did not obtain foreground ownership; Chrome remained foreground. The acceptance runner correctly refused to perform UIA semantic actions. This is a blocked rerun, not evidence that the prior result regressed in the application's adapter. No ValuePattern or InvokePattern operation was attempted in the fresh run. Fresh-run status: **BLOCKED by foreground ownership**; historical same-fixture integrated pass remains documented above.

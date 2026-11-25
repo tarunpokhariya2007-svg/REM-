@@ -61,7 +61,11 @@ def capture_observation(capture: Callable, look: Callable, *, preflight: Callabl
     """
     if preflight is not None:
         preflight()
-    image, mime_type = capture()
+    captured = capture()
+    if not isinstance(captured, tuple) or len(captured) not in (2, 3):
+        raise RuntimeError("Screen capture returned an unsupported result.")
+    image, mime_type = captured[:2]
+    capture_identity = captured[2] if len(captured) == 3 else None
     if not image:
         raise RuntimeError("Screen capture returned an empty image.")
     try:
@@ -72,7 +76,25 @@ def capture_observation(capture: Callable, look: Callable, *, preflight: Callabl
             reason=f"local screen text observation failed: {type(exc).__name__}: {exc}",
             elements=[], windows=[],
         )
-    return image, mime_type, describe_view(view)
+    if capture_identity and capture_identity.get("identity_validated") and not view.degraded:
+        target = capture_identity.get("window", {})
+        if ((view.pid and int(view.pid) != int(target.get("pid", 0)))
+                or (view.title and str(view.title) != str(target.get("title", "")))):
+            raise RuntimeError("UI observation belongs to a different foreground window than the screenshot.")
+    context = describe_view(view)
+    if capture_identity:
+        monitor = capture_identity.get("monitor_bounds", {})
+        window = capture_identity.get("window", {})
+        context += (
+            "\nScreenshot capture identity: "
+            f"mode={capture_identity.get('capture_mode', 'unknown')}; "
+            f"validated={bool(capture_identity.get('identity_validated'))}; "
+            f"window_specific_pixels={bool(capture_identity.get('window_specific_pixels'))}; "
+            f"HWND={window.get('hwnd', 'unavailable')}; PID={window.get('pid', 'unavailable')}; "
+            f"monitor_index={capture_identity.get('monitor_index', 'unavailable')}; "
+            f"monitor_bounds={monitor}; screenshot_size={capture_identity.get('image_size', 'unavailable')}"
+        )
+    return image, mime_type, context
 
 
 def prepare_image_for_live(image: bytes, mime_type: str) -> bytes:

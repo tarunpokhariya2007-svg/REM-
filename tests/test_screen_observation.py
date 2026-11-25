@@ -76,10 +76,11 @@ def _bare_rem(main, session=None):
 
 
 class ScreenObservationTests(unittest.TestCase):
-    def _view(self, *, source="none", degraded=True, reason="", elements=None):
+    def _view(self, *, source="none", degraded=True, reason="", elements=None, pid=42):
         return SimpleNamespace(
             app="Code.exe", title="App.tsx — React project", source=source,
             degraded=degraded, reason=reason, elements=elements or [],
+            pid=pid,
             windows=[("Code.exe", "App.tsx — React project")],
         )
 
@@ -88,6 +89,50 @@ class ScreenObservationTests(unittest.TestCase):
             screen_observation.capture_observation(
                 lambda: (_ for _ in ()).throw(RuntimeError("capture failed")),
                 lambda: self._view(),
+            )
+
+    def test_identity_metadata_is_returned_with_monitor_capture(self):
+        metadata = {"capture_mode": "monitor", "identity_validated": True,
+                    "window_specific_pixels": False,
+                    "window": {"hwnd": 10, "pid": 42,
+                               "title": "App.tsx — React project"},
+                    "monitor_index": 1,
+                    "monitor_bounds": {"left": 0, "top": 0,
+                                       "width": 1920, "height": 1080},
+                    "image_size": (1280, 720)}
+        _image, _mime, context = screen_observation.capture_observation(
+            lambda: (b"pixels", "image/jpeg", metadata),
+            lambda: self._view(source="uia", degraded=False),
+        )
+        self.assertIn("mode=monitor", context)
+        self.assertIn("window_specific_pixels=False", context)
+        self.assertIn("HWND=10; PID=42", context)
+        self.assertIn("monitor_index=1", context)
+
+    def test_identity_metadata_distinguishes_hwnd_window_pixels(self):
+        metadata = {"capture_mode": "window", "identity_validated": True,
+                    "window_specific_pixels": True,
+                    "window_capture_api": "Pillow ImageGrab.grab(window=HWND)",
+                    "window": {"hwnd": 10, "pid": 42,
+                               "title": "App.tsx — React project"},
+                    "monitor_index": 1,
+                    "image_size": (853, 720)}
+        _image, _mime, context = screen_observation.capture_observation(
+            lambda: (b"pixels", "image/jpeg", metadata),
+            lambda: self._view(source="uia", degraded=False),
+        )
+        self.assertIn("mode=window", context)
+        self.assertIn("window_specific_pixels=True", context)
+        self.assertIn("HWND=10; PID=42", context)
+
+    def test_screenshot_and_ui_observation_identity_mismatch_is_rejected(self):
+        metadata = {"capture_mode": "monitor", "identity_validated": True,
+                    "window": {"hwnd": 10, "pid": 43,
+                               "title": "Other window"}}
+        with self.assertRaisesRegex(RuntimeError, "different foreground window"):
+            screen_observation.capture_observation(
+                lambda: (b"pixels", "image/jpeg", metadata),
+                lambda: self._view(source="uia", degraded=False, pid=42),
             )
 
     def test_live_inactivity_close_is_classified_through_taskgroup(self):
@@ -270,9 +315,10 @@ class GeminiLiveScreenDispatchTests(unittest.TestCase):
         rem._action_registry = Registry()
         with patch("memory.config_manager.get_cloud_screen_vision_enabled", return_value=False), \
              patch.object(main.asyncio, "get_event_loop", return_value=fake_loop), \
-             patch.object(main, "_capture_screen", side_effect=AssertionError("must not capture")) as capture:
+             patch.object(main, "_capture_screen_with_identity", side_effect=AssertionError("must not capture")) as capture:
             response = _run_immediate(rem._execute_tool(SimpleNamespace(
-                name="screen_process", args={"text": "Check my screen"}, id="no-cloud")))
+                name="screen_process", args={"text": "Check my screen"}, id="no-cloud"),
+                rem._current_request_context()))
         capture.assert_not_called()
         self.assertIn("local UIA observation", response.response["result"])
         self.assertEqual(calls[0][0:2], ("desktop_ui", {"action": "observe"}))
@@ -299,12 +345,13 @@ class GeminiLiveScreenDispatchTests(unittest.TestCase):
         )
         from unittest.mock import patch
         with patch.object(main.asyncio, "get_event_loop", return_value=fake_loop), \
-             patch.object(main, "_capture_screen", return_value=(b"screen-bytes", "image/jpeg")), \
+             patch.object(main, "_capture_screen_with_identity", return_value=(b"screen-bytes", "image/jpeg")), \
              patch("core.screenview.look", return_value=view), \
              patch("core.screenact.click", side_effect=AssertionError("observation clicked")), \
              patch("core.screenact.type_text", side_effect=AssertionError("observation typed")):
             response = _run_immediate(rem._execute_tool(SimpleNamespace(
-                name="screen_process", args={"text": "What application is open?"}, id="call-1")))
+                name="screen_process", args={"text": "What application is open?"}, id="call-1"),
+                rem._current_request_context()))
             self.assertIn("VISION_PENDING", response.response["result"])
             self.assertTrue(_run_immediate(rem._flush_pending_vision()))
 
@@ -407,28 +454,31 @@ class VisionLifecycleTests(unittest.TestCase):
     def test_capture_failure_releases_state_and_retry_can_succeed(self):
         from unittest.mock import patch
         with patch.object(self.main.asyncio, "get_event_loop", return_value=self.loop), \
-             patch.object(self.main, "_capture_screen", side_effect=RuntimeError("capture failed")), \
+             patch.object(self.main, "_capture_screen_with_identity", side_effect=RuntimeError("capture failed")), \
              patch("core.screenview.look", return_value=self._view()):
             response = _run_immediate(self.rem._execute_tool(SimpleNamespace(
-                name="screen_process", args={"text": "Check my screen"}, id="fail")))
+                name="screen_process", args={"text": "Check my screen"}, id="fail"),
+                self.rem._current_request_context()))
         self.assertIn("failed", response.response["result"].lower())
         self.assertFalse(self.rem._vision_busy)
         self.rem._vision_last_time = time.monotonic() - 5
         with patch.object(self.main.asyncio, "get_event_loop", return_value=self.loop), \
-             patch.object(self.main, "_capture_screen", return_value=(b"image", "image/jpeg")), \
+             patch.object(self.main, "_capture_screen_with_identity", return_value=(b"image", "image/jpeg")), \
              patch("core.screenview.look", return_value=self._view()):
             response = _run_immediate(self.rem._execute_tool(SimpleNamespace(
-                name="screen_process", args={"text": "Check my screen"}, id="retry")))
+                name="screen_process", args={"text": "Check my screen"}, id="retry"),
+                self.rem._current_request_context()))
         self.assertIn("VISION_PENDING", response.response["result"])
 
     def test_encoding_failure_releases_state(self):
         from unittest.mock import patch
         with patch.object(self.main.asyncio, "get_event_loop", return_value=self.loop), \
-             patch.object(self.main, "_capture_screen", return_value=(b"image", "image/jpeg")), \
+             patch.object(self.main, "_capture_screen_with_identity", return_value=(b"image", "image/jpeg")), \
              patch("core.screenview.look", return_value=self._view()), \
              patch("core.screen_observation.prepare_image_for_live", side_effect=ValueError("encode failed")):
             response = _run_immediate(self.rem._execute_tool(SimpleNamespace(
-                name="screen_process", args={"text": "Check my screen"}, id="encode")))
+                name="screen_process", args={"text": "Check my screen"}, id="encode"),
+                self.rem._current_request_context()))
         self.assertIn("failed", response.response["result"].lower())
         self.assertFalse(self.rem._vision_busy)
         self.assertIsNone(self.rem._pending_vision)
@@ -444,10 +494,11 @@ class VisionLifecycleTests(unittest.TestCase):
         self.rem.session = Session()
         from unittest.mock import patch
         with patch.object(self.main.asyncio, "get_event_loop", return_value=self.loop), \
-             patch.object(self.main, "_capture_screen", return_value=(b"image", "image/jpeg")), \
+             patch.object(self.main, "_capture_screen_with_identity", return_value=(b"image", "image/jpeg")), \
              patch("core.screenview.look", return_value=self._view()):
             _run_immediate(self.rem._execute_tool(SimpleNamespace(
-                name="screen_process", args={"text": "Check my screen"}, id="delivery")))
+                name="screen_process", args={"text": "Check my screen"}, id="delivery"),
+                self.rem._current_request_context()))
         self.assertFalse(_run_immediate(self.rem._flush_pending_vision()))
         self.assertFalse(self.rem._vision_busy)
         self.assertIn("delivery failed", self.rem.session.inputs[0]["text"].lower())
@@ -456,11 +507,12 @@ class VisionLifecycleTests(unittest.TestCase):
         import asyncio
         from unittest.mock import patch
         with patch.object(self.main.asyncio, "get_event_loop", return_value=self.loop), \
-             patch.object(self.main, "_capture_screen", side_effect=asyncio.CancelledError()), \
+             patch.object(self.main, "_capture_screen_with_identity", side_effect=asyncio.CancelledError()), \
              patch("core.screenview.look", return_value=self._view()):
             with self.assertRaises(asyncio.CancelledError):
                 _run_immediate(self.rem._execute_tool(SimpleNamespace(
-                    name="screen_process", args={"text": "Check my screen"}, id="cancel")))
+                    name="screen_process", args={"text": "Check my screen"}, id="cancel"),
+                    self.rem._current_request_context()))
         self.assertFalse(self.rem._vision_busy)
 
     def test_delivery_cancellation_releases_state(self):
@@ -471,10 +523,11 @@ class VisionLifecycleTests(unittest.TestCase):
                 raise asyncio.CancelledError()
         self.rem.session = CancelSession()
         with patch.object(self.main.asyncio, "get_event_loop", return_value=self.loop), \
-             patch.object(self.main, "_capture_screen", return_value=(b"image", "image/jpeg")), \
+             patch.object(self.main, "_capture_screen_with_identity", return_value=(b"image", "image/jpeg")), \
              patch("core.screenview.look", return_value=self._view()):
             _run_immediate(self.rem._execute_tool(SimpleNamespace(
-                name="screen_process", args={"text": "Check my screen"}, id="delivery-cancel")))
+                name="screen_process", args={"text": "Check my screen"}, id="delivery-cancel"),
+                self.rem._current_request_context()))
         with self.assertRaises(asyncio.CancelledError):
             _run_immediate(self.rem._flush_pending_vision())
         self.assertFalse(self.rem._vision_busy)

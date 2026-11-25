@@ -90,7 +90,7 @@ class ChromeCdpConfigurationTests(unittest.TestCase):
         async def run():
             session = browser_control._BrowserSession("chrome")
             session._pw = Playwright()
-            with patch.object(browser_control, "_configured_chrome_cdp_endpoint",
+            with patch.object(browser_control, "_configured_browser_cdp_endpoint",
                               return_value="http://127.0.0.1:9222"):
                 await session._launch()
             self.assertIs(session._page, browser.contexts[0].pages[-1])
@@ -128,7 +128,7 @@ class ChromeCdpConfigurationTests(unittest.TestCase):
             session._context = ClosedContext()
             session._page = object()
             session._browser = None
-            with patch.object(browser_control, "_configured_chrome_cdp_endpoint",
+            with patch.object(browser_control, "_configured_browser_cdp_endpoint",
                               return_value="http://127.0.0.1:9222"):
                 await session._launch()
             self.assertIs(session._context, browser.contexts[0])

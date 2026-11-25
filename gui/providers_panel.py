@@ -87,6 +87,10 @@ class ProvidersOverlay(_HudOverlay):
     # for — the installed voices — has arrived. A signal rather than a direct
     # call because the worker must not touch a widget.
     _live_ready = pyqtSignal()
+    # (provider id, status text, colour) from provider workers. A queued signal
+    # marshals widget changes onto this overlay's Qt thread and is discarded if
+    # the overlay has already been destroyed.
+    _status_ready = pyqtSignal(str, str, str)
     # (provider id, [(value, label), ...]) from a worker that went and asked an
     # endpoint what it offers.
     _models_ready = pyqtSignal(str, list)
@@ -122,6 +126,7 @@ class ProvidersOverlay(_HudOverlay):
         # nothing in this folder may run before somebody opens it.
         self._live_ready.connect(self._on_live_ready)
         self._models_ready.connect(self._on_models_ready)
+        self._status_ready.connect(self._say)
         self._model_cache: dict[str, list] = {}
         self._fetching: set = set()
         for _kind in ("tts", "stt", "llm"):
@@ -355,7 +360,7 @@ class ProvidersOverlay(_HudOverlay):
         def report(ok, msg):
             colour = C.TEXT_DIM if ok is None else (C.GREEN if ok else C.RED)
             mark = "" if ok is None else ("✓  " if ok else "✕  ")
-            QTimer.singleShot(0, lambda: self._say(pid, mark + msg, colour))
+            self._status_ready.emit(pid, mark + msg, colour)
 
         threading.Thread(target=lambda: fn(values, report), daemon=True).start()
 
@@ -1125,8 +1130,7 @@ class ProvidersOverlay(_HudOverlay):
                        if good else (tail[-1][:150] if tail else "pip failed"))
             except Exception as e:
                 good, msg = False, f"{type(e).__name__}: {str(e)[:120]}"
-            QTimer.singleShot(0, lambda: self._say(pid, msg,
-                                                   C.GREEN if good else C.RED))
+            self._status_ready.emit(pid, msg, C.GREEN if good else C.RED)
 
         threading.Thread(target=work, daemon=True).start()
 

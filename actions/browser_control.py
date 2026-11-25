@@ -109,15 +109,15 @@ def _profile_path(name: str, legacy_name: str | None = None) -> Path:
     return _profile_root() / name
 
 
-def _configured_chrome_cdp_endpoint(value: str | None = None) -> str | None:
-    """Return an explicitly configured loopback-only Chrome CDP endpoint.
-
-    REM never starts a browser with a debugging port. Users may point this at
-    a Chrome instance they have already launched with remote debugging enabled.
-    A public or LAN endpoint is rejected because CDP grants broad browser
-    authority to anyone who can reach it.
-    """
-    endpoint = (os.environ.get("REM_CHROME_CDP_URL", "") if value is None
+def _configured_browser_cdp_endpoint(browser: str,
+                                     value: str | None = None) -> str | None:
+    """Return an explicitly configured loopback-only Chromium CDP endpoint."""
+    browser = str(browser or "").casefold().strip()
+    env_name = {"chrome": "REM_CHROME_CDP_URL",
+                "edge": "REM_EDGE_CDP_URL"}.get(browser)
+    if env_name is None:
+        return None
+    endpoint = (os.environ.get(env_name, "") if value is None
                 else str(value)).strip()
     if not endpoint:
         return None
@@ -138,10 +138,15 @@ def _configured_chrome_cdp_endpoint(value: str | None = None) -> str | None:
             raise ValueError
     except (ValueError, UnicodeError):
         raise ValueError(
-            "REM_CHROME_CDP_URL must be an explicit HTTP or WebSocket endpoint "
+            f"{env_name} must be an explicit HTTP or WebSocket endpoint "
             "on localhost/127.0.0.1/::1 with a port and no credentials or query."
         ) from None
     return endpoint
+
+
+def _configured_chrome_cdp_endpoint(value: str | None = None) -> str | None:
+    """Backward-compatible helper for the opt-in Chrome CDP endpoint."""
+    return _configured_browser_cdp_endpoint("chrome", value)
 
 def _normalize_url(url: str) -> str:
     """
@@ -795,16 +800,16 @@ class _BrowserSession:
                 # never silently switch an attached session to another profile.
                 self._browser = self._context = self._page = None
 
-        if self.browser_name == "chrome":
-            endpoint = _configured_chrome_cdp_endpoint()
-            if endpoint:
+        endpoint = _configured_browser_cdp_endpoint(self.browser_name)
+        if endpoint:
+            if self.browser_name in {"chrome", "edge"}:
                 browser = None
                 try:
                     browser = await self._pw.chromium.connect_over_cdp(
                         endpoint, timeout=5_000, no_defaults=True)
                     contexts = browser.contexts
                     if not contexts:
-                        raise RuntimeError("the attached Chrome session exposed no browser context")
+                        raise RuntimeError("the attached browser exposed no browser context")
                     context = contexts[0]
                     pages = [page for page in context.pages if not page.is_closed()]
                     self._browser = browser
@@ -814,7 +819,7 @@ class _BrowserSession:
                     # through the ordinary browser read tools before acting.
                     self._page = pages[-1] if pages else None
                     self.profile_kind = "attached"
-                    print("[Browser] Attached to explicitly configured local Chrome CDP session")
+                    print(f"[Browser] Attached to explicitly configured local {self.browser_name.title()} CDP session")
                     return
                 except Exception as exc:
                     if browser is not None:
@@ -823,10 +828,9 @@ class _BrowserSession:
                         except Exception:
                             pass
                     raise RuntimeError(
-                        "Could not attach to the configured local Chrome CDP endpoint; "
-                        "no browser action was taken. Check that Chrome was explicitly "
-                        "started with a loopback-only debugging port and that "
-                        "REM_CHROME_CDP_URL is correct."
+                        "Could not attach to the configured local browser CDP endpoint; "
+                        "no browser action was taken. Check that the selected browser "
+                        "was explicitly started with a loopback-only debugging port."
                     ) from exc
 
         if self._spec is None:
@@ -960,21 +964,36 @@ class _BrowserSession:
             await asyncio.sleep(0.2)
         return self._page
 
+    async def _page_visible_for_action(self, page) -> bool:
+        """Refuse input to a hidden/background page whose actions are not observable."""
+        try:
+            return await page.evaluate("document.visibilityState === 'visible'") is True
+        except Exception:
+            return False
+
     async def go_to(self, url: str) -> str:
 
         url      = _normalize_url(url)
         page     = await self._get_page()
         prev_url = page.url
+        navigation_error = None
+        if not await self._page_visible_for_action(page):
+            return outcome.unverified(
+                "browser_control", "browser page is hidden; navigation was not attempted",
+                requested=url, actual=prev_url, navigation_confirmed=False)
 
         async def _do_goto(p: Page) -> str:
             """Attempt navigation and return the resulting URL (may still be blank)."""
+            nonlocal navigation_error
             try:
                 await p.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 await asyncio.sleep(0.3)
             except PlaywrightTimeout:
-                pass   # page may have partially loaded — check URL below
+                # A timeout can happen after the address changed. The URL and
+                # document readiness below decide whether navigation occurred.
+                navigation_error = "timeout"
             except Exception as e:
-                print(f"[Browser] goto exception (non-fatal): {e}")
+                navigation_error = type(e).__name__
             return p.url
 
         result_url = await _do_goto(page)
@@ -984,11 +1003,29 @@ class _BrowserSession:
             try:
                 new_page   = await self._context.new_page()
                 self._page = new_page
+                page = new_page
                 result_url = await _do_goto(new_page)
             except Exception as e:
                 print(f"[Browser] New-tab retry failed: {e}")
 
         if result_url and result_url not in ("about:blank", "", None):
+            try:
+                page_ready = await page.evaluate(
+                    "() => document.readyState === 'interactive' || document.readyState === 'complete'")
+            except Exception:
+                page_ready = False
+            if not page_ready:
+                return outcome.unverified(
+                    "browser_control",
+                    "the browser URL changed, but the page did not confirm DOM readiness",
+                    requested=url, actual=result_url, navigation_confirmed=True,
+                    page_ready=False, error=navigation_error)
+            if not await self._page_visible_for_action(page):
+                return outcome.unverified(
+                    "browser_control",
+                    "the URL loaded, but the browser page is hidden; visible navigation is not confirmed",
+                    requested=url, actual=result_url, navigation_confirmed=False,
+                    page_ready=True)
             # Verified, and cheaply: this is the page's OWN url read back after
             # navigation, not the one we asked for. A redirect, a login wall or
             # a captive portal all show up here as a different address, which
@@ -999,19 +1036,21 @@ class _BrowserSession:
             # opens in a separate one where they are signed in to nothing —
             # and a Gmail that asks them to log in looks like a broken
             # assistant unless somebody says why.
-            if self.profile_kind == "separate":
-                return outcome.unverified(
-                    "browser_control",
-                    f"the page opened at {result_url}, but "
-                    f"{self.browser_name} was already running so its profile "
-                    f"was locked - this window uses a separate profile where "
-                    f"the user is NOT signed in to anything. Closing "
-                    f"{self.browser_name} first would let their own profile be "
-                    f"used",
-                    opened=result_url, profile="separate")
             return outcome.done("browser_control", opened=result_url,
                                 profile=self.profile_kind or "real",
-                                verified=True)
+                                verified=True, navigation_confirmed=True,
+                                page_ready=True, requested_url=url,
+                                requested_url_match=(result_url.rstrip("/")
+                                                     == url.rstrip("/")),
+                                profile_notice=(
+                                    "separate profile; existing signed-in profile was not used"
+                                    if self.profile_kind == "separate" else None))
+        if result_url == prev_url and prev_url not in ("about:blank", "", None):
+            return outcome.unverified(
+                "browser_control",
+                "the requested navigation was accepted, but the current page URL did not change",
+                requested=url, actual=result_url, navigation_confirmed=False,
+                page_ready=False, error=navigation_error)
         return outcome.failed(
             "browser_control",
             "the page stayed blank - the address may be wrong, or the site may "
@@ -1078,6 +1117,11 @@ class _BrowserSession:
     async def press(self, key: str) -> str:
         page = await self._get_page()
         try:
+            if not await self._page_visible_for_action(page):
+                return outcome.unverified(
+                    "browser_control", "browser page is hidden; no key was sent")
+            search_submit = False
+            before_url = page.url
             if str(key).strip().casefold() in ("enter", "return"):
                 focused = page.locator(":focus")
                 if await focused.count() == 1:
@@ -1085,13 +1129,25 @@ class _BrowserSession:
                     text = " ".join(str(v) for v in meta.values()).casefold()
                     search = (meta.get("type") == "search" or meta.get("role") == "searchbox"
                               or any(x in text for x in ("search", "query", "address")))
+                    search_submit = search and meta.get("tag") in ("INPUT", "TEXTAREA")
                     chat = any(x in text for x in ("message", "reply", "chat", "comment"))
                     if chat:
                         return "I will not submit a message or comment through a generic Enter key. Use the explicit send action and confirm it."
-                    if meta.get("editable") or (meta.get("tag") in ("INPUT", "TEXTAREA")
-                                                and not search):
+                    if ((meta.get("editable") and not search)
+                            or (meta.get("tag") in ("INPUT", "TEXTAREA")
+                                and not search)):
                         return "Enter could submit this form; use an explicit named button, which will request confirmation when consequential."
             await page.keyboard.press(key)
+            if search_submit:
+                await asyncio.sleep(0.25)
+                actual_url = page.url
+                if actual_url != before_url:
+                    return outcome.done(
+                        "browser_control", action="search_submit", verified=True,
+                        navigation_confirmed=True, actual_url=actual_url)
+                return outcome.unverified(
+                    "browser_control", "Enter was sent to the search field, but no URL change was confirmed",
+                    actual_url=actual_url)
             return f"Pressed: {key}; current page: {page.url}"
         except Exception as e:
             return f"Key error: {e}"
@@ -1110,6 +1166,9 @@ class _BrowserSession:
 
     async def fill_form(self, fields: dict) -> str:
         page    = await self._get_page()
+        if not await self._page_visible_for_action(page):
+            return outcome.unverified(
+                "browser_control", "browser page is hidden; no form fields were changed")
         results = []
         for selector, value in fields.items():
             try:
@@ -1133,7 +1192,22 @@ class _BrowserSession:
 
     async def smart_click(self, description: str) -> str:
         page = await self._get_page()
+        if not await self._page_visible_for_action(page):
+            return outcome.unverified(
+                "browser_control", "browser page is hidden; no click was attempted")
         before = await self._page_state(page)
+        ordinal_result = re.search(r"\b(first|second|third|last)\s+results?\b",
+                                   str(description or ""), re.IGNORECASE)
+        if ordinal_result:
+            try:
+                host = (urlsplit(page.url).hostname or "").casefold().rstrip(".")
+            except Exception:
+                host = ""
+            if host == "youtube.com" or host.endswith(".youtube.com"):
+                return await self._click_youtube_video_ordinal(
+                    page, ordinal_result.group(1).lower(), before)
+            return await self._click_ordinal_result(
+                page, ordinal_result.group(1).lower(), before)
         ordinal = re.search(r"\b(first|second|third|last)\s+videos?\b",
                             str(description or ""), re.IGNORECASE)
         try:
@@ -1164,6 +1238,60 @@ class _BrowserSession:
             except Exception:
                 continue
         return f"Could not find element: '{description}'"
+
+    async def _click_ordinal_result(self, page, ordinal: str, before: tuple) -> str:
+        """Select a unique visible result link in a semantic results container."""
+        try:
+            rows = await page.evaluate("""() => {
+              const selectorGroups = [
+                '#search .MjjYud a:has(h3)[href]',
+                '#b_results li.b_algo h2 a[href]',
+                '[data-testid="result"] a[href]',
+                '#search article h2 a[href], #search article h3 a[href]',
+                'main#results a[href]', '[role=main] article a[href]',
+                'main article a[href]'
+              ];
+              let anchors = [];
+              for (const selector of selectorGroups) {
+                anchors = [...document.querySelectorAll(selector)];
+                if (anchors.length) break;
+              }
+              if (!anchors.length)
+                anchors = [...document.querySelectorAll('main a[href], [role=main] a[href]')];
+              const seen = new Set(), all = [...document.querySelectorAll('a[href]')];
+              return anchors.flatMap(a => {
+                const r = a.getBoundingClientRect(), s = getComputedStyle(a);
+                const label = (a.innerText || a.getAttribute('aria-label') || a.title || '').trim();
+               const href = a.getAttribute('href');
+                const parentText = (a.closest('[data-text-ad], .uEierd, [aria-label*=Sponsored]')?.innerText || '').toLowerCase();
+                if (!label || !href || !r.width || !r.height || s.display === 'none' ||
+                    s.visibility === 'hidden' || a.closest('nav,header,footer,aside') ||
+                    /sponsored|advertisement/.test(parentText) || seen.has(href)) return [];
+                seen.add(href);
+                return [{label: label.slice(0,180), href,
+                  index: all.indexOf(a)}];
+              });
+            }""")
+            index = {"first": 0, "second": 1, "third": 2}.get(ordinal)
+            if ordinal == "last":
+                index = len(rows) - 1
+            if index is None or index < 0 or index >= len(rows):
+                return f"I found {len(rows)} visible non-ad results in the main results area; {ordinal} is unavailable, so nothing was clicked."
+            selected = rows[index]
+            all_links = page.locator("a[href]")
+            loc = all_links.nth(int(selected["index"]))
+            current_href = await loc.get_attribute("href")
+
+            if current_href != selected["href"]:
+                return "The result list changed during selection; nothing was clicked."
+            if not await loc.is_visible() or not await loc.is_enabled():
+                return "The selected result is no longer visible and enabled; nothing was clicked."
+            return await self._click_unique(
+                page, loc, before, f"{ordinal} result {selected['label']}"
+            )
+        except Exception as exc:
+            return outcome.failed("browser_control",
+                                  f"result selection failed safely: {type(exc).__name__}")
 
     async def _click_youtube_video_ordinal(self, page, ordinal: str, before: tuple) -> str:
         """Select a real visible YouTube video card, excluding ads and chrome."""
@@ -1252,6 +1380,11 @@ class _BrowserSession:
             after = await self._page_state(page)
             if after != before:
                 return f"Clicked {label!r}; verified page state changed."
+            if details.get("type") == "search" or details.get("role") == "searchbox":
+                focused = await loc.evaluate("el => document.activeElement === el")
+                if focused:
+                    return outcome.done("browser_control", action="focus_searchbox",
+                                        target=label, verified=True)
             return outcome.unverified("browser_control",
                                       f"clicked {label!r}, but no page-state change was observed")
         except Exception as exc:
@@ -1268,6 +1401,31 @@ class _BrowserSession:
 
     async def smart_type(self, description: str, text: str) -> str:
         page = await self._get_page()
+        if not await self._page_visible_for_action(page):
+            return outcome.unverified(
+                "browser_control", "browser page is hidden; no text was entered")
+        generic_search = str(description or "").strip().casefold() in {
+            "search", "search bar", "search box", "search field", "searchbox",
+        }
+        searchboxes = page.get_by_role("searchbox")
+        if generic_search:
+            try:
+                count = await searchboxes.count()
+                if count > 1:
+                    return "Multiple search boxes are visible; no text was entered. Name the site or field."
+                if count == 1:
+                    if not await searchboxes.is_visible() or not await searchboxes.is_enabled():
+                        return "The search box is not visible and enabled; no text was entered."
+                    await searchboxes.fill(str(text))
+                    if await searchboxes.input_value() == str(text):
+                        return outcome.done("browser_control", field="search box",
+                                            method="role=searchbox", verified=True)
+                    return outcome.unverified(
+                        "browser_control", "search box text did not read back exactly")
+            except Exception as exc:
+                return outcome.failed(
+                    "browser_control",
+                    f"the search box changed or became unavailable ({type(exc).__name__}); no result is confirmed")
         candidates = [
             ("placeholder", page.get_by_placeholder(description, exact=False)),
             ("label",       page.get_by_label(description, exact=False)),

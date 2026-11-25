@@ -19,6 +19,7 @@ class DesktopControlAuthorizationTests(unittest.TestCase):
             "Check my screen.", "What is visible?", "Describe my display.",
             "Which application is open?", "Read the error in my React terminal.",
             "Look at my VS Code window.", "What is written in this window?",
+            "REM, read the current test window.",
         ):
             with self.subTest(request=request):
                 # The tool's generated query intentionally need not match the utterance.

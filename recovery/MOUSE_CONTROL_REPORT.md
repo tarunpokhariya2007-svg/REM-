@@ -44,3 +44,7 @@ Two test-only issues caused the earlier apparent failures; the production safety
 2. The original disposable fixture ran as `python.exe`, the same executable REM identifies as its own. The existing `_lands_on_self` guard correctly refused its clicks. Running the fixture as the distinct `pythonw.exe` executable kept the production self-window guard active and allowed safe tests against a separate process.
 
 An early emergency-stop attempt used a fixed timer that could fire before drag mouse-down; that attempt did not count. The final test waits for the fixture's mouse-down callback before latching stop, and passed.
+
+## Latest physical mouse rerun — 2026-11-25
+
+Fresh disposable-window acceptance did not reach the first movement checkpoint: requested `(1018,472)`; observed cursor `(865,609)`. Python screen dimensions reported 1920×1080 while Win32 metrics reported 1536×864; target window DPI telemetry was 96 with 1.25 scaling. Direct `SetCursorPos` returned Access Denied, and the current process token diagnostic reported AppContainer=true. The runner halted before any click; no security boundary or fail-safe was bypassed. Historical prior mouse pass remains recorded in earlier sections but is not reproducible in this execution. Current status: **BLOCKED in this execution context**.

@@ -51,7 +51,6 @@ import threading
 import time
 import json
 import sys
-import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -75,7 +74,7 @@ from memory.memory_manager import (
 # system_status).
 from core import outcome
 from core.action_loader import strip_meta
-from actions.screen_processor  import _capture_camera, _capture_screen
+from actions.screen_processor  import _capture_camera, _capture_screen, _capture_screen_with_identity
 from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
@@ -94,6 +93,11 @@ from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.request_context      import RequestContext
+
+# Distinguish an omitted context (legacy direct callers may ask us to read the
+# current request) from an explicitly missing context captured for a Live tool
+# batch. The latter must stay missing rather than falling back to a newer turn.
+_REQUEST_CONTEXT_UNSET = object()
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
 from core.wake_phrase          import (
@@ -983,13 +987,25 @@ class RemLive:
         from core import outcome
         parameters = parameters or {}
         try:
+            from core.tool_security import tool_policy
+            if tool_policy(name) is None:
+                return outcome.failed(
+                    name,
+                    "this tool has no reviewed security classification; no action was taken",
+                    category="unreviewed_tool",
+                )
             control_tools = {"screen_agent", "desktop_ui", "computer_control", "computer_settings",
                              "browser_control", "screen_process", "open_app", "send_message"}
             if name in control_tools:
                 from core import desktop_control
                 context = self._bound_request_context()
                 if context is None:
-                    context = self._current_request_context()
+                    return outcome.failed(
+                        name,
+                        "the nested tool has no originating request context; "
+                        "no action was taken",
+                        category="missing_or_unrelated_context",
+                    )
                 user_request, request_source = self._usable_request_context(context)
                 allowed, reason = desktop_control.authorize_user_request(
                     user_request, name, parameters, source=request_source)
@@ -1003,7 +1019,13 @@ class RemLive:
                                                  player=self.ui,
                                                  session_memory=None)
         except Exception as e:
-            return outcome.failed(name, f"the tool raised an error: {e}")
+            from core.error_reporting import report_error
+            context = self._bound_request_context()
+            report_error("nested_tool_dispatch", name, e,
+                         task_id=getattr(context, "task_id", None),
+                         final_status="failed")
+            return outcome.failed(name,
+                                  f"the tool raised an error ({type(e).__name__}); no success is confirmed")
         return outcome.failed(name, "no tool with this name is available")
 
     def _record_user_request(self, text: str, source: str) -> None:
@@ -1177,8 +1199,17 @@ class RemLive:
     async def _wrap_up(self) -> None:
         try:
             await asyncio.wait_for(self._save_session_summary(), timeout=12)
+        except asyncio.CancelledError as e:
+            from core.error_reporting import report_error
+            report_error("shutdown", "save_session_summary", e,
+                         recovery="cancellation propagated to orderly shutdown",
+                         final_status="cancelled")
+            raise
         except Exception as e:
-            print(f"[REM] session summary not saved on exit: {e!r}")
+            from core.error_reporting import report_error
+            report_error("shutdown", "save_session_summary", e,
+                         recovery="application shutdown continues",
+                         final_status="failed")
 
     def _stop_engines(self) -> None:
         """Routines stop firing; a running background task stops after the round
@@ -1223,7 +1254,10 @@ class RemLive:
 
                 asyncio.run_coroutine_threadsafe(_shutdown_on_loop(), loop).result(timeout)
             except Exception as e:
-                print(f"[REM] wrap-up cut short: {e!r}")
+                from core.error_reporting import report_error
+                report_error("shutdown", "finish", e,
+                             recovery=("cleanup was cancelled or timed out; process exit continues"),
+                             final_status="unknown")
         self._stop_engines()
 
     # ── Routines (core/routines) ─────────────────────────────────────────────────
@@ -1656,10 +1690,10 @@ class RemLive:
             self._loop
         )
 
-    def speak_error(self, tool_name: str, error: str):
-        short = str(error)[:120]
-        self.ui.write_log(f"ERR: {tool_name} — {short}")
-        self.speak(f"Sir, {tool_name} encountered an error. {short}")
+    def speak_error(self, tool_name: str, error: BaseException):
+        error_type = type(error).__name__
+        self.ui.write_log(f"ERR: {tool_name} — {error_type}")
+        self.speak(f"Sir, {tool_name} encountered an error. I could not complete it.")
 
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
@@ -1859,11 +1893,20 @@ class RemLive:
 
         return out
 
-    async def _execute_tool(self, fc, request_context=None) -> types.FunctionResponse:
+    async def _execute_tool(self, fc, request_context=_REQUEST_CONTEXT_UNSET) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
-        request_context = request_context or self._current_request_context()
+        if request_context is _REQUEST_CONTEXT_UNSET:
+            # Tool execution is authorized only by the request snapshot carried
+            # by the Live batch. Never borrow a newer, unrelated global turn.
+            request_context = None
         user_request, request_source = self._usable_request_context(request_context)
+
+        from core.tool_security import tool_policy
+        if tool_policy(name) is None:
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": "This tool has no reviewed security classification; no action was taken."})
 
         control_tools = {"screen_agent", "desktop_ui", "computer_control", "computer_settings",
                          "browser_control", "screen_process", "open_app", "send_message"}
@@ -1874,7 +1917,13 @@ class RemLive:
             if not allowed:
                 task_id = getattr(request_context, "task_id", "missing")
                 age = (f"{request_context.age():.1f}s" if request_context else "unknown")
-                print(f"[REM] Desktop authorization refused task={task_id} tool={name} age={age} category=missing_or_unrelated_context")
+                if request_context is None:
+                    category = "missing_or_unrelated_context"
+                elif request_context.is_expired():
+                    category = "expired_authorization"
+                else:
+                    category = "request_not_authorized"
+                print(f"[REM] Desktop authorization refused task={task_id} tool={name} age={age} category={category}")
                 return types.FunctionResponse(
                     id=fc.id, name=name, response={"result": reason})
 
@@ -1892,7 +1941,7 @@ class RemLive:
             value    = args.get("value", "")
             if key and value:
                 update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
+                print("[Memory] Memory updated.")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
@@ -1980,7 +2029,7 @@ class RemLive:
                                 img_b, mime_t, observed = await loop.run_in_executor(
                                     None,
                                     lambda: capture_observation(
-                                        _capture_screen,
+                                        _capture_screen_with_identity,
                                         lambda: screenview.look(budget_s=1.2, allow_ocr=True),
                                         preflight=assert_cloud_image_egress_allowed,
                                     ),
@@ -2120,13 +2169,16 @@ class RemLive:
                     result = f"Unknown tool: {name}"
 
         except Exception as e:
+            from core.error_reporting import report_error
+            report_error("tool_dispatch", name, e,
+                         task_id=getattr(request_context, "task_id", None),
+                         final_status="failed")
             if name == "screen_process":
                 result = ("Screen observation failed; no image was sent. "
-                          f"{type(e).__name__}: {e}")
+                          f"Failure type: {type(e).__name__}.")
                 print(f"[Vision] ⚠️ {result}")
             else:
-                result = f"Tool '{name}' failed: {e}"
-                traceback.print_exc()
+                result = f"Tool '{name}' failed ({type(e).__name__}); no success is confirmed."
                 self.speak_error(name, e)
 
         if not self.ui.muted:
@@ -2135,8 +2187,14 @@ class RemLive:
         # How long the tool itself took. A long silence after a tool call is
         # either this number or the model's own time before and after it — and
         # without it the two look identical from the outside.
-        print(f"[REM] 📤 {name} ({(time.monotonic() - _t_tool) * 1000:.0f} ms) "
-              f"→ {str(result)[:80]}")
+        if name == "screen_process":
+            # Observation content can include passwords or private material.
+            # Never put screen text in routine diagnostics.
+            print(f"[REM] 📤 screen_process ({(time.monotonic() - _t_tool) * 1000:.0f} ms) "
+                  f"→ read-only observation result returned ({len(str(result))} chars)")
+        else:
+            print(f"[REM] 📤 {name} ({(time.monotonic() - _t_tool) * 1000:.0f} ms) "
+                  f"→ result returned ({len(str(result))} chars)")
 
         # A tool that declared itself NON_BLOCKING also says when its answer may
         # re-enter the conversation. Without this the model finishes whatever it
@@ -2147,9 +2205,12 @@ class RemLive:
         _sched = (self._action_registry.scheduling(name)
                   or self._plugin_registry.scheduling(name))
         _extra = {"scheduling": _sched} if _sched else {}
+        from core.conversation import format_tool_result, tool_result_guidance
+        response_result = format_tool_result(name, result)
+        response_result += "\n\n" + tool_result_guidance(response_result)
         return types.FunctionResponse(
             id=fc.id, name=name,
-            response={"result": result},
+            response={"result": response_result},
             **_extra
         )
 
@@ -2165,7 +2226,7 @@ class RemLive:
                 await self.session.send_realtime_input(
                     audio=types.Blob(
                         data=msg["data"],
-                        mime_type=msg.get("mime_type", "audio/pcm"),
+                        mime_type=msg.get("mime_type", "audio/pcm;rate=16000"),
                     )
                 )
 
@@ -2306,7 +2367,7 @@ class RemLive:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self._queue_realtime_audio,
-                    {"data": data, "mime_type": "audio/pcm"}
+                    {"data": data, "mime_type": "audio/pcm;rate=16000"}
                 )
                 # Feed the live mic level to the HUD so the waveform reacts to
                 # the user's actual voice while listening. Purely cosmetic — any
@@ -2589,8 +2650,9 @@ class RemLive:
                             self._keep_task(asyncio.create_task(
                                 self._handle_tool_call_batch(unique_calls, request_context)))
         except Exception as e:
-            print(f"[REM] ❌ Recv: {e}")
-            traceback.print_exc()
+            from core.error_reporting import report_error
+            report_error("gemini_live_receive", "receive", e,
+                         final_status="failed")
             raise
 
     async def _handle_tool_call_batch(self, function_calls, request_context) -> None:
@@ -2611,7 +2673,10 @@ class RemLive:
                         self._finish_vision(pending[0])
                     raise
                 except Exception as exc:
-                    print(f"[REM] ❌ Live tool {fc.name}: {type(exc).__name__}: {exc}")
+                    from core.error_reporting import report_error
+                    report_error("live_tool_batch", fc.name, exc,
+                                 task_id=getattr(request_context, "task_id", None),
+                                 final_status="failed")
                     responses.append(types.FunctionResponse(
                         id=fc.id, name=fc.name,
                         response={"result": "Tool execution failed; no success is confirmed."}))
@@ -3534,8 +3599,10 @@ class RemLive:
                     continue
 
                 err_str = str(e)
-                print(f"[REM] Error ({type(e).__name__}): {e}")
-                traceback.print_exc()
+                from core.error_reporting import report_error
+                report_error("gemini_live_session", "connect_or_run", e,
+                             recovery="classified for existing reconnect policy",
+                             final_status="reconnecting_or_stopping")
 
                 # Out of quota, or this model is not available to this key —
                 # step down the ladder and reconnect straight away. This is the

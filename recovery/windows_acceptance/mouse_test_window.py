@@ -9,7 +9,9 @@ from pathlib import Path
 
 state_path = Path(sys.argv[1])
 stop_path = Path(sys.argv[2])
-state = {"ready": False, "events": {}, "mouse_down": False, "drop_success": False}
+state = {"ready": False, "events": {}, "mouse_down": False, "drop_success": False,
+         "keyboard_text": "", "keyboard_secondary": "",
+         "keyboard_focus": "", "key_events": {}}
 
 
 def save_state():
@@ -21,6 +23,7 @@ def save_state():
         controls[name] = {
             "left": widget.winfo_rootx(), "top": widget.winfo_rooty(),
             "width": widget.winfo_width(), "height": widget.winfo_height(),
+            "hwnd": int(widget.winfo_id()),
         }
     state["controls"] = controls
     state["window"] = {"title": root.title(), "left": root.winfo_rootx(),
@@ -38,15 +41,82 @@ def event(name):
 
 root = tk.Tk()
 root.title("REM Disposable Mouse Acceptance")
-root.geometry("900x690+120+100")
+root.geometry("900x760+120+80")
 root.resizable(False, False)
 root.attributes("-topmost", True)
 tk.Label(root, text="REM MOUSE ACCEPTANCE — disposable test surface",
          font=("Segoe UI", 16, "bold")).pack(pady=12)
+marker = tk.Canvas(root, width=168, height=44, bg="#f4f4f4", highlightthickness=0)
+marker.create_rectangle(8, 6, 46, 38, fill="#ff00ff", outline="#ff00ff")
+marker.create_text(108, 22, text="REM_CAPTURE_MARKER", fill="#111111")
+marker.pack(pady=2)
+
+tk.Label(root, text="Disposable keyboard target — test text only").pack()
+keyboard = tk.Text(root, width=66, height=3, undo=True)
+keyboard.pack(pady=3)
+widgets = {"keyboard": keyboard}
+
+def keyboard_update(_event=None):
+    state["keyboard_text"] = keyboard.get("1.0", "end-1c")
+    save_state()
+
+def keyboard_focus_in(_event=None):
+    state["keyboard_focus"] = "keyboard"
+    save_state()
+
+def keyboard_focus_out(_event=None):
+    root.after_idle(refresh_keyboard_focus)
+
+def keyboard_keypress(event):
+    key = str(event.keysym)
+    state["key_events"][key] = state["key_events"].get(key, 0) + 1
+    if event.state & 0x4:
+        chord = "Ctrl+" + key.casefold()
+        state["key_events"][chord] = state["key_events"].get(chord, 0) + 1
+    save_state()
+
+keyboard.bind("<KeyRelease>", keyboard_update, add="+")
+keyboard.bind("<FocusIn>", keyboard_focus_in, add="+")
+keyboard.bind("<FocusOut>", keyboard_focus_out, add="+")
+keyboard.bind("<KeyPress>", keyboard_keypress, add="+")
+
+tk.Label(root, text="Second keyboard focus target").pack()
+keyboard_secondary = tk.Entry(root, width=56)
+keyboard_secondary.pack(pady=2)
+widgets["keyboard_secondary"] = keyboard_secondary
+
+def secondary_update(_event=None):
+    state["keyboard_secondary"] = keyboard_secondary.get()
+    save_state()
+
+def secondary_focus_in(_event=None):
+    state["keyboard_focus"] = "secondary"
+    save_state()
+
+def secondary_focus_out(_event=None):
+    root.after_idle(refresh_keyboard_focus)
+
+def refresh_keyboard_focus():
+    if not root.winfo_exists():
+        return
+    focused = root.focus_get()
+    state["keyboard_focus"] = ("keyboard" if focused is keyboard else
+                               "secondary" if focused is keyboard_secondary else "")
+    save_state()
+
+keyboard_secondary.bind("<KeyRelease>", secondary_update, add="+")
+keyboard_secondary.bind("<FocusIn>", secondary_focus_in, add="+")
+keyboard_secondary.bind("<FocusOut>", secondary_focus_out, add="+")
+
+def tab_to_secondary(_event=None):
+    keyboard_secondary.focus_set()
+    return "break"
+
+keyboard.bind("<Tab>", tab_to_secondary, add="+")
 
 row = tk.Frame(root)
 row.pack(pady=8)
-widgets = {}
+widgets["capture_marker"] = marker
 
 left = tk.Button(row, text="Left click target", width=18, height=3,
                  command=lambda: event("left_click"))
@@ -67,6 +137,11 @@ hover = tk.Label(row, text="Hover target", relief="ridge", width=18, height=3)
 hover.grid(row=0, column=3, padx=12)
 hover.bind("<Enter>", lambda _e: event("hover"))
 widgets["hover"] = hover
+
+middle = tk.Label(root, text="Middle-click target", relief="ridge", width=22, height=2)
+middle.pack(pady=4)
+middle.bind("<Button-2>", lambda _e: event("middle_click"))
+widgets["middle"] = middle
 
 hold = tk.Label(root, text="Hold/release target", relief="groove", width=24, height=2)
 hold.pack(pady=10)
@@ -137,6 +212,7 @@ root.update()  # map the window before publishing screen coordinates
 root.attributes("-topmost", True)
 root.lift()
 root.focus_force()
+keyboard.focus_force()
 state["ready"] = True
 save_state()
 root.after(100, poll_stop)

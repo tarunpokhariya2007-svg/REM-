@@ -47,12 +47,19 @@ internal static class NativeUiaFixture
             Location = new Point(24, 52), Size = new Size(360, 28) };
         var result = new Label { Name = "ResultLabel", AccessibleName = "Search result status",
             Text = "No search run", Location = new Point(24, 92), Size = new Size(520, 24) };
-        var button = new Button { Name = "SearchButton", AccessibleName = "Run test search",
-            Text = "Run test search", Location = new Point(400, 50), Size = new Size(150, 32) };
-        button.Click += (s, e) => result.Text = "Search completed: " + search.Text;
         var list = new ListBox { Name = "ResultList", AccessibleName = "Test results",
             Location = new Point(24, 140), Size = new Size(240, 110) };
         list.Items.AddRange(new object[] { "Alpha result", "Bravo result", "Charlie result" });
+        var button = new Button { Name = "SearchButton", AccessibleName = "Run test search",
+            Text = "Run test search", Location = new Point(400, 50), Size = new Size(150, 32) };
+        button.Click += (s, e) => {
+            result.Text = "Search completed: " + search.Text;
+            result.AccessibleName = result.Text;
+            list.BeginUpdate();
+            list.Items.Clear();
+            list.Items.Add("Result for " + search.Text);
+            list.EndUpdate();
+        };
         var check = new CheckBox { Name = "TestCheckBox", AccessibleName = "Enable test option",
             Text = "Enable test option", AutoSize = true, Location = new Point(300, 145) };
         var combo = new ComboBox { Name = "TestComboBox", AccessibleName = "Test choices",
@@ -63,10 +70,16 @@ internal static class NativeUiaFixture
             Location = new Point(24, 280), Size = new Size(500, 220) };
         tabs.TabPages.Add(new TabPage("Overview") { Name = "OverviewTab" });
         tabs.TabPages.Add(new TabPage("Details") { Name = "DetailsTab" });
+        var multiline = new RichTextBox { Name = "MultilineKeyboardBox",
+            AccessibleName = "Multiline keyboard field", Multiline = true,
+            AcceptsTab = true, WordWrap = true,
+            ScrollBars = RichTextBoxScrollBars.Vertical,
+            Location = new Point(24, 515), Size = new Size(520, 76) };
         var menu = new MenuStrip { Name = "TestMenu" };
         var item = new ToolStripMenuItem("Fixture") { Name = "FixtureMenuItem" };
         menu.Items.Add(item); form.MainMenuStrip = menu;
-        form.Controls.AddRange(new Control[] { label, search, result, button, list, check, combo, tabs, menu });
+        form.Controls.AddRange(new Control[] { label, search, result, button, list, check,
+            combo, tabs, multiline, menu });
         form.Shown += (s, e) => { form.Activate(); form.BringToFront(); };
         Application.Run(form);
     }

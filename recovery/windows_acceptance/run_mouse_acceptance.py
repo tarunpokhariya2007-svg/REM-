@@ -120,12 +120,26 @@ def run():
 
             # Absolute semantic point movement; verify the actual OS cursor.
             target = center(state, "hover")
+            hover_rect = state["controls"]["hover"]
             act = screenact.move_cursor(target)
             position = tuple(map(int, pyautogui.position()))
             expected = (target.x, target.y)
+            coordinate_error = (abs(position[0] - expected[0]),
+                                abs(position[1] - expected[1]))
             summary["checks"]["absolute_move"] = {
                 "act_ok": act.ok, "cursor": position, "expected": expected,
-                "passed": act.ok and position == expected,
+                "coordinate_error_px": coordinate_error,
+                "act_point": act.point,
+                "hover_widget_state_rect": hover_rect,
+                "window_state_rect": logical_window,
+                "cursor_win32": tuple(map(int, win32gui.GetCursorPos())),
+                "window_at_expected": int(win32gui.GetAncestor(
+                    win32gui.WindowFromPoint(expected), 2) or 0),
+                "window_at_cursor": int(win32gui.GetAncestor(
+                    win32gui.WindowFromPoint(position), 2) or 0),
+                # Windows may round a logical coordinate to the adjacent
+                # physical pixel when the target window is DPI-scaled.
+                "passed": act.ok and max(coordinate_error) <= 1,
             }
             if not summary["checks"]["absolute_move"]["passed"]:
                 raise AssertionError("absolute cursor position did not match the requested point")
@@ -225,6 +239,7 @@ def run():
             checks = [
                 ("left_click", lambda: screenact.click(center(state, "left")), "left_click"),
                 ("right_click", lambda: screenact.right_click(center(state, "right")), "right_click"),
+                ("middle_click", lambda: screenact.click(center(state, "middle"), button="middle"), "middle_click"),
                 ("double_click", lambda: screenact.double_click(center(state, "double")), "double_click"),
                 ("hover", lambda: screenact.hover(center(state, "hover")), "hover"),
             ]

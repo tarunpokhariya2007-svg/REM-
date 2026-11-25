@@ -25,6 +25,7 @@ class PersistentObservationSettingTests(unittest.TestCase):
                 self.assertEqual(saved["user_setting"], "keep")
                 self.assertIs(saved["persistent_local_observation_enabled"], True)
                 self.assertIs(saved["persistent_desktop_observation_enabled"], True)
+                self.assertIs(saved["local_screen_observation_enabled"], True)
                 self.assertIs(saved["cloud_screen_vision_enabled"], True)
 
     def test_saved_local_observation_is_not_cloud_authorization(self):
@@ -45,6 +46,17 @@ class PersistentObservationSettingTests(unittest.TestCase):
             }), encoding="utf-8")
             with patch.object(config_manager, "CONFIG_FILE", config):
                 self.assertTrue(config_manager.get_persistent_desktop_observation_enabled())
+
+    def test_canonical_local_observation_key_takes_precedence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "api_keys.json"
+            config.write_text(json.dumps({
+                "local_screen_observation_enabled": False,
+                "persistent_local_observation_enabled": True,
+                "persistent_desktop_observation_enabled": True,
+            }), encoding="utf-8")
+            with patch.object(config_manager, "CONFIG_FILE", config):
+                self.assertFalse(config_manager.get_persistent_desktop_observation_enabled())
 
     def test_exclusions_are_normalized_and_saved_without_other_config_loss(self):
         with tempfile.TemporaryDirectory() as directory:
