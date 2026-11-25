@@ -104,6 +104,7 @@ class MainWindow(QMainWindow):
     _viseme_sig     = pyqtSignal(object, float, float)
     _audio_level_sig = pyqtSignal(float)
     _avatar_reset_sig = pyqtSignal()
+    _expression_sig = pyqtSignal(str, float)   # (HAPPY|CONCERNED|"", hold seconds)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _codejob_sig    = pyqtSignal(object)     # dev_agent job state — live coding panel
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
@@ -406,6 +407,7 @@ class MainWindow(QMainWindow):
         self._viseme_sig.connect(self._apply_visemes)
         self._audio_level_sig.connect(self._apply_audio_level)
         self._avatar_reset_sig.connect(self.hud.reset_avatar_motion)
+        self._expression_sig.connect(self.hud.set_expression)
         self._content_sig.connect(self._show_content)
         self._codejob_sig.connect(self._show_code_job)
         self._reconfig_sig.connect(self._show_setup)

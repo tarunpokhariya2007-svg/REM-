@@ -431,6 +431,34 @@ def save_brief_enabled(enabled: bool) -> None:
     _write_config(data)
 
 
+PLAYBACK_BUFFER_DEFAULT_SECONDS = 30
+PLAYBACK_BUFFER_MIN_SECONDS = 5
+PLAYBACK_BUFFER_MAX_SECONDS = 120
+
+
+def get_playback_buffer_seconds() -> int:
+    """Configured maximum queued assistant audio, bounded to two minutes."""
+    try:
+        value = int(load_api_keys().get("playback_buffer_seconds",
+                                       PLAYBACK_BUFFER_DEFAULT_SECONDS))
+    except (TypeError, ValueError):
+        value = PLAYBACK_BUFFER_DEFAULT_SECONDS
+    return max(PLAYBACK_BUFFER_MIN_SECONDS,
+               min(PLAYBACK_BUFFER_MAX_SECONDS, value))
+
+
+def save_playback_buffer_seconds(seconds: int) -> int:
+    """Persist the bounded playback buffer without rewriting other settings."""
+    try:
+        value = int(seconds)
+    except (TypeError, ValueError):
+        value = PLAYBACK_BUFFER_DEFAULT_SECONDS
+    value = max(PLAYBACK_BUFFER_MIN_SECONDS,
+                min(PLAYBACK_BUFFER_MAX_SECONDS, value))
+    _save_flag("playback_buffer_seconds", value)
+    return value
+
+
 # ── Audio devices ────────────────────────────────────────────────────────────
 # Stored as device NAMES, not sounddevice indices. Indices shift every time a
 # USB device is plugged in or removed, so a saved index silently starts pointing

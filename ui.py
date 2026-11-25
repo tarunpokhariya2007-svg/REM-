@@ -248,6 +248,13 @@ class RemUI:
         except Exception:
             pass
 
+    def set_expression(self, name: str, hold: float = 6.0) -> None:
+        """Thread-safe: show a HAPPY / CONCERNED expression ("" clears it)."""
+        try:
+            self._win._expression_sig.emit(str(name or ""), float(hold))
+        except Exception:
+            pass
+
     def reset_avatar_motion(self) -> None:
         """Thread-safe immediate articulation reset on an interrupted turn."""
         self._win._avatar_reset_sig.emit()

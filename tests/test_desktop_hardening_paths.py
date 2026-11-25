@@ -44,6 +44,10 @@ class ChromeCdpConfigurationTests(unittest.TestCase):
                 browser_control._normalize_url(url)
         self.assertEqual(browser_control._normalize_url("youtube.com"),
                          "https://youtube.com")
+        self.assertEqual(browser_control._normalize_url("YouTube"),
+                         "https://youtube.com")
+        with self.assertRaisesRegex(ValueError, "ambiguous website name"):
+            browser_control._normalize_url("portal")
         self.assertEqual(browser_control._normalize_url("localhost:5173"),
                          "http://localhost:5173")
 

@@ -82,7 +82,7 @@ from actions.background_monitor import (
 )
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
-    get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
+    get_media_resolution, get_playback_buffer_seconds, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
 )
@@ -91,6 +91,8 @@ from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
+from core.audio_playback       import PlaybackBuffer
+from core.voice_state          import VoicePhase, VoiceState
 from core.action_loader        import discover_actions
 from core.request_context      import RequestContext
 
@@ -100,6 +102,7 @@ from core.request_context      import RequestContext
 _REQUEST_CONTEXT_UNSET = object()
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
+from core.avatar_anim          import expression_from_text
 from core.wake_phrase          import (
     WAKE_PHRASE, WakePhraseDetector,
     is_ready as wake_is_ready, install_and_download as wake_install,
@@ -207,6 +210,9 @@ except ValueError:
 _AVATAR_AUDIO_GAP_GRACE = max(0.9, min(1.2, _AVATAR_AUDIO_GAP_GRACE))
 _AVATAR_DEBUG = os.environ.get("REM_AVATAR_DEBUG", "").lower() in {
     "1", "true", "yes", "on",
+}
+_AVATAR_EXPRESSIONS = os.environ.get("REM_AVATAR_EXPRESSIONS", "1").lower() not in {
+    "0", "false", "no", "off",
 }
 
 # Erring early is the safe direction. A viewer tolerates a mouth that moves
@@ -647,6 +653,11 @@ class RemLive:
         self._audio_overflow_notice_at = 0.0
         self._playback_queue_overflows = 0
         self._playback_overflow_notice_at = 0.0
+        self._playback_generation = 0
+        self._playback_generation_lock = threading.Lock()
+        self._barge_in_blocks = 0
+        self._voice_state = VoiceState()
+        self._startup_greeting_sent = False
         self._loop                     = None
         self._closing                  = False
         self._finish_lock              = threading.Lock()
@@ -734,7 +745,6 @@ class RemLive:
         self._resume_handle: str | None = None
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
-        self._briefing_sent    = False          # morning briefing fires once per process
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
@@ -1650,18 +1660,17 @@ class RemLive:
 
     def interrupt(self) -> None:
         """Stop REM mid-speech: drain queued audio and open mic immediately."""
+        self._voice_state.set(VoicePhase.USER_INTERRUPTION)
+        with self._playback_generation_lock:
+            self._playback_generation += 1
         self._interrupted = True
-        q = self.audio_in_queue
-        if q:
-            drained = 0
-            while True:
-                try:
-                    q.get_nowait()
-                    drained += 1
-                except Exception:
-                    break
-            if drained:
-                print(f"[REM] ✋ Interrupted — {drained} audio chunks discarded")
+        self._voice_state.set(VoicePhase.CANCELLING)
+        loop = getattr(self, "_loop", None)
+        if self.audio_in_queue is not None:
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self._discard_playback_audio, "interruption")
+            else:
+                self._discard_playback_audio("interruption")
         self.set_speaking(False, reason="interrupted")
         # The words we were about to mouth are never going to be spoken now.
         self._visemes.reset()
@@ -1677,7 +1686,23 @@ class RemLive:
                 self._engine.interrupt()
             except Exception:
                 pass
+        self._barge_in_blocks = 0
+        if not getattr(self, "_closing", False):
+            self._voice_state.set(VoicePhase.LISTENING)
         self.ui.write_log("SYS: Interrupted — listening...")
+
+    def _playback_generation_now(self) -> int:
+        with self._playback_generation_lock:
+            return self._playback_generation
+
+    def _discard_playback_audio(self, reason: str) -> int:
+        queue = self.audio_in_queue
+        if queue is None:
+            return 0
+        count = queue.discard_all(reason)
+        if count:
+            print(f"[REM] Playback discarded={count} reason={reason}")
+        return count
 
     def speak(self, text: str):
         if not self._loop or not self.session:
@@ -2267,37 +2292,25 @@ class RemLive:
                     pass
             return accepted
 
-    def _queue_playback_audio(self, chunk: bytes) -> bool:
-        """Keep server PCM bounded and fresh without blocking the Live reader."""
+    async def _queue_playback_audio(self, chunk: bytes) -> bool:
+        """Queue PCM in order; a full bounded buffer backpressures Live receive."""
         queue = self.audio_in_queue
         if queue is None:
             return False
-        try:
-            queue.put_nowait(chunk)
-            return True
-        except asyncio.QueueFull:
-            self._playback_queue_overflows = getattr(self, "_playback_queue_overflows", 0) + 1
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                queue.put_nowait(chunk)
-            except asyncio.QueueFull:
-                accepted = False
-            else:
-                accepted = True
+        generation = self._playback_generation_now()
+        if self._interrupted or self._closing:
+            return False
+        accepted = await queue.put(chunk, generation)
+        if generation != self._playback_generation_now() or self._interrupted:
+            queue.discard_generation(generation, "interruption")
+            return False
+        if queue.qsize() >= int(queue.maxsize * 0.8):
             now = time.monotonic()
-            last = getattr(self, "_playback_overflow_notice_at", 0.0)
+            last = getattr(self, "_playback_metrics_at", 0.0)
             if now - last >= 30.0:
-                self._playback_overflow_notice_at = now
-                try:
-                    self.ui.write_log(
-                        "SYS: Playback queue is full; older output audio was dropped "
-                        f"(overflows: {self._playback_queue_overflows}).")
-                except Exception:
-                    pass
-            return accepted
+                self._playback_metrics_at = now
+                print(f"[REM] Playback buffer high-water diagnostics: {queue.stats()}")
+        return accepted
 
     async def _listen_audio(self):
         print("[REM] 🎤 Mic started")
@@ -2550,6 +2563,13 @@ class RemLive:
                                 # alone cannot show. Pure string work — it adds
                                 # nothing measurable to the response path.
                                 self._visemes.feed_text(txt)
+                                # Gentle expression cue from REM's own words
+                                # (HAPPY / CONCERNED). Cosmetic only; set
+                                # REM_AVATAR_EXPRESSIONS=0 to disable.
+                                if _AVATAR_EXPRESSIONS:
+                                    _expr = expression_from_text(txt)
+                                    if _expr:
+                                        self.ui.set_expression(_expr, 6.0)
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)

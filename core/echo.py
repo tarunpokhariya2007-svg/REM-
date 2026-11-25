@@ -50,6 +50,7 @@ agnostic, which matters here: the microphone runs at 16 kHz and playback at
 from __future__ import annotations
 
 import time
+import threading
 
 import numpy as np
 
@@ -122,6 +123,7 @@ class EchoGuard:
     """
 
     def __init__(self) -> None:
+        self._history_lock = threading.RLock()
         self._hist: list[tuple[float, np.ndarray, float]] = []   # (t, bands, level)
         self._gain = 0.6          # mic level per unit of output level; learned
         self._seen = 0            # how many echo blocks the estimate has seen
@@ -159,6 +161,11 @@ class EchoGuard:
         return self._floor < _UNRELIABLE_FLOOR
 
     @property
+    def has_history(self) -> bool:
+        with self._history_lock:
+            return bool(self._hist)
+
+    @property
     def threshold(self) -> float:
         """The residual a block must clear right now to count as a voice."""
         return max(_MIN_USER, self._head * _HEAD_MULT)
@@ -175,8 +182,9 @@ class EchoGuard:
 
     def reset(self) -> None:
         """Playback stopped — drop the history, keep what was learned."""
-        self._hist.clear()
-        self._last_sim = 0.0
+        with self._history_lock:
+            self._hist.clear()
+            self._last_sim = 0.0
 
     # ── the two entry points ────────────────────────────────────────────────
 
@@ -184,10 +192,12 @@ class EchoGuard:
         """Record a slice of what is being played, for later comparison."""
         try:
             t = time.monotonic() if when is None else when
-            self._hist.append((t, band_energies(pcm, sr), float(level)))
-            cutoff = t - _HISTORY_S
-            if len(self._hist) > 8:
-                self._hist = [h for h in self._hist if h[0] >= cutoff]
+            entry = (t, band_energies(pcm, sr), float(level))
+            with self._history_lock:
+                self._hist.append(entry)
+                cutoff = t - _HISTORY_S
+                if len(self._hist) > 8:
+                    self._hist = [h for h in self._hist if h[0] >= cutoff]
         except Exception:
             pass          # never let bookkeeping disturb playback
 
@@ -201,7 +211,9 @@ class EchoGuard:
                 # far from the speaker). Record that, or the window stays
                 # empty and the first person to speak gets mistaken for
                 # the calibration sample.
-                if self._hist and max(h[2] for h in self._hist) > 0.15:
+                with self._history_lock:
+                    history = tuple(self._hist)
+                if history and max(h[2] for h in history) > 0.15:
                     self._residuals.append(0.0)
                     if len(self._residuals) > _FLOOR_WINDOW:
                         del self._residuals[:-_FLOOR_WINDOW]
@@ -210,7 +222,9 @@ class EchoGuard:
                         self._head = float(np.percentile(self._residuals, _HEAD_Q))
                 self._run = 0
                 return False
-            if not self._hist:
+            with self._history_lock:
+                history = tuple(self._hist)
+            if not history:
                 # Nothing playing that we know of — anything audible is theirs.
                 return True
 
@@ -224,7 +238,7 @@ class EchoGuard:
             # subtract as much of it as fits. What is left over is whatever the
             # microphone heard that we did not play.
             best_res, best_level = 1.0, 0.0
-            for ts, ref, ref_level in self._hist:
+            for ts, ref, ref_level in history:
                 if ts > t or t - ts > _HISTORY_S:
                     continue
                 denom = float(np.dot(ref, ref))

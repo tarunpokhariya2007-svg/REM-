@@ -144,27 +144,37 @@ class ScreenObservationTests(unittest.TestCase):
         self.assertFalse(main._is_live_inactivity_close(
             RuntimeError("APIError 1008: invalid configuration")))
 
-    def test_playback_audio_queue_is_bounded_and_sheds_oldest_without_blocking(self):
-        import asyncio
+    def test_playback_audio_queue_is_bounded_and_backpressures_without_dropping(self):
         import main
+        from core.audio_playback import PlaybackBuffer
+        from tests.manual_async import manual_loop, run_ready
 
         class UI:
             def __init__(self): self.logs = []
             def write_log(self, text): self.logs.append(text)
 
         rem = main.RemLive.__new__(main.RemLive)
-        rem.audio_in_queue = asyncio.Queue(maxsize=2)
-        rem.audio_in_queue.put_nowait(b"old-1")
-        rem.audio_in_queue.put_nowait(b"old-2")
+        rem.audio_in_queue = PlaybackBuffer(maxsize=2)
+        rem._playback_generation = 0
+        rem._playback_generation_lock = __import__("threading").Lock()
+        rem._interrupted = False
+        rem._closing = False
         rem.ui = UI()
-        rem._playback_queue_overflows = 0
-        rem._playback_overflow_notice_at = 0.0
-        self.assertTrue(rem._queue_playback_audio(b"new"))
-        self.assertEqual(rem.audio_in_queue.qsize(), 2)
-        self.assertEqual(rem.audio_in_queue.get_nowait(), b"old-2")
-        self.assertEqual(rem.audio_in_queue.get_nowait(), b"new")
-        self.assertEqual(rem._playback_queue_overflows, 1)
-        self.assertTrue(rem.ui.logs)
+
+        with manual_loop():
+            run_ready(rem.audio_in_queue.put(b"old-1", 0))
+            run_ready(rem.audio_in_queue.put(b"old-2", 0))
+            producer = rem._queue_playback_audio(b"new")
+            waiter = producer.send(None)
+            self.assertFalse(waiter.done())
+            first = rem.audio_in_queue.get_nowait()
+            self.assertEqual(first.data, b"old-1")
+            with self.assertRaises(StopIteration) as completed:
+                producer.send(None)
+            self.assertTrue(completed.exception.value)
+            second = rem.audio_in_queue.get_nowait()
+            third = rem.audio_in_queue.get_nowait()
+            self.assertEqual([second.data, third.data], [b"old-2", b"new"])
 
     def test_shutdown_hook_cancels_live_run_and_finish_is_idempotent(self):
         import threading

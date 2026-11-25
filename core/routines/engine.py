@@ -399,7 +399,11 @@ class RoutineEngine:
                 self.host.start_task(r["text"], r.get("agent") or "general",
                                      int(r.get("minutes") or 10), r.get("deliver") or "voice")
             else:
-                self.host.builtin(r["builtin"], dict(r.get("options") or {}))
+                options = dict(r.get("options") or {})
+                # Preserve trigger identity for host behavior without changing
+                # the persisted user routine or its configured options.
+                options["_trigger_type"] = str(r.get("trigger", {}).get("type") or "")
+                self.host.builtin(r["builtin"], options)
             result = "ran"
         except Exception as e:
             result = f"failed: {type(e).__name__}: {e}"

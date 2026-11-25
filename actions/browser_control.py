@@ -150,7 +150,8 @@ def _configured_chrome_cdp_endpoint(value: str | None = None) -> str | None:
 
 def _normalize_url(url: str) -> str:
     """
-    Bare words like "instagram" → "https://instagram.com"
+    Known site names → their canonical homepages; unknown bare words are
+    rejected rather than silently guessed as an unrelated ``.com`` address.
     Domains like "instagram.com" → "https://instagram.com"
     Full URLs pass through unchanged.
     """
@@ -186,9 +187,21 @@ def _normalize_url(url: str) -> str:
         is_loopback = host == "localhost"
     if is_loopback:
         return "http://" + url
-    # No dot at all → assume .com  (e.g. "instagram" → "instagram.com")
     if "." not in url:
-        url = url + ".com"
+        aliases = {
+            "google": "google.com", "youtube": "youtube.com",
+            "gmail": "gmail.com", "google drive": "drive.google.com",
+            "github": "github.com", "reddit": "reddit.com",
+            "wikipedia": "wikipedia.org", "bing": "bing.com",
+            "amazon": "amazon.com", "instagram": "instagram.com",
+            "facebook": "facebook.com", "linkedin": "linkedin.com",
+            "microsoft": "microsoft.com", "netflix": "netflix.com",
+            "x": "x.com", "twitter": "x.com",
+        }
+        canonical = aliases.get(url.casefold())
+        if canonical is None:
+            raise ValueError("ambiguous website name")
+        url = canonical
     return "https://" + url
 
 
@@ -973,7 +986,14 @@ class _BrowserSession:
 
     async def go_to(self, url: str) -> str:
 
-        url      = _normalize_url(url)
+        try:
+            url = _normalize_url(url)
+        except ValueError:
+            return outcome.ask(
+                "browser_control",
+                "Which website did you mean? Please give me its name or web address.",
+                verified=False,
+            )
         page     = await self._get_page()
         prev_url = page.url
         navigation_error = None
@@ -1724,7 +1744,14 @@ def _browser_control_impl(
         else:
             nav_url = params.get("url", "").strip()
 
-        result = _open_native(nav_url, browser)
+        try:
+            result = _open_native(nav_url, browser)
+        except ValueError:
+            result = outcome.ask(
+                "browser_control",
+                "Which website did you mean? Please give me its name or web address.",
+                verified=False,
+            )
         # Remembered unless it outright FAILED. `unverified` is now the normal
         # answer for a native open - the browser does not report back - and
         # treating that as a problem would stop the automation session ever

@@ -185,6 +185,14 @@ class HudCanvas(QWidget):
         except Exception:
             pass
 
+    def set_expression(self, name: str, hold: float = 6.0) -> None:
+        """Overlay a HAPPY / CONCERNED expression on the portrait for ``hold`` s."""
+        try:
+            if self._avatar is not None and hasattr(self._avatar, "set_expression"):
+                self._avatar.set_expression(name or None, hold)
+        except Exception:
+            pass
+
     def reset_avatar_motion(self) -> None:
         """Clear queued articulation immediately after playback interruption."""
         self._visemes = None
@@ -355,6 +363,8 @@ class HudCanvas(QWidget):
                 width=v_wide,
                 level=v_level if v_level is not None else amp,
                 speaking=self.speaking,
+                muted=self.muted,
+                state=self.state,
             )
         else:
             if self._reactor is not None:

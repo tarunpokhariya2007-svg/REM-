@@ -1,4 +1,14 @@
-"""Particle portrait renderer with local audio-synchronised facial layers."""
+"""REM portrait renderers.
+
+``RemParticleAvatar()`` is a factory returning, in order of preference:
+
+1. ``RemLayeredAvatar`` — pre-built transparent layers from
+   ``gui/assets/rem/`` (base, eyelid frames, mouth keyframes, manifest.json),
+   pre-filtered to the display size so the particle art is not aliased, and
+   animated by ``core.avatar_anim.AvatarAnimator``.
+2. ``LegacyParticleAvatar`` — the original single-image renderer, used only if
+   the layered assets are missing/unreadable or ``REM_AVATAR_STYLE=legacy``.
+"""
 from __future__ import annotations
 
 import math
@@ -7,6 +17,9 @@ import random
 from pathlib import Path
 
 import numpy as np
+
+import json
+import time
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import (
@@ -36,7 +49,7 @@ def _qimage_from_rgba(pixels: np.ndarray) -> QImage:
                   QImage.Format.Format_RGBA8888).copy()
 
 
-class RemParticleAvatar:
+class LegacyParticleAvatar:
     """Keep the supplied portrait as the base and animate only aligned layers.
 
     ``openness`` and ``width`` come from 20 ms analysis of the PCM being sent
@@ -354,3 +367,250 @@ class RemParticleAvatar:
                                 Qt.PenCapStyle.RoundCap))
             painter.drawPoint(QPointF(px, py))
         painter.restore()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Layered renderer
+# ═════════════════════════════════════════════════════════════════════════════
+_LAYER_DIR = Path(__file__).resolve().parent.parent / "gui" / "assets" / "rem"
+
+
+def _clamp01(v: float) -> float:
+    return 0.0 if v < 0.0 else 1.0 if v > 1.0 else v
+
+
+class RemLayeredAvatar:
+    """Transparent layered portrait: base + eyelid frames + mouth keyframes.
+
+    Honest limits: the head, hair and ribbon are one raster, so "head
+    movement" is a whole-portrait tilt/bob of a fraction of a degree/pixel.
+    Mouth shapes between the closed line and the open mouth are derived from
+    the original open mouth; they are not hand-drawn phoneme art.
+    """
+
+    def __init__(self, layer_dir: Path | None = None) -> None:
+        from core.avatar_anim import AvatarAnimator
+        self._dir = Path(layer_dir) if layer_dir else _LAYER_DIR
+        manifest_path = self._dir / "manifest.json"
+        try:
+            self._manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"REM layer manifest unreadable: {manifest_path}: {exc}")
+        canvas = self._manifest["canvas"]
+        self._cw, self._ch = int(canvas["w"]), int(canvas["h"])
+        self.SPAN = 2.0 * self._ch / max(self._cw, self._ch)
+        self._src: dict[str, tuple[QImage, int, int]] = {}
+        for name, meta in self._manifest["layers"].items():
+            img = QImage(str(self._dir / meta["file"]))
+            if img.isNull():
+                raise RuntimeError(f"REM layer missing or unreadable: {meta['file']}")
+            self._src[name] = (img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied),
+                               int(meta["x"]), int(meta["y"]))
+        for needed in ("rem-base", "rem-mouth-open", "rem-eyes-lid100"):
+            if needed not in self._src:
+                raise RuntimeError(f"REM layer set incomplete: {needed}")
+        self._lid_levels = [float(v) for v in self._manifest.get("lid_levels", (0.35, 0.7, 1.0))]
+        self._anim = AvatarAnimator()
+        self._cache: dict[str, tuple[QImage, int, int]] = {}
+        self._cache_w = 0
+        self._cache_dpr = 1.0
+        self._cache_t = 0.0
+        self._sparkles = self._make_sparkles()
+        self._debug_pose = ""
+
+    # ── inputs from the HUD ──────────────────────────────────────────────────
+    def glance(self, *_a, **_k) -> None:
+        """Gaze cannot move without separate pupil art; kept for API parity."""
+
+    def set_state(self, state: str) -> None:
+        self._anim.set_state(state)
+
+    def set_expression(self, name, hold: float = 6.0) -> None:
+        self._anim.set_expression(name, hold)
+
+    def reset_motion(self) -> None:
+        self._anim.reset_motion()
+
+    def step(self, dt: float, openness=None, width=None, level=None,
+             speaking: bool = False, muted: bool = False, state=None, **_unused) -> None:
+        # ``muted`` is the *microphone*; REM can still be speaking. Mouth is
+        # gated by the playback-derived ``speaking`` flag only.
+        self._anim.step(dt, openness=openness, width=width, level=level,
+                        speaking=speaking, state=state)
+        if _AVATAR_DEBUG:
+            p = self._anim.pose
+            tag = f"{self._anim.state}/{self._anim.expression}"
+            if tag != self._debug_pose:
+                self._debug_pose = tag
+                print(f"[Avatar] state={tag} open={p.mouth_open:.2f} lid={p.lid:.2f}")
+
+    # ── scaling cache ────────────────────────────────────────────────────────
+    def _make_sparkles(self):
+        base, _x, _y = self._src["rem-base"]
+        rng = random.Random(7)
+        pts = []
+        w, h = base.width(), base.height()
+        tries = 0
+        while len(pts) < 80 and tries < 6000:
+            tries += 1
+            x, y = rng.randrange(w), rng.randrange(h)
+            # keep the face clear: sparkles live on hair/ruffles, not on skin
+            if ((x / w - 0.5) / 0.22) ** 2 + ((y / h - 0.52) / 0.24) ** 2 < 1.0:
+                continue
+            c = base.pixelColor(x, y)
+            if c.alpha() < 240 or c.blue() < 200 or c.red() > 170:
+                continue
+            pts.append((x, y, c.red(), c.green(), c.blue(),
+                        rng.random() * math.tau, 0.5 + rng.random() * 0.8))
+        return pts
+
+    def _ensure_cache(self, width_px: int, dpr: float) -> None:
+        """(Re)build pre-filtered layers for the current device size.
+
+        Downscaling the 1277 px dotted art with the painter's bilinear
+        transform aliases badly (the noise visible in the old HUD).
+        QImage.scaled(SmoothTransformation) averages properly. Rebuilds are
+        rate-limited so dragging the window edge stays smooth.
+        """
+        width_px = max(64, int(width_px))
+        if self._cache:
+            drift = abs(width_px - self._cache_w) / float(self._cache_w)
+            if drift < 0.04 and dpr == self._cache_dpr:
+                return
+            if time.monotonic() - self._cache_t < 0.12 and dpr == self._cache_dpr:
+                return                       # reuse stale cache, scaled smoothly
+        sx = width_px / float(self._cw)
+        out: dict[str, tuple[QImage, int, int]] = {}
+        for name, (img, x, y) in self._src.items():
+            w = max(1, int(round(img.width() * sx)))
+            h = max(1, int(round(img.height() * sx)))
+            scaled = img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation)
+            scaled = scaled.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+            scaled.setDevicePixelRatio(dpr)
+            out[name] = (scaled, int(round(x * sx)), int(round(y * sx)))
+        self._cache, self._cache_w, self._cache_dpr = out, width_px, dpr
+        self._cache_t = time.monotonic()
+
+    # ── drawing ──────────────────────────────────────────────────────────────
+    def _blit(self, p: QPainter, name: str, left: float, top: float,
+              unit: float, opacity: float = 1.0) -> None:
+        if opacity <= 0.004 or name not in self._cache:
+            return
+        img, x, y = self._cache[name]
+        # ``unit`` converts cache device-pixels to logical pixels (1/dpr, and
+        # the ratio between the cached width and the current width).
+        p.setOpacity(opacity)
+        p.drawImage(QRectF(left + x * unit, top + y * unit,
+                           img.width() * unit, img.height() * unit), img)
+
+    def _mouth_layers(self, o: float, w: float, smile: float):
+        """[(layer name, opacity)] for the current mouth pose."""
+        if o < 0.035:
+            return [("rem-mouth-smile", smile)] if smile > 0.01 else []
+        chain = [(0.0, None), (0.25, "rem-mouth-small"), (0.55, "rem-mouth-medium"), (1.0, "rem-mouth-open")]
+        layers: list[tuple[str, float]] = []
+        for (lo, a), (hi, b) in zip(chain, chain[1:]):
+            if o <= hi:
+                t = (o - lo) / (hi - lo)
+                if a:
+                    layers.append((a, 1.0))
+                layers.append((b, t if a else _smooth(t)))
+                break
+        shape = 0.0
+        shape_name = ""
+        if w < -0.25:
+            shape, shape_name = _clamp01((-w - 0.25) / 0.5), "rem-mouth-round"
+        elif w > 0.25:
+            shape, shape_name = _clamp01((w - 0.25) / 0.5), "rem-mouth-wide"
+        shape *= _clamp01(o * 1.6)
+        if shape_name and shape_name in self._cache and shape > 0.01:
+            layers = [(n, a * (1.0 - shape)) for n, a in layers] + [(shape_name, shape)]
+        return layers
+
+    def paint(self, painter: QPainter, cx: float, cy: float, radius: float,
+              primary: QColor, accent: QColor, bg: QColor) -> None:
+        dpr = 1.0
+        try:
+            dpr = float(painter.device().devicePixelRatioF())
+        except Exception:
+            pass
+        width_logical = 2.0 * radius
+        self._ensure_cache(int(round(width_logical * dpr)), dpr)
+        if not self._cache:
+            return
+        pose = self._anim.pose
+        base_img, _bx, _by = self._cache["rem-base"]
+        # logical size of one cached pixel, derived from the base layer
+        unit = width_logical / float(base_img.width())
+        left, top = cx - radius, cy - radius
+        height = base_img.height() * unit
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        halo = QRadialGradient(QPointF(cx, cy), radius * 0.95)
+        glow = QColor(primary)
+        glow.setAlpha(10)
+        halo.setColorAt(0.0, glow)
+        glow.setAlpha(0)
+        halo.setColorAt(1.0, glow)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(halo)
+        painter.drawEllipse(QPointF(cx, cy), radius * 1.08, radius * 1.08)
+
+        # whole-portrait idle motion, anchored at the bottom centre (the neck/
+        # shoulders stay planted; the head moves most)
+        ax, ay = cx, top + height
+        painter.translate(ax, ay + pose.bob * height)
+        painter.rotate(pose.tilt)
+        painter.scale(pose.scale, pose.scale)
+        painter.translate(-ax, -ay)
+
+        self._blit(painter, "rem-base", left, top, unit)
+
+        # eyelids: 0 = open (no layer), then lid035 -> lid070 -> lid100
+        lid = pose.lid
+        if lid > 0.02:
+            names = ["rem-eyes-lid%03d" % int(round(v * 100)) for v in self._lid_levels]
+            levels = [0.0] + self._lid_levels
+            for i in range(1, len(levels)):
+                if lid <= levels[i]:
+                    t = (lid - levels[i - 1]) / (levels[i] - levels[i - 1])
+                    if i > 1:
+                        self._blit(painter, names[i - 2], left, top, unit, 1.0)
+                        self._blit(painter, names[i - 1], left, top, unit, t)
+                    else:
+                        self._blit(painter, names[0], left, top, unit, t)
+                    break
+
+        for name, alpha in self._mouth_layers(pose.mouth_open, pose.mouth_width, pose.smile):
+            self._blit(painter, name, left, top, unit, alpha)
+        painter.setOpacity(1.0)
+
+        # sparse shimmer on hair/ruffles only — never on the face
+        sx = width_logical / float(self._cw)
+        for x, y, r, g, b, phase, speed in self._sparkles:
+            shimmer = 0.5 + 0.5 * math.sin(pose.shimmer * 1.6 * speed + phase)
+            if shimmer < 0.25:
+                continue
+            painter.setPen(QPen(QColor(min(255, r + 70), min(255, g + 70), 255, int(60 + 160 * shimmer)),
+                                max(0.8, sx * 2.6), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawPoint(QPointF(left + x * sx, top + y * sx))
+        painter.restore()
+
+
+def _smooth(v: float) -> float:
+    v = _clamp01(v)
+    return v * v * (3.0 - 2.0 * v)
+
+
+def RemParticleAvatar():
+    """Factory kept under the historical name used by gui/theme.py and hud.py."""
+    if os.environ.get("REM_AVATAR_STYLE", "").lower() != "legacy":
+        try:
+            return RemLayeredAvatar()
+        except Exception as exc:     # cosmetics must never take the HUD down
+            print(f"[Avatar] layered renderer unavailable ({exc}); using legacy particle portrait")
+    return LegacyParticleAvatar()
