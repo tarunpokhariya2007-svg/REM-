@@ -102,3 +102,27 @@ Changes after integrated UIA acceptance:
 Mocked/offline validation: **117 tests passed**, compilation passed, `git diff --check` passed. Previously documented real integrated UIA on the disposable fixture passed field discovery, writable ValuePattern/readback, button Invoke/status, checkbox toggle/restore, combo expand/collapse, and list-item selection. The current continuation's new fallback/dispatch, ContextVar, inactivity and shutdown paths have no live full-app/voice test. No full Gemini Live reconnect test, GUI shutdown-during-audio test, persistent preference restart/exclusion test, memory restart CRUD, browser disconnect acceptance, or sustained resource test was run. Full mission remains incomplete.
 
 The latest adapter also has a local WindowPattern visual-state route (normal/restore/maximize/minimize), TextPattern bounded text extraction, and SelectionPattern selected-count readback. These were not exercised in a live window; see manual steps and retain their status as unverified.
+
+## Voice keyboard affordances continuation (2026-11-25)
+
+The integrated `desktop_ui` press action previously allowed only a short list of navigation keys and shortcuts. This meant several explicitly requested everyday operations (Backspace, Insert, F1–F12, Ctrl+S/Z/Y/X, Windows shortcuts, and repeated Tab navigation) could be rejected by the voice-facing tool even though `core.screenact.press()` supported key chords and repeat delivery. The allowlist now covers the requested common keys/chords, and `presses` is bounded to 1–10 and exposed in both the direct `desktop_ui` declaration and the `screen_agent` plugin's single-step and bounded-task schemas. Alt+F4 is confirmation-gated and rechecks the active app/title before delivery. Unsupported chords, including Ctrl+Alt+Delete, remain refused.
+
+The plugin description now directs ordinary read-only screen inspection to local `desktop_ui` observation and reserves screenshot-based `screen_process` for cases where cloud image permission is enabled and visual interpretation is needed.
+
+### Validation for this continuation
+
+- Unit/offline: **121 tests passed** (`python -m unittest discover -s tests -q`), including four new keyboard allowlist, repeat-bound, confirmation, and schema exposure tests.
+- Python compilation: passed for `main.py`, `core`, `actions`, `plugins`, `memory`, `tests`, and `recovery/windows_acceptance`.
+- `git diff --check`: passed; Git emitted only line-ending conversion notices.
+- No real Windows keyboard or voice action was performed for these changes. The app inventory showed a pre-existing Chrome window, VS Code window, and File Explorer window; they were left untouched. The normal REM GUI was not running, and no live microphone/Gemini session was started.
+- Previously recorded real Windows UIA fixture acceptance remains as documented above; it predates this keyboard change. Previously documented physical mouse, disposable Chrome, OCR and Gemini component outcomes are historical component tests, not acceptance of this full mission or the newly changed key paths.
+
+Files changed in this continuation: `actions/screen_agent.py`, `plugins/screen_agent.py`, `tests/test_visual_targeting_extensions.py`, and this report. No dependencies, credentials, configuration, or memory data were changed; no Git staging, commit, or push was performed.
+
+### Full mission status
+
+This work does **not** establish full Windows desktop operator acceptance. The remaining requested real acceptance is: launch and exercise the normal `main.py` GUI; physical keyboard and complete mouse matrix through that app; live natural voice-to-tool dispatch; the entire disposable Chrome workflow through the actual running app; File Explorer workflow and cleanup; screenshot-off repeated operation; same-task authorization logs; and 15-minute Live/audio/Qt/resource soak. Earlier real component-level results do not substitute for these integrated tests. No current-turn action was sent to the existing Chrome, VS Code, or Explorer windows.
+
+### Normal app smoke attempt
+
+After the preceding status was written, the normal `main.py` entry point was launched from the existing `.venv` (Python 3.12.10). A REM window appeared in the returned accessibility tree. However, the selected REM window's screenshot API returned the Codex conversation image instead of the REM window. Because the visual target could not be trusted, no action was sent to REM or another app and no voice command was spoken. The configured wake-word setting was false, so normal startup may open the microphone if Gemini Live connects; the connection/audio state was not established from available output. The launched process was interrupted and the follow-up window inventory confirmed that its REM window had closed. This verifies only that a REM window was exposed to accessibility inspection during startup; it does not verify Gemini Live readiness, microphone streaming, or voice-to-tool delivery. The existing Chrome, VS Code, and Explorer windows were not acted on.

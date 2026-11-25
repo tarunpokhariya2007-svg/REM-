@@ -4,6 +4,61 @@ from types import SimpleNamespace
 
 
 class VisualTargetingExtensionTests(unittest.TestCase):
+    def test_desktop_key_allowlist_covers_requested_keys_and_shortcuts(self):
+        from actions.screen_agent import _key_request_allowed
+        accepted = ("Backspace", "F12", "Ctrl+Shift+T", "Win+R", "Ctrl+S",
+                    "Alt+Tab", "Escape", "Page Down")
+        rejected = ("Ctrl+Alt+Delete", "Ctrl+Shift+Escape", "Ctrl+Q")
+        for key in accepted:
+            with self.subTest(key=key):
+                self.assertTrue(_key_request_allowed(key))
+        for key in rejected:
+            with self.subTest(key=key):
+                self.assertFalse(_key_request_allowed(key))
+
+    def test_press_dispatch_normalizes_shortcut_and_bounds_repeats(self):
+        from contextlib import nullcontext
+        from actions import screen_agent
+        from core.screenview import View
+        view = View(source="uia", degraded=False, app="notepad.exe", title="Untitled")
+        act = SimpleNamespace(ok=True, action="press", error="", target="ctrl+s")
+        with patch.object(screen_agent, "_view", return_value=view), \
+             patch.object(screen_agent.desktop_control, "action", return_value=nullcontext()), \
+             patch.object(screen_agent, "_verified_after", return_value=(view, "verified")), \
+             patch.object(screen_agent.screenact, "press", return_value=act) as press:
+            result = screen_agent.screen_agent({
+                "action": "press", "key": "Control + S", "presses": 2})
+        self.assertIn("verified", result)
+        press.assert_called_once_with("ctrl+s", presses=2)
+
+    def test_press_repeat_count_is_bounded_before_input(self):
+        from contextlib import nullcontext
+        from actions import screen_agent
+        from core.screenview import View
+        with patch.object(screen_agent, "_view", return_value=View(
+                source="uia", degraded=False, app="notepad.exe", title="Untitled")), \
+             patch.object(screen_agent.desktop_control, "action", return_value=nullcontext()), \
+             patch.object(screen_agent.screenact, "press") as press:
+            result = screen_agent.screen_agent({
+                "action": "press", "key": "Tab", "presses": 11})
+        self.assertIn("from 1 to 10", result)
+        press.assert_not_called()
+
+    def test_alt_f4_requires_confirmation_before_input(self):
+        from contextlib import nullcontext
+        from actions import screen_agent
+        from core.screenview import View
+        view = View(source="uia", degraded=False, app="notepad.exe", title="Untitled")
+        with patch.object(screen_agent, "_view", return_value=view), \
+             patch.object(screen_agent.desktop_control, "action", return_value=nullcontext()), \
+             patch("core.confirm.pending_title", return_value=""), \
+             patch("core.confirm.request", return_value="[CONFIRMATION_PENDING]") as request, \
+             patch.object(screen_agent.screenact, "press") as press:
+            result = screen_agent.screen_agent({"action": "press", "key": "Alt+F4"})
+        self.assertEqual(result, "[CONFIRMATION_PENDING]")
+        request.assert_called_once()
+        press.assert_not_called()
+
     def test_semantic_mouse_actions_are_exposed_by_plugin_schema(self):
         from actions.screen_agent import TOOL
         from plugins import screen_agent
@@ -17,6 +72,9 @@ class VisualTargetingExtensionTests(unittest.TestCase):
             self.assertIn(name, action_text)
             self.assertIn(name, plugin_text)
             self.assertIn(name, screen_agent._DESKTOP_ACTIONS)
+        self.assertIn("presses", TOOL["parameters"]["properties"])
+        self.assertIn("presses", screen_agent.PLUGIN["parameters"]["properties"])
+        self.assertIn("presses", screen_agent.PLUGIN["parameters"]["properties"]["steps"]["items"]["properties"])
 
     def test_observe_is_read_only(self):
         from actions import screen_agent

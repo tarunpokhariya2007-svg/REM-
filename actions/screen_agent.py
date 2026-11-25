@@ -5,6 +5,7 @@ coordinates from previous observations are never retained.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 
@@ -116,6 +117,37 @@ _CONSEQUENTIAL_LABELS = ("send", "submit", "delete", "remove", "purchase",
                          "buy", "place order", "pay", "transfer", "share",
                          "install", "allow access", "disable security")
 
+_SINGLE_KEYS = frozenset({
+    "enter", "tab", "esc", "space", "backspace", "delete", "insert",
+    "up", "down", "left", "right", "home", "end", "pageup", "pagedown",
+    "ctrl", "alt", "shift", "winleft",
+    *(f"f{i}" for i in range(1, 13)),
+})
+_SAFE_SHORTCUTS = frozenset({
+    "ctrl+a", "ctrl+c", "ctrl+v", "ctrl+x", "ctrl+z", "ctrl+y",
+    "ctrl+s", "ctrl+f", "ctrl+n", "ctrl+t", "ctrl+w", "ctrl+l",
+    "ctrl+shift+t", "ctrl+tab", "ctrl+shift+tab", "alt+tab",
+    "alt+f4", "f5", "shift+tab",
+    "winleft+d", "winleft+e", "winleft+r", "winleft+l", "winleft+tab",
+})
+
+
+def _normalize_key_request(value: str) -> str:
+    aliases = {"return": "enter", "escape": "esc", "control": "ctrl",
+               "windows": "winleft", "win": "winleft", "start": "winleft",
+               "pgup": "pageup", "pgdn": "pagedown", "del": "delete",
+               "ins": "insert", "spacebar": "space"}
+    text = str(value or "").strip().casefold()
+    text = re.sub(r"\bpage\s+(up|down)\b", r"page\1", text)
+    parts = [part for part in re.split(r"[+\s]+", text)
+             if part]
+    return "+".join(aliases.get(part, part) for part in parts)
+
+
+def _key_request_allowed(value: str) -> bool:
+    normalized = _normalize_key_request(value)
+    return normalized in _SINGLE_KEYS or normalized in _SAFE_SHORTCUTS
+
 
 def _confirmed_click(target_label: str, app: str, title: str, player=None,
                      click_action: str = "click") -> str:
@@ -158,6 +190,24 @@ def _confirmed_press(key: str, app: str, title: str, player=None) -> str:
             return f"{result}; {verification}."
     except Exception as exc:
         return f"Confirmed submission stopped safely: {exc}"
+
+
+def _confirmed_shortcut(key: str, app: str, title: str, player=None) -> str:
+    """Revalidate the active window after approval before a close shortcut."""
+    try:
+        with desktop_control.action("confirmed window close"):
+            view = _view()
+            if view.app != app or view.title != title:
+                return "The active window changed while confirmation was pending; nothing was closed."
+            result = screenact.press(key)
+            if not result.ok:
+                return str(result)
+            after, verification = _verified_after(view)
+            desktop_control.report("confirmed window close", verification, after.app)
+            _publish(player)
+            return f"{result}; {verification}."
+    except Exception as exc:
+        return f"Confirmed window close stopped safely: {exc}"
 
 
 def screen_agent(parameters: dict, player=None, speak=None, response=None,
@@ -361,12 +411,17 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
 
             if action == "press":
                 key = str(params.get("key", "")).strip()
-                allowed = {"enter", "tab", "escape", "esc", "up", "down", "left", "right",
-                           "home", "end", "pageup", "pagedown", "ctrl+a", "ctrl+c", "ctrl+v",
-                           "ctrl+f", "ctrl+l", "ctrl+tab", "ctrl+shift+tab", "alt+tab", "f5"}
-                if key.casefold() not in allowed:
-                    return "That key or shortcut is not on the safe allowlist for desktop control."
-                if key.casefold() == "enter":
+                normalized_key = _normalize_key_request(key)
+                if not _key_request_allowed(key):
+                    return ("That key or shortcut is not on the safe allowlist for desktop "
+                            "control. Use a supported key or an explicitly supported shortcut.")
+                try:
+                    presses = int(params.get("presses", 1))
+                except (TypeError, ValueError):
+                    return "Key repeat count must be an integer from 1 to 10."
+                if not 1 <= presses <= 10:
+                    return "Key repeat count must be from 1 to 10."
+                if normalized_key == "enter":
                     focused = next((e for e in before.elements if e.focused), None)
                     label = fold(focused.label if focused else "")
                     if any(word in label for word in ("message", "reply", "chat")):
@@ -383,7 +438,18 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                             run=lambda: _confirmed_press(key, before.app,
                                                          before.title, player),
                         )
-                outcome = screenact.press(key)
+                if normalized_key == "alt+f4":
+                    from core import confirm
+                    if confirm.pending_title():
+                        return "Another confirmation is already waiting; no window was closed."
+                    return confirm.request(
+                        key="desktop-close-active-window",
+                        title=f"Confirm closing {before.title or before.app}?",
+                        detail="Alt+F4 closes the active window and may expose an unsaved-changes prompt.",
+                        run=lambda: _confirmed_shortcut(normalized_key, before.app,
+                                                        before.title, player),
+                    )
+                outcome = screenact.press(normalized_key, presses=presses)
                 if not outcome.ok:
                     desktop_control.report(action, f"failed: {outcome.error}", before.app)
                     _publish(player)
@@ -439,7 +505,10 @@ TOOL = {
         "ambiguous targets, acts once, then re-reads the interface to verify. "
         "Use observe to inspect the active app and controls; find for a named "
         "control; click/type with target set to the visible label (for 'search "
-        "bar' use that exact phrase); press for allowlisted keys; scroll for a "
+        "bar' use that exact phrase); press for allowlisted keys and shortcuts "
+        "such as Ctrl+A/C/V/X/Z/Y/S/F/N/T/W, Ctrl+Shift+T, Alt+Tab and Windows "
+        "shortcuts; use presses for bounded repeats such as 'Tab twice'. Alt+F4 "
+        "requires confirmation. Scroll for a "
         "named scroll area; focus_window for an app title. If it reports more "
         "than one match, ask which one. Password fields are never typed into. "
         "For webpage elements and Chrome DOM use browser_control, which uses "
@@ -452,6 +521,7 @@ TOOL = {
         "target": {"type": "STRING", "description": "Visible control name or app/window title. For search fields say search bar."},
         "text": {"type": "STRING", "description": "Text to type into the named, non-protected field."},
         "key": {"type": "STRING", "description": "Allowlisted key or shortcut (Enter, Escape, Tab, Ctrl+F, Alt+Tab, etc.)."},
+        "presses": {"type": "INTEGER", "description": "Repeat a key press 1–10 times; useful for commands such as 'Tab twice'."},
         "direction": {"type": "STRING", "description": "up | down | left | right"},
         "amount": {"type": "INTEGER", "description": "Scroll notches, 1–20."},
         "dx": {"type": "INTEGER", "description": "Bounded relative cursor offset, up to 200 pixels."},

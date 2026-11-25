@@ -15,11 +15,14 @@ _DESKTOP_ACTIONS = {
 PLUGIN = {
     "name": "screen_agent",
     "description": (
-        "Use screen_process for read-only visual questions about visible content, "
-        "errors, or project files; it sends a screenshot to the vision model. "
+        "Use desktop_ui observe for read-only local inspection of visible controls "
+        "and text. Use screen_process only when cloud image permission is enabled "
+        "and visual interpretation is needed. "
         "Operate the active desktop through fresh UI Automation observations and "
         "supported Invoke/Selection/Toggle/ExpandCollapse patterns before guarded "
         "physical input fallback, then verify the result. "
+        "Keyboard actions support allowlisted navigation keys and common shortcuts; "
+        "bounded repeats use presses. Alt+F4 requires confirmation. "
         "Use bounded steps for multi-part native desktop tasks; route application "
         "launches to open_app and web page work to browser_control. Ambiguous "
         "targets are refused, protected fields are never typed into, and "
@@ -32,6 +35,7 @@ PLUGIN = {
             "target": {"type": "STRING", "description": "Visible control or application window name."},
             "text": {"type": "STRING", "description": "Text for a named, non-protected field."},
             "key": {"type": "STRING", "description": "Safe allowlisted key or shortcut."},
+            "presses": {"type": "INTEGER", "description": "Repeat a key press 1–10 times."},
             "direction": {"type": "STRING", "description": "Scroll direction: up, down, left, or right."},
             "amount": {"type": "INTEGER", "description": "Scroll amount."},
             "dx": {"type": "INTEGER", "description": "Bounded cursor offset in pixels for move_relative (maximum 200 each direction)."},
@@ -39,7 +43,7 @@ PLUGIN = {
             "position": {"type": "STRING", "description": "Named desktop position for move: center, top_left, top_right, bottom_left, bottom_right."},
             "clear_first": {"type": "BOOLEAN", "description": "Clear a target field before typing when requested."},
             "mode": {"type": "STRING", "description": "Desktop control mode."},
-            "steps": {"type": "ARRAY", "description": "For task: up to eight sequential desktop or existing-tool steps. Tool steps also specify tool_name and tool_parameters.", "items": {"type": "OBJECT", "properties": {"action": {"type": "STRING"}, "target": {"type": "STRING"}, "text": {"type": "STRING"}, "key": {"type": "STRING"}, "direction": {"type": "STRING"}, "amount": {"type": "INTEGER"}, "dx": {"type": "INTEGER"}, "dy": {"type": "INTEGER"}, "position": {"type": "STRING"}, "clear_first": {"type": "BOOLEAN"}, "mode": {"type": "STRING"}, "tool_name": {"type": "STRING"}, "tool_parameters": {"type": "OBJECT"}}}},
+            "steps": {"type": "ARRAY", "description": "For task: up to eight sequential desktop or existing-tool steps. Tool steps also specify tool_name and tool_parameters.", "items": {"type": "OBJECT", "properties": {"action": {"type": "STRING"}, "target": {"type": "STRING"}, "text": {"type": "STRING"}, "key": {"type": "STRING"}, "presses": {"type": "INTEGER"}, "direction": {"type": "STRING"}, "amount": {"type": "INTEGER"}, "dx": {"type": "INTEGER"}, "dy": {"type": "INTEGER"}, "position": {"type": "STRING"}, "clear_first": {"type": "BOOLEAN"}, "mode": {"type": "STRING"}, "tool_name": {"type": "STRING"}, "tool_parameters": {"type": "OBJECT"}}}},
             "tool_name": {"type": "STRING", "description": "For action=tool, an existing tool name from tool_catalog."},
             "tool_parameters": {"type": "OBJECT", "description": "Arguments for the selected existing tool."},
         },
