@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 
 def _when(at: str) -> float:
@@ -39,7 +40,7 @@ def _row(t: dict) -> str:
     return f"{t['id']} [{t['status']}] {t['agent']} · {t['title']} · {_minutes(t)}"
 
 
-def background_tasks(parameters: dict, player=None) -> str:
+def background_tasks(parameters: dict, player=None, session_memory=None) -> str:
     from core import outcome
     from core.tasks import ACTIVE
     from core.tasks import desktop
@@ -47,6 +48,15 @@ def background_tasks(parameters: dict, player=None) -> str:
     eng = desktop.ensure(player)
     a = dict(parameters or {})
     action = str(a.get("action") or "list").strip().lower()
+
+    if action == "autonomous_status":
+        from core import autonomous_mode
+        return outcome.done("background_tasks", **autonomous_mode.snapshot())
+
+    if action == "revoke":
+        from core import autonomous_mode
+        ok = autonomous_mode.revoke_session(reason="revoked via background_tasks", disable_mode=True)
+        return outcome.done("background_tasks", revoked=ok, mode=autonomous_mode.get_mode())
 
     if action == "start":
         task = str(a.get("task") or "").strip()
@@ -59,14 +69,48 @@ def background_tasks(parameters: dict, player=None) -> str:
             except ValueError as e:
                 return outcome.failed("background_tasks", str(e))
         files = [a["file_path"]] if a.get("file_path") else None
+
+        want_autonomous = bool(a.get("autonomous")) or str(a.get("agent") or "").lower() == "autonomous"
+        extra: dict = {}
+        from core import autonomous_mode
+        source = str((session_memory or {}).get("source") or "typed").strip().lower()
+        if want_autonomous or autonomous_mode.is_enabled():
+            if source not in autonomous_mode.TRUSTED_SOURCES:
+                return outcome.failed(
+                    "background_tasks",
+                    "Overnight Autonomous Mode tasks require a direct trusted user channel.",
+                )
+            if want_autonomous and not autonomous_mode.is_enabled():
+                return outcome.failed(
+                    "background_tasks",
+                    "REM AUTONOMOUS MODE is DISABLED. Enable Overnight Autonomous Mode in the HUD first.",
+                )
+            if autonomous_mode.is_enabled():
+                approved_dirs = a.get("approved_dirs")
+                if not approved_dirs:
+                    approved_dirs = [str(Path(__file__).resolve().parent.parent)]
+                minutes = int(a.get("minutes") or 240)
+                sess = autonomous_mode.start_session(
+                    task,
+                    source=source,
+                    approved_dirs=approved_dirs,
+                    permitted_apps=a.get("permitted_apps"),
+                    internet_access=bool(a.get("internet_access", True)),
+                    max_duration_s=max(60.0, minutes * 60.0),
+                )
+                extra["autonomous_session_id"] = sess.session_id
+
         try:
-            t = eng.start(task, agent=a.get("agent") or "general", minutes=a.get("minutes"),
-                          deliver=a.get("deliver") or "voice", not_before=not_before, files=files)
+            agent_name = "general" if str(a.get("agent") or "").lower() == "autonomous" else (a.get("agent") or "general")
+            t = eng.start(task, agent=agent_name, minutes=a.get("minutes"),
+                          deliver=a.get("deliver") or "voice", not_before=not_before,
+                          files=files, extra=extra)
         except ValueError as e:
             return outcome.failed("background_tasks", str(e))
         starts = time.strftime("%Y-%m-%d %H:%M", time.localtime(not_before)) if not_before else "now"
         return outcome.started("background_tasks", task_id=t["id"], agent=t["agent"],
                                minutes=t["budget"]["minutes"], starts=starts,
+                               autonomous=bool(extra.get("autonomous_session_id")),
                                note="the result is announced when it is done; the conversation "
                                     "carries on meanwhile")
 
@@ -83,8 +127,6 @@ def background_tasks(parameters: dict, player=None) -> str:
     if tid:
         task = eng.get(tid)
     else:
-        # No id: the task this most plausibly means — the latest still running,
-        # or for a result, the latest at all.
         pool = tasks if action == "result" else [t for t in tasks if t["status"] in ACTIVE]
         task = pool[0] if pool else None
     if task is None:
@@ -108,6 +150,9 @@ def background_tasks(parameters: dict, player=None) -> str:
                                 note="stopping and writing up what was found")
                 if ok else outcome.failed("background_tasks", "that task is not running"))
     if action == "cancel":
+        if task.get("autonomous_session_id"):
+            from core import autonomous_mode
+            autonomous_mode.revoke_session(task["autonomous_session_id"], reason="task cancelled")
         ok = eng.cancel(task["id"])
         return (outcome.done("background_tasks", task_id=task["id"], cancelled=True)
                 if ok else outcome.failed("background_tasks", "that task is not running"))
@@ -123,30 +168,26 @@ TOOL = {
     "description": (
         "Long work that runs in the background on this computer while the conversation carries on: "
         "real research, reading and comparing many sources, writing a report, working through a "
-        "list. For a quick answer the user is waiting for, use web_search instead. "
-        "start = hand the task to an agent — agent 'researcher' for research (it plans, reads "
-        "sources in full, checks every quote against the page and writes a cited report), "
-        "'general' for other work; task = the whole request, self-contained, in the user's words; "
-        "minutes = the time budget when the user gives one ('research this for 10 minutes' -> 10); "
-        "without one, 10 for research, more (20-40) when the user asks for something thorough or "
-        "in depth; at = start later, "
-        "'YYYY-MM-DD HH:MM' or 'HH:MM' local time ('tonight at 2' -> '02:00'); file_path = a file to "
-        "work from. After start, say in one short sentence that it is under way — the result is "
-        "announced by itself when done. "
-        "list = the tasks and their state; status = how one is going; result = a finished task's "
-        "result; finish = stop now and write up what was found; cancel = stop without a result; "
-        "steer = add an instruction to a running task (note); agents = the available agents. "
-        "task_id may be left empty to mean the latest task."),
-    "brief": "Hands long work (research, reports) to a background agent: start, list, status, "
-             "result, finish, cancel, steer.",
+        "list, or Overnight Autonomous Mode tasks when REM AUTONOMOUS MODE is ENABLED. "
+        "start = hand the task to an agent — agent 'researcher' for research, "
+        "'general' for other work, or 'autonomous' / autonomous=true when REM AUTONOMOUS MODE is ENABLED; "
+        "task = the whole request, self-contained, in the user's words; "
+        "minutes = time budget; at = start later ('YYYY-MM-DD HH:MM' or 'HH:MM'); "
+        "file_path = a file to work from. "
+        "list = tasks; status = progress; result = finished result; finish = stop and write report; "
+        "cancel = stop; steer = add instruction; agents = list agents; "
+        "autonomous_status = inspect REM AUTONOMOUS MODE state; revoke = revoke trusted autonomous session."),
+    "brief": "Hands long or overnight autonomous work to a background agent: start, list, status, result, finish, cancel, steer, autonomous_status, revoke.",
     "tier": "core",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {"type": "STRING",
-                       "enum": ["start", "list", "status", "result", "finish", "cancel", "steer", "agents"]},
+                       "enum": ["start", "list", "status", "result", "finish", "cancel", "steer", "agents", "autonomous_status", "revoke"]},
             "task": {"type": "STRING", "description": "for start: the whole task, self-contained"},
-            "agent": {"type": "STRING", "description": "for start: researcher | general"},
+            "agent": {"type": "STRING", "description": "for start: researcher | general | autonomous"},
+            "autonomous": {"type": "BOOLEAN", "description": "for start: require/use active REM AUTONOMOUS MODE session"},
+            "approved_dirs": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "approved project directories"},
             "minutes": {"type": "INTEGER", "description": "for start: time budget in minutes"},
             "at": {"type": "STRING", "description": "for start: when to begin, local time"},
             "deliver": {"type": "STRING", "enum": ["voice", "panel", "silent"],

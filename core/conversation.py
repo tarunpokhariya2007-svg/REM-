@@ -4,7 +4,37 @@ from __future__ import annotations
 import re
 
 
-_STATUS = re.compile(r"^\s*status=(done|unverified|failed|ask|started)\b", re.I)
+_STATUS = re.compile(r"^\s*status=(done|verified|unverified|failed|ask|started)\b", re.I)
+
+_SPANISH_MARKERS = (
+    "hola", "gracias", "por favor", "qué", "como", "cómo", "estás", "estoy",
+    "tengo", "miedo", "puedes", "dime", "háblame", "por qué", "porque", "pero",
+    "buenos días", "buenas tardes", "buenas noches", "quiero", "necesito",
+    "ayuda", "ayúdame", "español", "espanol", "me da", "no sé", "claro",
+)
+
+
+def detect_language(text: str) -> str:
+    """Lightweight deterministic language detector for routing & logging."""
+    raw = str(text or "").strip()
+    if not raw:
+        return "English"
+    if re.search(r"[\u0900-\u097F]", raw):
+        return "Hindi"
+    if re.search(r"[\u3040-\u30FF]", raw):
+        return "Japanese"
+    low = f" {raw.casefold()} "
+    if any(ch in raw for ch in "¿¡ñÑáéíóúÁÉÍÓÚüÜ"):
+        return "Spanish"
+    es_hits = sum(
+        1 for m in _SPANISH_MARKERS
+        if re.search(rf"(?<!\w){re.escape(m)}(?!\w)", low)
+    )
+    if es_hits >= 1 and any(w in low for w in (" me ", " te ", " se ", " que ", " qué ", " de ", " la ", " el ", " es ", " no ", " un ", " una ", "hola", "gracias", "por favor")):
+        return "Spanish"
+    if es_hits >= 2:
+        return "Spanish"
+    return "English"
 _INTERNAL_ERROR = re.compile(
     r"(?:\btraceback\b|\bHRESULT\b|\bWinError\b|\bPlaywright\b|"
     r"\bCDP\b|\bUI Automation\b|\bUIA\b|\bselector\b|\bcoordinates?\b|"

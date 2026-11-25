@@ -212,6 +212,38 @@ def save_persistent_desktop_observation_enabled(enabled: bool) -> None:
     _write_config(data)
 
 
+def get_local_screen_observation_enabled() -> bool:
+    """User's persistent local-only screen observation permission (default True).
+
+    Separate from ``cloud_screen_vision_enabled``: granting local screen
+    observation allows local capture/UIA/OCR inspection without uploading
+    screenshots to remote cloud models.
+    """
+    data = load_api_keys()
+    if "local_screen_observation_enabled" in data:
+        return bool(data["local_screen_observation_enabled"])
+    return True
+
+
+@_locked
+def save_local_screen_observation_enabled(enabled: bool) -> None:
+    """Persist local-only screen observation permission without altering cloud vision."""
+    data = _read_for_write()
+    data["local_screen_observation_enabled"] = bool(enabled)
+    _write_config(data)
+
+
+@_locked
+def revoke_screen_access() -> None:
+    """Immediately revoke both local and cloud screen observation permissions."""
+    data = _read_for_write()
+    data["local_screen_observation_enabled"] = False
+    data["cloud_screen_vision_enabled"] = False
+    data["persistent_local_observation_enabled"] = False
+    data["persistent_desktop_observation_enabled"] = False
+    _write_config(data)
+
+
 def get_cloud_screen_vision_enabled() -> bool:
     """Separate opt-in for sending on-demand screen images to the chosen model."""
     return bool(load_api_keys().get("cloud_screen_vision_enabled", False))

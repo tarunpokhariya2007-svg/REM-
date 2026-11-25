@@ -59,7 +59,8 @@ def _is_screen_observation_request(value: str) -> bool:
 
     Screen tool arguments are questions to answer, not text to type. This
     classifier deliberately accepts common Hindi (Devanagari and transliterated)
-    requests as well as English; it grants only observation, never actuation.
+    and natural English verification/observation requests; it grants only
+    observation, never actuation.
     """
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
     english_phrases = (
@@ -68,8 +69,17 @@ def _is_screen_observation_request(value: str) -> bool:
         "what application", "what app", "current window", "current test window",
         "read the current window", "read current window", "read the error",
         "terminal", "editor", "react project", "what is written",
+        "can you see", "do you see", "see whether", "see if", "check whether",
+        "check if", "what is open", "what's open", "currently open",
+        "active window", "active browser", "active tab", "browser tab",
+        "loaded", "logged in", "showing on",
     )
     if any(phrase in text for phrase in english_phrases):
+        return True
+    if re.search(
+        r"\b(?:is|are|whether)\b.{1,60}\b(?:open|loaded|running|visible|showing|logged\s+in)\b",
+        text,
+    ):
         return True
     hindi_phrases = (
         "स्क्रीन", "पर्दे पर", "क्या दिख", "क्या दिखाई", "दिख रहा", "दिखाओ",
@@ -125,16 +135,18 @@ def snapshot() -> dict:
 
 
 def authorize_user_request(user_request: str, tool: str, args: dict, *,
-                           source: str = "untrusted") -> tuple[bool, str]:
+                           source: str = "untrusted",
+                           auth_context=None) -> tuple[bool, str]:
     """Limit computer actions to the human's latest request, not page text.
 
     The Live model can see untrusted page contents. Tool output is never used as
     this input; main.py supplies only the input-audio transcript received from
-    the user. This is an intent filter, with consequential actions still behind
-    the separate confirmation gate.
+    the user. When an active, task-scoped AutonomousSession is bound to
+    ``auth_context``, routine permitted actions within its explicit boundaries
+    are evaluated against that session rather than single-turn word matching.
     """
     request = str(user_request or "").casefold().strip()
-    trusted_sources = {"voice", "typed", "dashboard"}
+    trusted_sources = {"voice", "typed", "dashboard", "ui"}
     if source not in trusted_sources:
         return False, "A direct user request from a trusted input channel is required."
     if not request:
@@ -157,6 +169,29 @@ def authorize_user_request(user_request: str, tool: str, args: dict, *,
     if _negates_action(request, action or t):
         return False, "Your request explicitly forbids that action; nothing was done."
 
+    # Task-scoped trusted authorization (Overnight Autonomous Mode)
+    session_id = getattr(auth_context, "autonomous_session_id", "") if auth_context is not None else ""
+    if session_id:
+        from core import autonomous_mode
+        sess = autonomous_mode.get_session(session_id)
+        if sess is None:
+            return False, "The autonomous task session is missing or no longer valid."
+        if _negates_action(sess.objective.casefold(), action or t):
+            return False, "Your approved task forbids that action; nothing was done."
+        allowed, cat, reason = autonomous_mode.evaluate_tool_access(sess, tool, args)
+        if allowed:
+            return True, ""
+        # Sensitive operations or out-of-scope operations must NEVER fall back to
+        # silent bypass; record/refuse cleanly.
+        if cat in {
+            "external_communication", "destructive_action", "security_or_system_action",
+            "software_install", "consequential_desktop_action", "consequential_ui_action",
+            "privileged_or_install_command", "consequential_mutation", "outside_task_scope",
+            "permission_category_denied", "network_disabled", "camera_not_authorized",
+            "expired_or_revoked",
+        }:
+            return False, reason
+
     # The existing screen_agent plugin can sequence bounded native steps or
     # route to selected tools. Authorize each concrete step against the same
     # user's transcript before the plugin is allowed to start.
@@ -168,36 +203,56 @@ def authorize_user_request(user_request: str, tool: str, args: dict, *,
             if not isinstance(step, dict):
                 return False, "A desktop task step is invalid; no actions were run."
             allowed, reason = authorize_user_request(
-                request, "desktop_ui", step, source=source)
+                request, "desktop_ui", step, source=source, auth_context=auth_context)
             if not allowed:
                 return False, reason
         return True, ""
     if t == "screen_agent" and action == "tool":
         name = str((args or {}).get("tool_name") or "")
-        if name not in {"open_app", "browser_control"}:
+        if name not in {"open_app", "browser_control", "web_search", "file_controller"}:
             return False, "That routed tool is not authorized for desktop tasks."
+        if name == "web_search":
+            return True, ""
         return authorize_user_request(
             request, name, (args or {}).get("tool_parameters") or {},
-            source=source)
+            source=source, auth_context=auth_context)
 
     if t == "screen_process":
         angle = str((args or {}).get("angle") or "screen").strip().casefold()
         if angle == "camera":
             allowed = _is_explicit_camera_request(request)
+            print(f"[Auth] {'ALLOW' if allowed else 'DENY'} tool=screen_process action=camera source={source}")
             return (allowed, "A direct camera request is required." if not allowed else "")
         if angle != "screen":
+            print(f"[Auth] DENY tool=screen_process action={angle} source={source} cat=invalid_angle")
             return False, "Screen observation only accepts angle='screen' or an explicitly requested camera."
+        try:
+            from memory.config_manager import get_local_screen_observation_enabled
+            if not get_local_screen_observation_enabled():
+                print(f"[Auth] DENY tool=screen_process action=screen source={source} cat=revoked_authorization")
+                return False, "Local screen observation is disabled or revoked in COMPUTER USE settings."
+        except Exception:
+            pass
         allowed = _is_screen_observation_request(request)
+        print(f"[Auth] {'ALLOW' if allowed else 'DENY'} tool=screen_process action=screen source={source}")
         return (allowed, "A direct screen-observation request is required." if not allowed else "")
 
     if t == "screen_agent" and action == "observe":
+        try:
+            from memory.config_manager import get_local_screen_observation_enabled
+            if not get_local_screen_observation_enabled():
+                print(f"[Auth] DENY tool=desktop_ui action=observe source={source} cat=revoked_authorization")
+                return False, "Local screen observation is disabled or revoked in COMPUTER USE settings."
+        except Exception:
+            pass
         allowed = _is_screen_observation_request(request)
+        print(f"[Auth] {'ALLOW' if allowed else 'DENY'} tool=desktop_ui action=observe source={source}")
         return (allowed, "A direct screen-observation request is required." if not allowed else "")
 
     intents = {
         "screen_agent": {
-            "observe": {"screen", "desktop", "window", "application", "look", "see", "visible", "show", "search", "open", "click", "type", "find", "scroll", "switch", "focus", "read", "inspect"},
-            "find": {"find", "locate", "search", "where", "identify", "look"},
+            "observe": {"screen", "desktop", "window", "application", "look", "see", "visible", "show", "search", "open", "click", "type", "find", "scroll", "switch", "focus", "read", "inspect", "check", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube"},
+            "find": {"find", "locate", "search", "where", "identify", "look", "open", "see", "check", "whether", "visible", "whatsapp", "youtube", "chrome", "tab"},
             "click": {"click", "select", "choose", "open", "press"},
             "right_click": {"right", "click", "context"},
             "double_click": {"double", "click"},
@@ -222,13 +277,16 @@ def authorize_user_request(user_request: str, tool: str, args: dict, *,
             "go_to": {"open", "go", "visit", "navigate", "website", "url", "browser", "chrome"},
             "search": {"search", "find", "look", "google", "bing", "web"},
             "new_tab": {"tab", "open", "new"},
+            "switch_tab": {"tab", "switch", "open", "focus", "whatsapp", "youtube", "chrome", "browser"},
+            "inspect": {"inspect", "open", "see", "check", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "page", "site", "website", "tab", "status", "loaded", "login", "url", "read"},
             "smart_click": {"click", "open", "select", "choose", "press"},
             "click": {"click", "open", "select", "choose"},
             "smart_type": {"type", "enter", "search", "fill", "write"},
             "type": {"type", "enter", "search", "fill", "write"},
             "fill_form": {"fill", "form", "enter", "complete"},
-            "get_text": {"read", "summarize", "page", "website", "screen", "text", "search"},
-            "get_url": {"url", "address", "website", "page", "where"},
+            "get_text": {"read", "summarize", "page", "website", "screen", "text", "search", "open", "check", "see", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "tab", "loaded"},
+            "get_url": {"url", "address", "website", "page", "where", "open", "check", "see", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "tab", "loaded"},
+            "list_browsers": {"browser", "chrome", "open", "see", "check", "whether", "verify", "which"},
             "scroll": {"scroll", "down", "up", "page"},
             "press": {"press", "enter", "keyboard", "key"},
             "back": {"back", "previous"}, "forward": {"forward", "next"},
@@ -513,6 +571,11 @@ def emergency_stop() -> dict:
             persistent_observation=False,
             current_action="Emergency stop", verification="Stopped by user",
             mouse_keyboard=False)
+    try:
+        from core import autonomous_mode
+        autonomous_mode.emergency_stop("Desktop emergency stop triggered")
+    except Exception:
+        pass
     try:
         from core import screenact
         screenact.release_all()

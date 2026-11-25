@@ -48,8 +48,20 @@ def ensure(player=None):
             _player = player
         if _engine is None:
             from core.tasks.engine import TaskEngine
+
+            def _tools(task: dict, profile):
+                from core.tasks.tools import TaskTools
+                return TaskTools(
+                    _engine.store.workdir(task["id"]),
+                    profile.tools,
+                    log=_engine._log,
+                    autonomous_session_id=str(task.get("autonomous_session_id") or ""),
+                    player=_player,
+                )
+
             _engine = TaskEngine(tasks_dir(), reports_dir(), [agents_dir()],
-                                 notify=_notify, max_parallel=_max_parallel())
+                                 notify=_notify, max_parallel=_max_parallel(),
+                                 tools_factory=_tools)
         return _engine
 
 

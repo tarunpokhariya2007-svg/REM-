@@ -185,11 +185,15 @@ class HudCanvas(QWidget):
         except Exception:
             pass
 
-    def set_expression(self, name: str, hold: float = 6.0) -> None:
-        """Overlay a HAPPY / CONCERNED expression on the portrait for ``hold`` s."""
+    def set_expression(self, name: str, hold: float = 6.0,
+                       source: str = "EXPLICIT_USER_COMMAND") -> None:
+        """Overlay one of the eight REM emotional expressions for ``hold`` s."""
         try:
             if self._avatar is not None and hasattr(self._avatar, "set_expression"):
-                self._avatar.set_expression(name or None, hold)
+                try:
+                    self._avatar.set_expression(name or None, hold, source=source)
+                except TypeError:
+                    self._avatar.set_expression(name or None, hold)
         except Exception:
             pass
 

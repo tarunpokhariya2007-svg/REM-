@@ -425,8 +425,17 @@ class RemLayeredAvatar:
     def set_state(self, state: str) -> None:
         self._anim.set_state(state)
 
-    def set_expression(self, name, hold: float = 6.0) -> None:
-        self._anim.set_expression(name, hold)
+    def set_expression(self, name, hold: float | None = 6.0,
+                       source: str = "EXPLICIT_USER_COMMAND") -> None:
+        self._anim.set_expression(name, hold, source=source)
+
+    @property
+    def state_name(self) -> str:
+        return self._anim.state
+
+    @property
+    def expression_name(self) -> str:
+        return self._anim.expression_state
 
     def reset_motion(self) -> None:
         self._anim.reset_motion()
@@ -504,10 +513,28 @@ class RemLayeredAvatar:
         p.drawImage(QRectF(left + x * unit, top + y * unit,
                            img.width() * unit, img.height() * unit), img)
 
-    def _mouth_layers(self, o: float, w: float, smile: float):
+    def _mouth_layers(self, o: float, w: float, smile: float,
+                      expr_weights: dict[str, float] | None = None):
         """[(layer name, opacity)] for the current mouth pose."""
         if o < 0.035:
-            return [("rem-mouth-smile", smile)] if smile > 0.01 else []
+            out: list[tuple[str, float]] = []
+            weights = expr_weights or {}
+            expr_mouth_map = (
+                ("HAPPY", "rem-mouth-happy"),
+                ("LOVE", "rem-mouth-love"),
+                ("SAD", "rem-mouth-sad"),
+                ("ANGRY", "rem-mouth-angry-closed"),
+                ("SHY", "rem-mouth-shy"),
+                ("SURPRISED", "rem-mouth-surprised"),
+                ("SLEEPY", "rem-mouth-sleepy"),
+            )
+            for expr_name, layer_name in expr_mouth_map:
+                wt = float(weights.get(expr_name, 0.0))
+                if wt > 0.01 and layer_name in self._cache:
+                    out.append((layer_name, _clamp01(wt)))
+            if not out and smile > 0.01:
+                out.append(("rem-mouth-smile", smile))
+            return out
         chain = [(0.0, None), (0.25, "rem-mouth-small"), (0.55, "rem-mouth-medium"), (1.0, "rem-mouth-open")]
         layers: list[tuple[str, float]] = []
         for (lo, a), (hi, b) in zip(chain, chain[1:]):
@@ -528,6 +555,22 @@ class RemLayeredAvatar:
             layers = [(n, a * (1.0 - shape)) for n, a in layers] + [(shape_name, shape)]
         return layers
 
+    def _blit_lid_sequence(self, painter: QPainter, lid: float, left: float,
+                           top: float, unit: float, opacity: float = 1.0) -> None:
+        if lid <= 0.02 or opacity <= 0.004:
+            return
+        names = ["rem-eyes-lid%03d" % int(round(v * 100)) for v in self._lid_levels]
+        levels = [0.0] + self._lid_levels
+        for i in range(1, len(levels)):
+            if lid <= levels[i]:
+                t = (lid - levels[i - 1]) / (levels[i] - levels[i - 1])
+                if i > 1:
+                    self._blit(painter, names[i - 2], left, top, unit, opacity)
+                    self._blit(painter, names[i - 1], left, top, unit, t * opacity)
+                else:
+                    self._blit(painter, names[0], left, top, unit, t * opacity)
+                break
+
     def paint(self, painter: QPainter, cx: float, cy: float, radius: float,
               primary: QColor, accent: QColor, bg: QColor) -> None:
         dpr = 1.0
@@ -545,6 +588,8 @@ class RemLayeredAvatar:
         unit = width_logical / float(base_img.width())
         left, top = cx - radius, cy - radius
         height = base_img.height() * unit
+        weights = getattr(pose, "expr_weights", None) or {}
+        blink = float(getattr(pose, "blink", 0.0))
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -570,23 +615,94 @@ class RemLayeredAvatar:
 
         self._blit(painter, "rem-base", left, top, unit)
 
-        # eyelids: 0 = open (no layer), then lid035 -> lid070 -> lid100
-        lid = pose.lid
-        if lid > 0.02:
-            names = ["rem-eyes-lid%03d" % int(round(v * 100)) for v in self._lid_levels]
-            levels = [0.0] + self._lid_levels
-            for i in range(1, len(levels)):
-                if lid <= levels[i]:
-                    t = (lid - levels[i - 1]) / (levels[i] - levels[i - 1])
-                    if i > 1:
-                        self._blit(painter, names[i - 2], left, top, unit, 1.0)
-                        self._blit(painter, names[i - 1], left, top, unit, t)
-                    else:
-                        self._blit(painter, names[0], left, top, unit, t)
-                    break
+        # ---- cheek blush & tears -------------------------------------------
+        soft_blush = _clamp01(
+            0.75 * weights.get("HAPPY", 0.0)
+            + 0.95 * weights.get("LOVE", 0.0)
+            + 0.45 * weights.get("SURPRISED", 0.0)
+            + 0.70 * weights.get("SLEEPY", 0.0)
+        )
+        intense_blush = _clamp01(weights.get("SHY", 0.0))
+        if soft_blush > 0.01 and "rem-blush-soft" in self._cache:
+            self._blit(painter, "rem-blush-soft", left, top, unit, soft_blush * (1.0 - intense_blush * 0.7))
+        if intense_blush > 0.01 and "rem-blush-intense" in self._cache:
+            self._blit(painter, "rem-blush-intense", left, top, unit, intense_blush)
 
-        for name, alpha in self._mouth_layers(pose.mouth_open, pose.mouth_width, pose.smile):
+        sad_w = _clamp01(weights.get("SAD", 0.0))
+        if sad_w > 0.01 and "rem-tears" in self._cache:
+            tear_pulse = 0.82 + 0.18 * math.sin(pose.shimmer * 2.4)
+            self._blit(painter, "rem-tears", left, top, unit, sad_w * tear_pulse)
+
+        # ---- open-eye expression overlays (fade smoothly during blinks) ----
+        open_vis = _clamp01(1.0 - blink)
+        for expr_name, layer_name in (
+            ("SURPRISED", "rem-eyes-wide"),
+            ("ANGRY", "rem-eyes-angry-open"),
+            ("SAD", "rem-eyes-sad-open"),
+            ("SHY", "rem-eyes-shy"),
+            ("SLEEPY", "rem-eyes-sleepy"),
+        ):
+            wt = _clamp01(weights.get(expr_name, 0.0))
+            if wt > 0.01 and layer_name in self._cache:
+                self._blit(painter, layer_name, left, top, unit, wt * open_vis)
+
+        # ---- eyelids / expression-matched blink closures -------------------
+        lid = pose.lid
+        happy_love_w = _clamp01(weights.get("HAPPY", 0.0) + weights.get("LOVE", 0.0))
+        angry_w = _clamp01(weights.get("ANGRY", 0.0))
+        special_closed = (
+            happy_love_w * ("rem-eyes-happy-closed" in self._cache)
+            + angry_w * ("rem-eyes-angry-closed" in self._cache)
+            + sad_w * ("rem-eyes-sad-closed" in self._cache)
+        )
+        generic_weight = _clamp01(1.0 - special_closed)
+        if lid > 0.02 and generic_weight > 0.01:
+            self._blit_lid_sequence(painter, lid, left, top, unit, generic_weight)
+        if blink > 0.02:
+            if happy_love_w > 0.01 and "rem-eyes-happy-closed" in self._cache:
+                self._blit(painter, "rem-eyes-happy-closed", left, top, unit, happy_love_w * blink)
+            if angry_w > 0.01 and "rem-eyes-angry-closed" in self._cache:
+                self._blit(painter, "rem-eyes-angry-closed", left, top, unit, angry_w * blink)
+            if sad_w > 0.01 and "rem-eyes-sad-closed" in self._cache:
+                self._blit(painter, "rem-eyes-sad-closed", left, top, unit, sad_w * blink)
+
+        # ---- eyebrows ------------------------------------------------------
+        brow_map = (
+            ("NEUTRAL", "rem-brows-neutral"),
+            ("HAPPY", "rem-brows-happy"),
+            ("LOVE", "rem-brows-happy"),
+            ("SAD", "rem-brows-sad"),
+            ("ANGRY", "rem-brows-angry"),
+            ("SHY", "rem-brows-shy"),
+            ("SURPRISED", "rem-brows-surprised"),
+            ("SLEEPY", "rem-brows-sleepy"),
+        )
+        for expr_name, layer_name in brow_map:
+            wt = _clamp01(weights.get(expr_name, 0.0))
+            if wt > 0.01 and layer_name in self._cache:
+                self._blit(painter, layer_name, left, top, unit, wt * 0.90)
+
+        # ---- mouth (speech visemes + resting emotional shapes) -------------
+        for name, alpha in self._mouth_layers(
+            pose.mouth_open, pose.mouth_width, pose.smile, weights
+        ):
             self._blit(painter, name, left, top, unit, alpha)
+
+        # ---- animated decorative expression effects ------------------------
+        fx_map = (
+            ("HAPPY", "rem-fx-happy", 0.0, 2.5),
+            ("ANGRY", "rem-fx-angry", 1.8, 4.0),
+            ("SHY", "rem-fx-shy", 0.0, 2.0),
+            ("SURPRISED", "rem-fx-surprised", 1.4, 3.2),
+            ("SLEEPY", "rem-fx-sleepy", 3.5, 1.4),
+            ("LOVE", "rem-fx-love", 3.0, 2.2),
+        )
+        for expr_name, layer_name, float_px, freq in fx_map:
+            wt = _clamp01(weights.get(expr_name, 0.0))
+            if wt > 0.01 and layer_name in self._cache:
+                pulse = 0.85 + 0.15 * math.sin(pose.shimmer * freq)
+                dy = math.sin(pose.shimmer * freq) * float_px * (width_logical / float(self._cw))
+                self._blit(painter, layer_name, left, top + dy, unit, wt * pulse)
         painter.setOpacity(1.0)
 
         # sparse shimmer on hair/ruffles only — never on the face

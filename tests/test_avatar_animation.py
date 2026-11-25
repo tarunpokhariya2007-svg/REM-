@@ -12,8 +12,10 @@ import unittest
 from pathlib import Path
 
 from core.avatar_anim import (
-    CONCERNED, ERROR, HAPPY, IDLE, INTERRUPTED, LISTENING, SPEAKING, THINKING,
-    AvatarAnimator, expression_from_text, normalise_state,
+    ANGRY, CONCERNED, ERROR, EXPRESSIONS, HAPPY, IDLE, INTERRUPTED, LISTENING,
+    LOVE, NEUTRAL, SAD, SHY, SLEEPY, SPEAKING, SURPRISED, THINKING,
+    AvatarAnimator, detect_expression, expression_from_text, normalise_expression,
+    normalise_state,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -172,6 +174,72 @@ class ExpressionTests(unittest.TestCase):
         self.assertIsNone(expression_from_text("The weather is mild today."))
         self.assertEqual(expression_from_text("Glad to say sorry it failed"), CONCERNED)
 
+    def test_all_eight_expressions_and_independent_conversation_state(self):
+        a = AvatarAnimator(random.Random(7))
+        self.assertEqual(a.expression_state, NEUTRAL)
+        self.assertEqual(a.state, IDLE)
+
+        for expr in (HAPPY, SAD, ANGRY, SHY, SURPRISED, SLEEPY, LOVE, NEUTRAL):
+            with self.subTest(expression=expr):
+                a.set_expression(expr, hold=5.0)
+                a.set_state(SPEAKING)
+                run(a, 0.8, openness=0.6, level=0.5, speaking=True)
+                self.assertEqual(a.expression_state, expr)
+                self.assertEqual(a.state, SPEAKING)
+                self.assertGreater(a.pose.expr_weights[expr], 0.85)
+                self.assertGreater(a.pose.mouth_open, 0.2)
+
+                # Changing conversation state to IDLE/LISTENING/THINKING preserves expression
+                a.set_state(IDLE)
+                run(a, 0.4, speaking=False)
+                self.assertEqual(a.expression_state, expr)
+                self.assertEqual(a.state, IDLE)
+                self.assertEqual(a.pose.mouth_open, 0.0)
+
+        # LOVE / AFFECTION alias normalizes to LOVE
+        self.assertEqual(normalise_expression("Love / Affection"), LOVE)
+        self.assertIsNone(normalise_expression("Neutral"))
+
+    def test_sleepy_never_stays_permanently_closed_and_blinks_smoothly(self):
+        a = AvatarAnimator(random.Random(11))
+        a.set_expression(SLEEPY, hold=10.0)
+        poses = run(a, 15.0)
+        lids = [lid for lid, _ in poses]
+        self.assertTrue(any(0.45 <= lid <= 0.65 for lid in lids))
+        self.assertTrue(any(lid > 0.9 for lid in lids))
+        self.assertLess(lids[-1], 0.7)
+
+    def test_contextual_expression_detection_and_neutral_fallback(self):
+        # Mentioning "sad" as a word/story does NOT trigger SAD
+        self.assertEqual(detect_expression(user_message="Tell me what the word sad means"), NEUTRAL)
+        self.assertEqual(detect_expression(user_message="Recommend a sad movie"), NEUTRAL)
+        self.assertEqual(detect_expression(user_message="Don't be angry"), NEUTRAL)
+        self.assertEqual(detect_expression(user_message="Run python -m unittest"), NEUTRAL)
+
+        # Real conversational emotional cues
+        self.assertEqual(detect_expression(user_message="Good morning REM, all tests passed!"), HAPPY)
+        self.assertEqual(detect_expression(user_message="I'm feeling really sad and heartbroken today",
+                                           response_text="I'm so sorry to hear that."), SAD)
+        self.assertEqual(detect_expression(user_message="This bug is infuriating and unacceptable!"), ANGRY)
+        self.assertEqual(detect_expression(user_message="You're so cute, REM!",
+                                           response_text="Oh, you're making me blush!"), SHY)
+        self.assertEqual(detect_expression(user_message="Wait what?! No way!"), SURPRISED)
+        self.assertEqual(detect_expression(user_message="I'm exhausted, going to sleep now, good night."), SLEEPY)
+        self.assertEqual(detect_expression(user_message="I love you REM, thank you from the heart.",
+                                           response_text="I'll always be here for you."), LOVE)
+
+    def test_speaking_while_sad_and_interruption_stops_mouth(self):
+        a = AvatarAnimator(random.Random(12))
+        a.set_expression(SAD, hold=6.0)
+        run(a, 0.6, openness=0.75, level=0.7, speaking=True, state=SPEAKING)
+        self.assertEqual(a.expression_state, SAD)
+        self.assertEqual(a.state, SPEAKING)
+        self.assertGreater(a.pose.mouth_open, 0.3)
+
+        a.set_state(INTERRUPTED)
+        self.assertEqual(a.pose.mouth_open, 0.0)
+        self.assertEqual(a.expression_state, SAD)
+
 
 class AssetTests(unittest.TestCase):
     @classmethod
@@ -265,6 +333,22 @@ class RendererTests(unittest.TestCase):
             lit = sum(1 for x in range(0, size, 9) for y in range(0, size, 9)
                       if img.pixelColor(x, y).blue() > 120)
             self.assertGreater(lit, 50, size)
+
+    def test_all_eight_expressions_render_distinctly_in_qt(self):
+        av = self.Avatar()
+        renders = {}
+        for expr in EXPRESSIONS:
+            av.set_expression(expr, hold=10.0)
+            for _ in range(45):
+                av.step(DT, speaking=False, state="IDLE")
+            img = self.render(av, 360)
+            # Hash downsampled pixel sum across whole canvas to verify distinct artwork
+            total = sum(
+                img.pixelColor(x, y).red() * 3 + img.pixelColor(x, y).green() * 5 + img.pixelColor(x, y).blue()
+                for x in range(0, 360, 6) for y in range(0, 360, 6)
+            )
+            renders[expr] = total
+        self.assertEqual(len(set(renders.values())), len(EXPRESSIONS))
 
     def test_open_mouth_renders_then_stops_after_reset(self):
         av = self.Avatar()

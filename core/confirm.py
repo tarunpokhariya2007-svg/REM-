@@ -99,8 +99,31 @@ def request(key: str, title: str, detail: str, run: Callable[[], str]) -> str:
 
     Returns the sentence the tool should hand back to the model — phrased as an
     instruction so the assistant asks the user out loud in their own language,
-    rather than reading an English string verbatim."""
+    rather than reading an English string verbatim.
+
+    In Overnight Autonomous Mode, silence must never be interpreted as approval:
+    the pending action is recorded in the autonomous session's pending-approvals
+    queue without blocking other independent permitted work.
+    """
     global _pending
+
+    try:
+        from core import autonomous_mode
+        sess = autonomous_mode.active_session()
+        if sess is not None:
+            entry = autonomous_mode.record_pending_approval(
+                sess, category="sensitive_operation",
+                title=title, detail=detail, tool=key,
+            )
+            _log(f"SYS: Pending approval recorded (not executed) — {title}")
+            return (
+                f"[APPROVAL_REQUIRED_QUEUED] Sensitive action '{title}' requires "
+                f"explicit user approval and was recorded (id={entry['id']}). "
+                f"It was NOT executed; silence is never treated as approval. "
+                f"Continue other independent, permitted steps."
+            )
+    except Exception:
+        pass
 
     if _show_cb is None:
         # No interface bound (headless, or a very early call). Refuse rather

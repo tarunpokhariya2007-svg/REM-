@@ -104,7 +104,7 @@ class MainWindow(QMainWindow):
     _viseme_sig     = pyqtSignal(object, float, float)
     _audio_level_sig = pyqtSignal(float)
     _avatar_reset_sig = pyqtSignal()
-    _expression_sig = pyqtSignal(str, float)   # (HAPPY|CONCERNED|"", hold seconds)
+    _expression_sig = pyqtSignal(str, float, str)  # (expression name|"", hold, source)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _codejob_sig    = pyqtSignal(object)     # dev_agent job state — live coding panel
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
@@ -126,6 +126,7 @@ class MainWindow(QMainWindow):
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
     _desktop_control_sig = pyqtSignal(object)
+    _autonomous_sig = pyqtSignal(object)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -415,6 +416,7 @@ class MainWindow(QMainWindow):
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
         self._desktop_control_sig.connect(self._set_desktop_control_status)
+        self._autonomous_sig.connect(self._set_autonomous_status)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._wake_btns_sig.connect(self._refresh_wake_btns)
@@ -1403,8 +1405,16 @@ class MainWindow(QMainWindow):
         self._computer_panel.body.addWidget(self._desktop_mode)
         from memory.config_manager import (
             get_persistent_desktop_observation_enabled, get_cloud_screen_vision_enabled,
-            get_desktop_observation_exclusions,
+            get_local_screen_observation_enabled, get_desktop_observation_exclusions,
         )
+        self._local_screen_obs = QCheckBox("LOCAL SCREEN OBSERVATION")
+        self._local_screen_obs.setToolTip(
+            "Persistent permission for on-request local screen capture, UIA, and OCR. "
+            "Screenshots stay on this device and are never uploaded to cloud models.")
+        self._local_screen_obs.setChecked(get_local_screen_observation_enabled())
+        self._local_screen_obs.toggled.connect(self._on_local_screen_observation_toggled)
+        self._computer_panel.body.addWidget(self._local_screen_obs)
+
         self._persistent_observation = QCheckBox("PERSISTENT LOCAL UIA OBSERVATION")
         self._persistent_observation.setToolTip(
             "With your consent, REM checks accessible window structure locally at a low rate. "
@@ -1412,9 +1422,10 @@ class MainWindow(QMainWindow):
         self._persistent_observation.setChecked(get_persistent_desktop_observation_enabled())
         self._persistent_observation.toggled.connect(self._on_persistent_observation_toggled)
         self._computer_panel.body.addWidget(self._persistent_observation)
-        self._cloud_screen_vision = QCheckBox("ALLOW SCREEN IMAGES TO SELECTED CLOUD MODEL")
+        self._cloud_screen_vision = QCheckBox("CLOUD IMAGE SHARING")
         self._cloud_screen_vision.setToolTip(
-            "Separate permission for on-demand screen images. Local UIA observation does not need this.")
+            "Separate permission for sending screen images to the selected cloud model. "
+            "Local screen observation works without this.")
         self._cloud_screen_vision.setChecked(get_cloud_screen_vision_enabled())
         self._cloud_screen_vision.toggled.connect(self._on_cloud_screen_vision_toggled)
         self._computer_panel.body.addWidget(self._cloud_screen_vision)
@@ -1428,15 +1439,34 @@ class MainWindow(QMainWindow):
         control_buttons = QHBoxLayout()
         control_buttons.setSpacing(4)
         self._desktop_pause = QPushButton("PAUSE")
+        self._revoke_screen_btn = QPushButton("REVOKE SCREEN ACCESS")
         self._desktop_stop = QPushButton("EMERGENCY STOP")
-        for button in (self._desktop_pause, self._desktop_stop):
+        for button in (self._desktop_pause, self._revoke_screen_btn, self._desktop_stop):
             button.setFont(px_font(8, QFont.Weight.Bold))
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setStyleSheet(btn_css("dim", align="center"))
             control_buttons.addWidget(button)
         self._desktop_pause.clicked.connect(self._toggle_desktop_pause)
+        self._revoke_screen_btn.clicked.connect(self._revoke_screen_access)
         self._desktop_stop.clicked.connect(self._emergency_stop_desktop)
         self._computer_panel.body.addLayout(control_buttons)
+
+        self._autonomous_row = DataRow("AUTONOMOUS", "DISABLED")
+        self._computer_panel.body.addWidget(self._autonomous_row)
+        auto_buttons = QHBoxLayout()
+        auto_buttons.setSpacing(4)
+        self._autonomous_toggle = QPushButton("AUTONOMOUS: OFF")
+        self._autonomous_revoke = QPushButton("REVOKE TRUST")
+        for button in (self._autonomous_toggle, self._autonomous_revoke):
+            button.setFont(px_font(8, QFont.Weight.Bold))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(btn_css("dim", align="center"))
+            auto_buttons.addWidget(button)
+        self._autonomous_revoke.setEnabled(False)
+        self._autonomous_toggle.clicked.connect(self._toggle_autonomous_mode)
+        self._autonomous_revoke.clicked.connect(self._revoke_autonomous_session)
+        self._computer_panel.body.addLayout(auto_buttons)
+
         lay.addWidget(self._computer_panel)
 
         # Background tasks (core/tasks). Read from the engine every two seconds —
@@ -1533,6 +1563,35 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log.append_log(f"SYS: Could not change computer-use mode: {exc}")
 
+    def _on_local_screen_observation_toggled(self, enabled: bool) -> None:
+        try:
+            from memory.config_manager import save_local_screen_observation_enabled
+            from core import desktop_control
+            save_local_screen_observation_enabled(enabled)
+            if not enabled:
+                desktop_control.set_persistent_observation(False)
+            self._set_desktop_control_status(desktop_control.snapshot())
+            self._log.append_log(
+                f"SYS: Local screen observation {'ENABLED' if enabled else 'REVOKED / OFF'}."
+            )
+        except Exception as exc:
+            self._log.append_log(f"SYS: Could not update local screen observation ({type(exc).__name__}).")
+
+    def _revoke_screen_access(self) -> None:
+        try:
+            from memory.config_manager import revoke_screen_access
+            from core import desktop_control
+            revoke_screen_access()
+            desktop_control.set_persistent_observation(False)
+            for box in (self._local_screen_obs, self._persistent_observation, self._cloud_screen_vision):
+                box.blockSignals(True)
+                box.setChecked(False)
+                box.blockSignals(False)
+            self._set_desktop_control_status(desktop_control.snapshot())
+            self._log.append_log("SYS: Screen access revoked immediately (local & cloud OFF).")
+        except Exception as exc:
+            self._log.append_log(f"ERR: Could not revoke screen access: {exc}")
+
     def _on_persistent_observation_toggled(self, enabled: bool) -> None:
         if enabled:
             answer = QMessageBox.question(
@@ -1579,6 +1638,8 @@ class MainWindow(QMainWindow):
         try:
             from memory.config_manager import save_cloud_screen_vision_enabled
             save_cloud_screen_vision_enabled(enabled)
+            from core import desktop_control
+            self._set_desktop_control_status(desktop_control.snapshot())
         except Exception as exc:
             self._log.append_log(f"SYS: Could not update cloud screen vision: {exc}")
             self._cloud_screen_vision.blockSignals(True)
@@ -1606,12 +1667,67 @@ class MainWindow(QMainWindow):
 
     def _emergency_stop_desktop(self) -> None:
         try:
-            from core import desktop_control
+            from core import desktop_control, autonomous_mode
             desktop_control.emergency_stop()
             self._set_desktop_control_status(desktop_control.snapshot())
-            self._log.append_log("SYS: Emergency stop — desktop control paused and inputs released.")
+            self._set_autonomous_status(autonomous_mode.snapshot())
+            self._log.append_log("SYS: Emergency stop — desktop control paused and autonomous session stopped.")
         except Exception as exc:
             self._log.append_log(f"ERR: Emergency stop failed: {exc}")
+
+    def _toggle_autonomous_mode(self) -> None:
+        try:
+            from core import autonomous_mode
+            if autonomous_mode.is_enabled():
+                snap = autonomous_mode.disable("Disabled by user from HUD")
+                self._set_autonomous_status(snap)
+                self._log.append_log("SYS: REM AUTONOMOUS MODE — DISABLED.")
+                return
+            answer = QMessageBox.question(
+                self,
+                "Enable REM AUTONOMOUS MODE?",
+                "REM AUTONOMOUS MODE allows REM to perform approved routine local, "
+                "browser, and project-file operations for an assigned task without "
+                "repeated confirmations while you are away. Sensitive actions (messages, "
+                "payments, deletions, software installs, security changes) are never "
+                "auto-approved and will wait in Pending Approvals.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            snap = autonomous_mode.enable()
+            self._set_autonomous_status(snap)
+            self._log.append_log("SYS: REM AUTONOMOUS MODE — ENABLED.")
+        except Exception as exc:
+            self._log.append_log(f"ERR: Could not update REM AUTONOMOUS MODE: {exc}")
+
+    def _revoke_autonomous_session(self) -> None:
+        try:
+            from core import autonomous_mode
+            autonomous_mode.revoke_session(reason="Revoked by user from HUD", disable_mode=True)
+            self._set_autonomous_status(autonomous_mode.snapshot())
+            self._log.append_log("SYS: Trusted autonomous session revoked; REM AUTONOMOUS MODE DISABLED.")
+        except Exception as exc:
+            self._log.append_log(f"ERR: Could not revoke trusted session: {exc}")
+
+    def _set_autonomous_status(self, status: dict) -> None:
+        status = dict(status or {})
+        if not hasattr(self, "_autonomous_row"):
+            return
+        enabled = bool(status.get("enabled"))
+        active = bool(status.get("session_active"))
+        pending = int(status.get("pending_approvals") or 0)
+        done = int(status.get("steps_done") or 0)
+        total = int(status.get("steps_total") or 0)
+        label = "ENABLED" if enabled else "DISABLED"
+        if active and total:
+            label = f"ENABLED ({done}/{total})"
+        if pending:
+            label += f" · {pending} WAIT"
+        self._autonomous_row.set_value(label[:22], "GREEN" if enabled else "DIM")
+        self._autonomous_toggle.setText("AUTONOMOUS: ON" if enabled else "AUTONOMOUS: OFF")
+        self._autonomous_revoke.setEnabled(enabled or active)
 
     def _set_desktop_control_status(self, status: dict) -> None:
         status = dict(status or {})
@@ -1623,10 +1739,34 @@ class MainWindow(QMainWindow):
             self._desktop_mode.blockSignals(True)
             self._desktop_mode.setCurrentText(mode)
             self._desktop_mode.blockSignals(False)
-        self._computer_rows["SCREEN"].set_value(
-            ("LOCAL UIA ACTIVE" if status.get("persistent_observation") else
-             "ACCESS ACTIVE" if status.get("screen_access") else "OFF"),
-            "GREEN" if status.get("screen_access") else "DIM")
+        try:
+            from memory.config_manager import (
+                get_local_screen_observation_enabled,
+                get_cloud_screen_vision_enabled,
+            )
+            local_ok = get_local_screen_observation_enabled()
+            cloud_ok = get_cloud_screen_vision_enabled()
+        except Exception:
+            local_ok, cloud_ok = True, False
+        if status.get("persistent_observation"):
+            screen_txt, screen_tone = "LOCAL UIA ACTIVE", "GREEN"
+        elif status.get("screen_access"):
+            screen_txt, screen_tone = "ACCESS ACTIVE", "GREEN"
+        elif local_ok and cloud_ok:
+            screen_txt, screen_tone = "LOCAL + CLOUD", "GREEN"
+        elif local_ok:
+            screen_txt, screen_tone = "LOCAL READY", "GREEN"
+        else:
+            screen_txt, screen_tone = "REVOKED / OFF", "DIM"
+        self._computer_rows["SCREEN"].set_value(screen_txt, screen_tone)
+        if hasattr(self, "_local_screen_obs") and self._local_screen_obs.isChecked() != local_ok:
+            self._local_screen_obs.blockSignals(True)
+            self._local_screen_obs.setChecked(local_ok)
+            self._local_screen_obs.blockSignals(False)
+        if hasattr(self, "_cloud_screen_vision") and self._cloud_screen_vision.isChecked() != cloud_ok:
+            self._cloud_screen_vision.blockSignals(True)
+            self._cloud_screen_vision.setChecked(cloud_ok)
+            self._cloud_screen_vision.blockSignals(False)
         self._computer_rows["ACTIVE APP"].set_value(str(status.get("active_app") or "—")[:22])
         self._computer_rows["ACTION"].set_value(str(status.get("current_action") or "None")[:22])
         self._computer_rows["LAST ACTION"].set_value(str(status.get("last_action") or "None")[:22])

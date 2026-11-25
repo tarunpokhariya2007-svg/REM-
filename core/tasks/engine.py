@@ -155,7 +155,10 @@ class TaskEngine:
 
     def _default_tools(self, task: dict, profile):
         from core.tasks.tools import TaskTools
-        return TaskTools(self.store.workdir(task["id"]), profile.tools, log=self._log)
+        return TaskTools(
+            self.store.workdir(task["id"]), profile.tools, log=self._log,
+            autonomous_session_id=str(task.get("autonomous_session_id") or ""),
+        )
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start_scheduler(self) -> None:
@@ -316,6 +319,21 @@ class TaskEngine:
         if has_web:
             lines.append("[PRIVACY] You can reach the web, so you are not given the user's stored "
                          "memories. Do not ask the user for personal details.")
+        if task.get("autonomous_session_id"):
+            lines.extend([
+                "",
+                "[OVERNIGHT AUTONOMOUS MODE]",
+                "You are operating under an explicit, task-scoped user authorization.",
+                "1. Begin by calling task_checkpoint(action='plan', steps=[...]) to divide the task into clear steps.",
+                "2. Check task_checkpoint(action='status') when resuming and skip any steps already marked 'done'.",
+                "3. Update step checkpoints with verification evidence after each milestone.",
+                "4. Retry recoverable tool errors up to the retry limit; never repeat completed work.",
+                "5. Sensitive actions (messages, emails, payments, purchases, deleting important data, "
+                "publishing, security/password changes, software installs, admin commands, or actions "
+                "outside approved directories) are NEVER approved by silence. If blocked, record them "
+                "with task_checkpoint(action='pending_approval', ...) and continue independent permitted steps.",
+                "6. Never claim completion without verifying actual test/command/tool results.",
+            ])
         return "\n".join(lines)
 
     def _run(self, tid: str) -> None:
@@ -361,6 +379,14 @@ class TaskEngine:
                 return
 
             fresh = self.store.get(tid)
+            sid = str(fresh.get("autonomous_session_id") or "")
+            if sid:
+                from core import autonomous_mode, desktop_control
+                sess = autonomous_mode.get_session(sid)
+                valid, why = (sess.is_valid() if sess else (False, "session missing"))
+                if desktop_control.should_stop() or not valid:
+                    self._complete(tid, f"Stopped safely: {why or 'emergency stop'}")
+                    return
             if fresh["notes_in"]:
                 notes = list(fresh["notes_in"])
                 turns.append({"role": "user", "text": "[UPDATE FROM THE USER, while you work]\n"
@@ -465,6 +491,16 @@ class TaskEngine:
 
     def _write_report(self, task: dict, result: str) -> Path:
         self.reports_dir.mkdir(parents=True, exist_ok=True)
+        sid = str(task.get("autonomous_session_id") or "")
+        if sid:
+            from core import autonomous_mode
+            sess = autonomous_mode.get_session(sid)
+            if sess is not None:
+                if sess.status == "active":
+                    sess.status = "completed"
+                return autonomous_mode.save_completion_report(
+                    sess, final_summary=result, reports_dir=self.reports_dir,
+                )
         now = self._clock()
         stamp = time.strftime("%Y-%m-%d", time.localtime(now))
         path = self.reports_dir / f"{stamp}-{_slug(task['title'])}-{task['id']}.md"

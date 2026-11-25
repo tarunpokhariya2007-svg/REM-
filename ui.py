@@ -248,10 +248,12 @@ class RemUI:
         except Exception:
             pass
 
-    def set_expression(self, name: str, hold: float = 6.0) -> None:
-        """Thread-safe: show a HAPPY / CONCERNED expression ("" clears it)."""
+    def set_expression(self, name: str, hold: float = 6.0,
+                       source: str = "EXPLICIT_USER_COMMAND") -> None:
+        """Thread-safe: show one of the 8 emotional expressions (NEUTRAL or "" clears)."""
         try:
-            self._win._expression_sig.emit(str(name or ""), float(hold))
+            self._win._expression_sig.emit(
+                str(name or ""), float(hold), str(source or "EXPLICIT_USER_COMMAND"))
         except Exception:
             pass
 
@@ -262,6 +264,13 @@ class RemUI:
     def set_desktop_control_status(self, status: dict) -> None:
         """Thread-safe desktop-control status update for the HUD panel."""
         self._win._desktop_control_sig.emit(dict(status or {}))
+
+    def set_autonomous_status(self, status: dict) -> None:
+        """Thread-safe REM AUTONOMOUS MODE status update for the HUD panel."""
+        try:
+            self._win._autonomous_sig.emit(dict(status or {}))
+        except Exception:
+            pass
 
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()

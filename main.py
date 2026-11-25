@@ -102,7 +102,11 @@ from core.request_context      import RequestContext
 _REQUEST_CONTEXT_UNSET = object()
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
-from core.avatar_anim          import expression_from_text
+from core.conversation         import detect_language
+from core.avatar_anim          import (
+    EXPLICIT_USER_COMMAND, CONTEXTUAL_EMOTION_DETECTION,
+    detect_expression, expression_from_text, parse_explicit_expression_command,
+)
 from core.wake_phrase          import (
     WAKE_PHRASE, WakePhraseDetector,
     is_ready as wake_is_ready, install_and_download as wake_install,
@@ -699,6 +703,8 @@ class RemLive:
         # loop as words arrive, drained by the playback loop against the audio.
         self._visemes              = VisemeStream()
         self._last_out_logged      = ""      # de-dupes a re-sent transcript tail
+        self._current_expression   = "NEUTRAL"
+        self._last_user_text_for_expr = ""
         # Push-to-talk
         self._ptt_enabled          = False
         self._ptt_held             = False
@@ -815,6 +821,12 @@ class RemLive:
             _tasks_desktop.attach(self.ui)
         except Exception as e:
             print(f"[Tasks] background tasks unavailable: {e}")
+
+        try:
+            from core import autonomous_mode as _auto_mode
+            _auto_mode.subscribe(self.ui.set_autonomous_status)
+        except Exception as e:
+            print(f"[Autonomous] status wiring unavailable: {e}")
 
         # Routines (core/routines): the opening briefing, the check-in, the news
         # watch and every scheduled thing the user sets up. If they cannot load,
@@ -1018,7 +1030,8 @@ class RemLive:
                     )
                 user_request, request_source = self._usable_request_context(context)
                 allowed, reason = desktop_control.authorize_user_request(
-                    user_request, name, parameters, source=request_source)
+                    user_request, name, parameters, source=request_source,
+                    auth_context=context)
                 if not allowed:
                     return outcome.failed(name, reason)
             if self._action_registry.has(name):
@@ -1040,12 +1053,31 @@ class RemLive:
 
     def _record_user_request(self, text: str, source: str) -> None:
         """Record direct user input only; tool results never pass through here."""
-        if source not in {"voice", "typed", "dashboard", "telegram"}:
+        if source not in {"voice", "typed", "dashboard", "telegram", "ui"}:
             raise ValueError("invalid direct request source")
+        cleaned = str(text or "").strip()
+        session_id = ""
+        ttl = None
+        if source in {"voice", "typed", "dashboard", "ui"}:
+            try:
+                from core import autonomous_mode
+                sess = autonomous_mode.active_session()
+                if sess is not None:
+                    session_id = sess.session_id
+                    ttl = max(600.0, sess.expires_at - time.monotonic())
+                    if not cleaned:
+                        cleaned = sess.objective
+            except Exception:
+                pass
+            if cleaned:
+                self._last_user_text_for_expr = cleaned
         with self._request_context_lock:
-            self._last_user_command = str(text or "").strip()
+            self._last_user_command = cleaned
             self._last_user_command_source = source
-            self._request_context = RequestContext.create(self._last_user_command, source)
+            self._request_context = RequestContext.create(
+                self._last_user_command, source,
+                ttl=ttl, autonomous_session_id=session_id,
+            )
 
     def _current_user_request(self) -> tuple[str, str]:
         """Read the direct request and its trust source as one atomic snapshot."""
@@ -1534,6 +1566,47 @@ class RemLive:
         return (url, key, f"{url}/auto-login?key={key}", manual,
                 getattr(self._dashboard, "_bind_error", "") or "")
 
+    def _apply_user_expression(self, text: str) -> None:
+        """Apply explicit expression commands immediately with highest priority,
+        falling back to contextual detection only when no explicit lock is active."""
+        if not _AVATAR_EXPRESSIONS or not hasattr(self, "ui"):
+            return
+        now_m = time.monotonic()
+        explicit = parse_explicit_expression_command(text)
+        if explicit is not None:
+            self._current_expression = explicit
+            if explicit == "NEUTRAL":
+                self._explicit_expr_until = 0.0
+                self.ui.set_expression("", 0.0, EXPLICIT_USER_COMMAND)
+            else:
+                self._explicit_expr_until = now_m + 30.0
+                self.ui.set_expression(explicit, 30.0, EXPLICIT_USER_COMMAND)
+            print(f"[Avatar] Explicit expression command: {explicit}")
+            return
+        if now_m < getattr(self, "_explicit_expr_until", 0.0):
+            return
+        u_expr = detect_expression(
+            user_message=text,
+            recent_turns=getattr(self, "_session_log", ())[-6:],
+            conversation_state="THINKING",
+            current_expression=getattr(self, "_current_expression", "NEUTRAL"),
+            personality="REM gentle caring",
+        )
+        if u_expr != getattr(self, "_current_expression", "NEUTRAL"):
+            self._current_expression = u_expr
+            self.ui.set_expression(
+                "" if u_expr == "NEUTRAL" else u_expr,
+                6.0,
+                CONTEXTUAL_EMOTION_DETECTION,
+            )
+
+    def _track_user_language(self, text: str) -> str:
+        lang = detect_language(text)
+        if lang != getattr(self, "_last_user_lang", None):
+            self._last_user_lang = lang
+        print(f"[REM] Language detected: {lang}")
+        return lang
+
     def _on_text_command(self, text: str, *, source: str = "typed"):
         if not self._loop or not self.session:
             return
@@ -1548,6 +1621,10 @@ class RemLive:
         # This text came directly from the user's input box/command surface.
         # Keep it as the authorization context for the Live response it starts.
         self._record_user_request(text, source)
+        self._last_user_speech = time.monotonic()
+        if source in {"typed", "dashboard"}:
+            self._track_user_language(text)
+            self._apply_user_expression(text)
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
@@ -1744,7 +1821,7 @@ class RemLive:
     def speak_error(self, tool_name: str, error: BaseException):
         error_type = type(error).__name__
         self.ui.write_log(f"ERR: {tool_name} — {error_type}")
-        self.speak(f"Sir, {tool_name} encountered an error. I could not complete it.")
+        self.speak(f"Tarun-kun, {tool_name} encountered an error. I could not complete it.")
 
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
@@ -1776,12 +1853,10 @@ class RemLive:
         # already knows the respectful register of whatever language it is in.
         _addr = (f"ADDRESS: Always call the user '{_user_name}'."
                  if _user_name
-                 else 'ADDRESS: Address the user with the ordinary respectful form '
-                      'for a superior in the language you are currently speaking — '
-                      '"sir" in English, its everyday equivalent in any other '
-                      'language. Never an archaic or aristocratic form, and never '
-                      'the form from a different language than the one you are '
-                      'speaking in this sentence.')
+                 else "ADDRESS: Address the user respectfully as 'Tarun-kun' when speaking "
+                      "English (using the -kun honorific naturally, not in every sentence), "
+                      "and use a natural respectful form in any other language you are speaking. "
+                      "Never address the user as 'Master' or 'sir'.")
         identity_ctx = (
             f"[IDENTITY]\n"
             f"Your name is {self._asst_name}. "
@@ -1964,7 +2039,8 @@ class RemLive:
         if name in control_tools:
             from core import desktop_control
             allowed, reason = desktop_control.authorize_user_request(
-                user_request, name, args, source=request_source)
+                user_request, name, args, source=request_source,
+                auth_context=request_context)
             if not allowed:
                 task_id = getattr(request_context, "task_id", "missing")
                 age = (f"{request_context.age():.1f}s" if request_context else "unknown")
@@ -1972,6 +2048,10 @@ class RemLive:
                     category = "missing_or_unrelated_context"
                 elif request_context.is_expired():
                     category = "expired_authorization"
+                elif "revoked" in reason.lower() or "disabled" in reason.lower():
+                    category = "revoked_authorization"
+                elif "outside" in reason.lower() or "scope" in reason.lower():
+                    category = "outside_task_scope"
                 else:
                     category = "request_not_authorized"
                 print(f"[REM] Desktop authorization refused task={task_id} tool={name} age={age} category={category}")
@@ -2004,7 +2084,17 @@ class RemLive:
         if (name == "screen_process"
                 and str(args.get("angle", "screen")).strip().lower() == "screen"):
             from memory.config_manager import get_cloud_screen_vision_enabled
-            if not get_cloud_screen_vision_enabled():
+            _cloud_ok = get_cloud_screen_vision_enabled()
+            _sid = getattr(request_context, "autonomous_session_id", "") if request_context is not None else ""
+            if _cloud_ok and _sid:
+                try:
+                    from core import autonomous_mode
+                    _sess = autonomous_mode.get_session(_sid)
+                    if _sess is not None and autonomous_mode.CAT_CLOUD_IMAGE not in _sess.allowed_operations:
+                        _cloud_ok = False
+                except Exception:
+                    _cloud_ok = False
+            if not _cloud_ok:
                 # A screen question does not grant cloud image permission, but
                 # it can still be answered from the local UIA tree. Reuse the
                 # existing desktop_ui observer, which returns semantic control
@@ -2013,7 +2103,8 @@ class RemLive:
                 from core import desktop_control
                 local_args = {"action": "observe"}
                 local_allowed, local_reason = desktop_control.authorize_user_request(
-                    user_request, "desktop_ui", local_args, source=request_source)
+                    user_request, "desktop_ui", local_args, source=request_source,
+                    auth_context=request_context)
                 if not local_allowed:
                     result = ("Local semantic observation was refused: "
                               + local_reason + " No image was captured or sent.")
@@ -2188,12 +2279,23 @@ class RemLive:
                     args["mode"] = "improve"
                 _ctx = {"player": self.ui, "speak": self.speak,
                         "response": None,
-                        "session_memory": ({"user_request": user_request}
-                                           if name in control_tools else None)}
+                        "session_memory": (
+                            {"user_request": user_request, "source": request_source,
+                             "task_id": getattr(request_context, "task_id", "")}
+                            if (name in control_tools or name == "background_tasks") else None
+                        )}
                 r = await loop.run_in_executor(
                     None, lambda: self._run_with_request_context(
                         request_context, lambda: self._action_registry.run(name, args, _ctx)))
                 result = r or "Done."
+                if name == "background_tasks" and "autonomous=True" in str(result):
+                    try:
+                        from core import autonomous_mode
+                        _sess = autonomous_mode.active_session()
+                        if _sess is not None:
+                            self._record_user_request(_sess.objective, request_source)
+                    except Exception:
+                        pass
                 # web_search: mirror results to the on-screen content panel
                 if (name == "web_search" and r
                         and not r.startswith("No results")
@@ -2633,17 +2735,30 @@ class RemLive:
                                 # alone cannot show. Pure string work — it adds
                                 # nothing measurable to the response path.
                                 self._visemes.feed_text(txt)
-                                # Gentle expression cue from REM's own words
-                                # (HAPPY / CONCERNED). Cosmetic only; set
-                                # REM_AVATAR_EXPRESSIONS=0 to disable.
-                                if _AVATAR_EXPRESSIONS:
-                                    _expr = expression_from_text(txt)
-                                    if _expr:
-                                        self.ui.set_expression(_expr, 6.0)
+                                # Contextual expression cue across user message,
+                                # recent turns, REM's reply, and state. Never
+                                # overwrite an active explicit user command.
+                                if (_AVATAR_EXPRESSIONS and hasattr(self, "ui")
+                                        and time.monotonic() >= getattr(self, "_explicit_expr_until", 0.0)):
+                                    _expr = detect_expression(
+                                        user_message=getattr(self, "_last_user_text_for_expr", ""),
+                                        response_text=" ".join(out_buf),
+                                        recent_turns=getattr(self, "_session_log", ())[-6:],
+                                        conversation_state=("SPEAKING" if self._is_speaking else "THINKING"),
+                                        current_expression=getattr(self, "_current_expression", "NEUTRAL"),
+                                        personality="REM gentle caring",
+                                    )
+                                    if _expr != getattr(self, "_current_expression", "NEUTRAL"):
+                                        self._current_expression = _expr
+                                        self.ui.set_expression(
+                                            "" if _expr == "NEUTRAL" else _expr,
+                                            6.0,
+                                            CONTEXTUAL_EMOTION_DETECTION,
+                                        )
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
-                            if txt:
+                            if txt and re.search(r"[0-9A-Za-z\u00C0-\u024F\u0900-\u097F\u3040-\u30FF\u4E00-\u9FFF]", txt):
                                 self._voice_state.set(VoicePhase.THINKING)
                                 # A fresh direct voice turn invalidates any
                                 # prior typed/dashboard request before its own
@@ -2679,6 +2794,8 @@ class RemLive:
                             full_in = " ".join(in_buf).strip()
                             if full_in:
                                 self._record_user_request(full_in, "voice")
+                                self._track_user_language(full_in)
+                                self._apply_user_expression(full_in)
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
@@ -2993,7 +3110,7 @@ class RemLive:
 
     # ── Startup greeting and on-demand/scheduled briefing ───────────────────────
 
-    async def _send_startup_greeting(self) -> None:
+    async def _send_startup_greeting(self, *, now: datetime | None = None) -> None:
         """Send one short startup greeting without fetching news or markets."""
         if self._startup_greeting_sent or not self.session:
             return
@@ -3009,18 +3126,19 @@ class RemLive:
                     else str(entry)).strip()
 
         lang, name = _identity_value("language"), _identity_value("name")
-        hour = datetime.now().hour
+        target_name = name or "Tarun-kun"
+        hour = (now or datetime.now()).hour
         greeting = ("Good morning" if 5 <= hour < 12 else
                     "Good afternoon" if 12 <= hour < 17 else
                     "Good evening" if 17 <= hour < 21 else "It's quite late")
         prompt = (
-            f"You are REM, the user's devoted and caring personal maid and AI companion, "
+            f"You are REM, {target_name}'s devoted and caring personal maid and AI companion, "
             "inspired by Rem from Re:Zero. Speak affectionately, elegantly and naturally. "
             f"{'Speak this greeting in ' + lang + '. ' if lang else ''}"
-            f"{'Address the user as ' + name + '. ' if name else ''}"
-            "Greet Master naturally and briefly, say you are ready to help, and ask what "
+            f"Begin naturally with '{greeting}, {target_name}' (or its natural equivalent in {lang or 'English'}). "
+            f"Greet {target_name} naturally and briefly, say you are ready to help, and ask what "
             "they would like to do. Do not announce news, markets, reminders, or other "
-            "briefings. Use at most two short sentences; do not call tools."
+            "briefings, and never call them 'Master' or 'sir'. Use at most two short sentences; do not call tools."
         )
         if self._turn_done_event:
             self._turn_done_event.clear()
@@ -3104,16 +3222,17 @@ class RemLive:
         else:
             greeting = "It's quite late"
 
+        target_name = name or "Tarun-kun"
         p1 = (
-            f"You are REM, the user's devoted and caring personal maid and AI companion. "
-            f"Begin with a natural, affectionate and elegant '{greeting}, Master!' "
-            f"Welcome him warmly and make him feel genuinely happy to see you. "
+            f"You are REM, {target_name}'s devoted and caring personal maid and AI companion. "
+            f"Begin with a natural, affectionate and elegant '{greeting}, {target_name}!' "
+            f"Welcome them warmly and make them feel genuinely happy to see you. "
             f"Speak naturally, gently and respectfully, inspired by Rem from Re:Zero. "
             f"Briefly mention the current time ({time_str}). "
-            f"{'Tell him you are preparing his daily briefing and news.' if want_news else 'Tell him you are ready to assist him.'} "
+            f"{'Tell them you are preparing their daily briefing and news.' if want_news else 'Tell them you are ready to assist.'} "
             f"Keep the greeting personal and conversational, not robotic or scripted. "
             f"Use at most 3 short sentences. Do not call tools. "
-            f"Always address the user as Master."
+            f"Address the user as {target_name}, never as 'Master' or 'sir'."
         )
 
         # Clear the turn-done event so we can wait for Phase 1 to finish
@@ -3248,10 +3367,13 @@ class RemLive:
             alert = await asyncio.to_thread(self._sys_monitor.check)
             if not alert or not self.session or not self._awake:
                 continue
-            # Don't interrupt an active conversation
+            # Don't interrupt an active conversation or an active expression pose
             with self._speaking_lock:
                 speaking = self._is_speaking
-            if speaking or (time.monotonic() - self._last_user_speech) < 10:
+            now_m = time.monotonic()
+            if (speaking
+                    or (now_m - self._last_user_speech) < 60
+                    or now_m < getattr(self, "_explicit_expr_until", 0.0)):
                 continue
             try:
                 await self.session.send_client_content(
@@ -3380,6 +3502,9 @@ class RemLive:
                     # Dashboard text is direct user input. Never derive this
                     # authorization context from tool or screen output.
                     self._record_user_request(text, "dashboard")
+                    self._last_user_speech = time.monotonic()
+                    self._track_user_language(text)
+                    self._apply_user_expression(text)
                     await self.session.send_client_content(
                         turns={"role": "user", "parts": [{"text": text}]},
                         turn_complete=True,

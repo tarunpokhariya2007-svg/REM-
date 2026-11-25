@@ -16,12 +16,22 @@ class RequestContext:
     source: str
     created_at: float
     expires_at: float
+    autonomous_session_id: str = ""
 
     @classmethod
-    def create(cls, instruction: str, source: str, *, now: float | None = None):
+    def create(cls, instruction: str, source: str, *, now: float | None = None,
+               ttl: float | None = None, autonomous_session_id: str = "",
+               task_id: str = ""):
         at = time.monotonic() if now is None else float(now)
-        return cls(uuid.uuid4().hex, str(instruction or "").strip(), str(source),
-                   at, at + REQUEST_CONTEXT_TTL)
+        lifetime = REQUEST_CONTEXT_TTL if ttl is None else max(0.0, float(ttl))
+        return cls(
+            task_id or uuid.uuid4().hex,
+            str(instruction or "").strip(),
+            str(source),
+            at,
+            at + lifetime,
+            str(autonomous_session_id or ""),
+        )
 
     def age(self, *, now: float | None = None) -> float:
         return max(0.0, (time.monotonic() if now is None else float(now)) - self.created_at)

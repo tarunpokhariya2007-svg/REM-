@@ -148,34 +148,63 @@ def _configured_chrome_cdp_endpoint(value: str | None = None) -> str | None:
     """Backward-compatible helper for the opt-in Chrome CDP endpoint."""
     return _configured_browser_cdp_endpoint("chrome", value)
 
+_CANONICAL_URLS = {
+    "www.youtube": "https://www.youtube.com/",
+    "www.youtube.com": "https://www.youtube.com/",
+    "whatsapp": "https://web.whatsapp.com/",
+    "whatsapp web": "https://web.whatsapp.com/",
+    "web.whatsapp": "https://web.whatsapp.com/",
+    "whatsapp.com": "https://web.whatsapp.com/",
+    "web.whatsapp.com": "https://web.whatsapp.com/",
+}
+
+
 def _normalize_url(url: str) -> str:
     """
     Known site names → their canonical homepages; unknown bare words are
     rejected rather than silently guessed as an unrelated ``.com`` address.
     Domains like "instagram.com" → "https://instagram.com"
-    Full URLs pass through unchanged.
+    Full URLs are validated so truncated hosts (e.g. ``https://web.whatsapp``
+    or ``https://www.youtube.``) are canonicalized or rejected cleanly.
     """
-    url = url.strip()
-    # Trailing sentence punctuation is never part of an address, and it arrives
-    # more often than anyone would guess: a name lifted out of a sentence brings
-    # the full stop with it, and youtube.com/@name./videos opens an error page
-    # that looks like a page. Stripping it costs nothing and is true of every
-    # site in every language.
+    url = str(url or "").strip()
     url = url.rstrip(".,;:!?'\"")
     if not url:
         return "about:blank"
+
+    canonical_hit = _CANONICAL_URLS.get(url.casefold())
+    if canonical_hit is not None:
+        return canonical_hit
+
     if "://" in url:
         try:
             parsed = urlsplit(url)
-            valid = (parsed.scheme.lower() in {"http", "https"}
-                     and bool(parsed.hostname)
-                     and not parsed.username and not parsed.password)
+            if (parsed.scheme.lower() not in {"http", "https"}
+                    or not parsed.hostname
+                    or parsed.username or parsed.password):
+                raise ValueError
             _ = parsed.port  # validate malformed ports before handing off
+            host = parsed.hostname.rstrip(".").casefold()
+            if host in _CANONICAL_URLS and not parsed.path.strip("/") and not parsed.query:
+                return _CANONICAL_URLS[host]
+            if host in _CANONICAL_URLS and host in {"web.whatsapp", "www.youtube", "youtube", "whatsapp"}:
+                canon = urlsplit(_CANONICAL_URLS[host])
+                return f"{canon.scheme}://{canon.netloc}{parsed.path or '/'}" + (f"?{parsed.query}" if parsed.query else "")
+            try:
+                is_ip = bool(ipaddress.ip_address(host))
+            except ValueError:
+                is_ip = False
+            if host != "localhost" and not is_ip:
+                parts = [p for p in host.split(".") if p]
+                if len(parts) < 2 or len(parts[-1]) < 2:
+                    raise ValueError
+            if parsed.hostname != host:
+                netloc = host + (f":{parsed.port}" if parsed.port else "")
+                return f"{parsed.scheme.lower()}://{netloc}{parsed.path or ''}" + (f"?{parsed.query}" if parsed.query else "")
+            return url
         except ValueError:
-            valid = False
-        if not valid:
-            raise ValueError("Only valid HTTP or HTTPS browser URLs are supported.")
-        return url
+            raise ValueError("Only valid HTTP or HTTPS browser URLs are supported.") from None
+
     prefix = url.split(":", 1)[0]
     if ":" in url and prefix.isalpha():
         if prefix.casefold() != "localhost":
@@ -190,6 +219,7 @@ def _normalize_url(url: str) -> str:
     if "." not in url:
         aliases = {
             "google": "google.com", "youtube": "youtube.com",
+            "whatsapp": "web.whatsapp.com", "whatsapp web": "web.whatsapp.com",
             "gmail": "gmail.com", "google drive": "drive.google.com",
             "github": "github.com", "reddit": "reddit.com",
             "wikipedia": "wikipedia.org", "bing": "bing.com",
@@ -563,42 +593,165 @@ def _launch_flags(name: str) -> list[str]:
             if name in _CHROMIUM_FAMILY else [])
 
 
-def _native_outcome(name: str, url: str) -> str:
-    """What a native launch actually established, as opposed to what it asked for.
+def _expected_site_hints(url: str) -> tuple[str, tuple[str, ...]]:
+    try:
+        host = (urlsplit(url).hostname or "").casefold().lstrip("www.")
+    except Exception:
+        host = ""
+    hints = [host] if host else []
+    if "whatsapp" in host:
+        hints.extend(["whatsapp", "web.whatsapp.com"])
+    elif "youtube" in host:
+        hints.extend(["youtube", "youtube.com"])
+    elif "google" in host:
+        hints.extend(["google"])
+    elif host:
+        base = host.split(".")[0]
+        if len(base) >= 3:
+            hints.append(base)
+    return host, tuple(dict.fromkeys(h for h in hints if h))
 
-    THIS RETURNED A SENTENCE SAYING "Opened", AND IT WAS NOT TRUE ENOUGH
-        Handing a URL to a browser executable proves one thing: the executable
-        started. It proves nothing about the page. The address may 404, redirect
-        to a sign-in wall, or - the case that exposed this - be an address the
-        model invented because it did not know the real one.
 
-        Asked to open a user's own YouTube channel, the model guessed a path
-        that does not exist. The browser opened it, this function answered
-        "Opened in operagx: <that address>", and the assistant reported the
-        channel as open while the screen showed an error page. A bare success
-        sentence is exactly the invitation to invent the rest that the rest of
-        this project spent a release removing.
+def _classify_page_state(title: str, body: str = "") -> str:
+    text = f"{title}\n{body}".casefold()
+    if any(k in text for k in (
+        "this site can't be reached", "err_name_not_resolved", "err_connection",
+        "err_internet_disconnected", "404 not found", "page isn't working",
+        "problem loading page", "dns_probe_finished",
+    )):
+        return "error"
+    if any(k in text for k in (
+        "scan qr code", "use whatsapp on your computer", "link with phone number",
+        "sign in", "log in", "enter your password", "choose an account",
+    )):
+        return "login_required"
+    if any(k in text for k in ("loading", "connecting", "opening")):
+        return "loading"
+    return "loaded" if title.strip() else "unverified"
 
-    The browser itself CAN be confirmed, cheaply, from the process table, so
-    that part is reported as fact and the page is reported as unconfirmed. Two
-    different things, said separately, which is the whole point of the outcome
-    vocabulary.
-    """
+
+def inspect_open_chrome_tabs_local(browser_name: str = "chrome") -> list[str]:
+    """Return a non-intrusive local summary of open browser windows/tabs."""
+    found: list[str] = []
+    try:
+        from core import screenview
+        for app, title in screenview.all_windows():
+            app_cf = str(app or "").casefold()
+            title_cf = str(title or "").casefold()
+            if browser_name in app_cf or "chrome" in title_cf or "edge" in title_cf:
+                found.append(f"{app or browser_name}: {title}")
+    except Exception:
+        pass
+    try:
+        if _registry.has(browser_name):
+            sess = _registry.get(browser_name)
+            page = getattr(sess, "_page", None)
+            if page is not None and not page.is_closed():
+                found.insert(0, f"CDP tab: {page.url}")
+    except Exception:
+        pass
+    return found
+
+
+def _verify_native_browser(name: str, url: str, *, timeout_s: float | None = None) -> str:
+    """Verify native browser launch and active window/tab state when possible."""
+    import time as _time
+    if timeout_s is None:
+        try:
+            timeout_s = float(os.environ.get("REM_BROWSER_VERIFY_TIMEOUT", "2.5"))
+        except ValueError:
+            timeout_s = 2.5
+
+    host, hints = _expected_site_hints(url)
+    deadline = _time.monotonic() + max(0.0, timeout_s)
     running = bool(appidentity.running(name))
+    matched_title = ""
+    observed_url = ""
+    all_browser_titles: list[str] = []
+
+    while True:
+        running = bool(appidentity.running(name))
+        all_browser_titles = []
+        try:
+            from core import screenview
+            for app, title in screenview.all_windows():
+                app_cf = str(app or "").casefold()
+                title_cf = str(title or "").casefold()
+                if name in app_cf or (name == "chrome" and "google chrome" in title_cf) or (name == "edge" and "microsoft edge" in title_cf):
+                    all_browser_titles.append(str(title or ""))
+                    if any(h in title_cf for h in hints):
+                        matched_title = str(title or "")
+                        break
+            if not matched_title:
+                fg_app, fg_title, _pid, _hwnd = screenview._foreground()
+                if name in str(fg_app or "").casefold():
+                    view = screenview.look(budget_s=0.6, allow_ocr=False, allow_pixel_digest=False)
+                    for el in view.elements:
+                        val = str(getattr(el, "value", "") or getattr(el, "name", "") or "")
+                        if host and host in val.casefold():
+                            observed_url = val if "://" in val else f"https://{val}"
+                            matched_title = str(fg_title or view.title or "")
+                            break
+        except Exception:
+            pass
+        if matched_title or _time.monotonic() >= deadline:
+            break
+        _time.sleep(0.35)
+
     if not url:
         if running:
+            print(f"[Browser] Verified launch browser={name} windows={len(all_browser_titles)}")
             return outcome.done("browser_control", browser=name, opened=True,
-                                verified=True)
+                                verified=True, browser_launched=True,
+                                page_state="loaded" if all_browser_titles else "open")
+        print(f"[Browser] Unverified launch browser={name} (process not detected)")
         return outcome.unverified(
             "browser_control",
-            "the browser was launched but has not appeared in the process list "
-            "yet", browser=name)
+            "the browser was launched but has not appeared in the process list yet",
+            browser=name, browser_launched=False, page_state="unverified",
+            verification_step="process_presence",
+        )
+
+    if matched_title:
+        page_state = _classify_page_state(matched_title)
+        if page_state == "error":
+            print(f"[Browser] Navigation error detected browser={name} url={url} title={matched_title!r}")
+            return outcome.failed(
+                "browser_control",
+                f"the page reported an error ({matched_title})",
+                browser=name, url=observed_url or url, title=matched_title,
+                page_state="error", browser_launched=running, navigation_requested=True,
+            )
+        print(f"[Browser] Verified native navigation browser={name} url={observed_url or url} page_state={page_state}")
+        return outcome.done(
+            "browser_control",
+            verified=True,
+            browser=name,
+            url=observed_url or url,
+            title=matched_title,
+            page_state=page_state,
+            browser_launched=running,
+            navigation_requested=True,
+            navigation_completed=True,
+        )
+
+    print(f"[Browser] Unverified native navigation browser={name} url={url} running={running}")
     return outcome.unverified(
         "browser_control",
-        "the address was handed to the browser, which does not report back - "
-        "whether the page actually loaded, redirected or does not exist is NOT "
-        "known, so it must not be described as open",
-        browser=name, url=url, browser_running=running)
+        "navigation was requested, but active tab URL and page load state could not be confirmed",
+        browser=name,
+        url=url,
+        browser_launched=running,
+        navigation_requested=True,
+        navigation_completed=False,
+        page_state="unverified",
+        verification_step="active_tab_url_and_title",
+    )
+
+
+def _native_outcome(name: str, url: str) -> str:
+    """Backward-compatible wrapper returning structured browser verification."""
+    return _verify_native_browser(name, url)
 
 
 def _open_native(url: str, browser_name: Optional[str]) -> str:
@@ -1045,18 +1198,27 @@ class _BrowserSession:
                     "browser_control",
                     "the URL loaded, but the browser page is hidden; visible navigation is not confirmed",
                     requested=url, actual=result_url, navigation_confirmed=False,
-                    page_ready=True)
-            # Verified, and cheaply: this is the page's OWN url read back after
-            # navigation, not the one we asked for. A redirect, a login wall or
-            # a captive portal all show up here as a different address, which
-            # is exactly what the user needs to hear about.
-            #
-            # The profile is reported for the same reason. When the user's
-            # browser was already running its profile is locked, so the page
-            # opens in a separate one where they are signed in to nothing —
-            # and a Gmail that asks them to log in looks like a broken
-            # assistant unless somebody says why.
+                    page_ready=True, browser=self.browser_name, page_state="hidden")
+            try:
+                title = await page.title()
+            except Exception:
+                title = ""
+            try:
+                body_sample = (await page.locator("body").inner_text(timeout=1_500))[:1200]
+            except Exception:
+                body_sample = ""
+            page_state = _classify_page_state(title or result_url, body_sample)
+            if page_state == "error":
+                print(f"[Browser] Navigation error page browser={self.browser_name} url={result_url} title={title!r}")
+                return outcome.failed(
+                    "browser_control",
+                    f"the requested page failed to load ({title or result_url})",
+                    browser=self.browser_name, url=result_url, title=title, page_state="error",
+                )
+            print(f"[Browser] Verified navigation browser={self.browser_name} url={result_url} page_state={page_state}")
             return outcome.done("browser_control", opened=result_url,
+                                browser=self.browser_name, url=result_url,
+                                title=title or "", page_state=page_state,
                                 profile=self.profile_kind or "real",
                                 verified=True, navigation_confirmed=True,
                                 page_ready=True, requested_url=url,
@@ -1483,7 +1645,55 @@ class _BrowserSession:
         self._page = new
         if url:
             return await self.go_to(url)
-        return "New tab opened."
+        return outcome.done("browser_control", action="new_tab", verified=True, url=new.url)
+
+    async def switch_tab(self, target: str = "") -> str:
+        page = await self._get_page()
+        pages = [p for p in page.context.pages if not p.is_closed()]
+        if not pages:
+            return outcome.failed("browser_control", "no open tabs found")
+        q = str(target or "").strip()
+        if q.isdigit():
+            idx = int(q) - 1
+            if 0 <= idx < len(pages):
+                self._page = pages[idx]
+                await self._page.bring_to_front()
+                return outcome.done("browser_control", action="switch_tab", verified=True,
+                                    url=self._page.url, title=await self._page.title())
+        q_cf = q.casefold()
+        for p in pages:
+            title = ""
+            try:
+                title = await p.title()
+            except Exception:
+                pass
+            if not q_cf or q_cf in str(p.url or "").casefold() or q_cf in title.casefold():
+                self._page = p
+                await self._page.bring_to_front()
+                return outcome.done("browser_control", action="switch_tab", verified=True,
+                                    url=p.url, title=title)
+        return outcome.failed("browser_control", f"no tab matching {q!r} was found")
+
+    async def inspect_page(self) -> str:
+        page = await self._get_page()
+        url = page.url
+        try:
+            title = await page.title()
+        except Exception:
+            title = ""
+        try:
+            ready = await page.evaluate("() => document.readyState")
+        except Exception:
+            ready = "unknown"
+        try:
+            body = (await page.locator("body").inner_text(timeout=1_500))[:1200]
+        except Exception:
+            body = ""
+        state = _classify_page_state(title, body) if ready in ("interactive", "complete") else "loading"
+        return outcome.done(
+            "browser_control", verified=True, browser=self.browser_name,
+            url=url, title=title, page_state=state, ready_state=ready,
+        )
 
     async def close_tab(self) -> str:
         page = self._page
@@ -1620,7 +1830,7 @@ _registry = _SessionRegistry()
 # by nothing else — it exists so that being told "that is not an action" also
 # tells you what the actions ARE.
 _ACTIONS = (
-    "go_to", "search", "new_tab", "close_tab",
+    "go_to", "search", "new_tab", "switch_tab", "close_tab", "inspect",
     "click", "smart_click", "type", "smart_type", "fill_form", "press",
     "scroll", "get_text", "get_url", "screenshot",
     "back", "forward", "reload",
@@ -1752,12 +1962,30 @@ def _browser_control_impl(
                 "Which website did you mean? Please give me its name or web address.",
                 verified=False,
             )
-        # Remembered unless it outright FAILED. `unverified` is now the normal
-        # answer for a native open - the browser does not report back - and
-        # treating that as a problem would stop the automation session ever
-        # resuming the page the user is actually looking at.
         if nav_url and not result.startswith(f"status={outcome.FAILED} "):
-            _registry.note_native_url(_normalize_url(nav_url))
+            try:
+                _registry.note_native_url(_normalize_url(nav_url))
+            except ValueError:
+                pass
+        _log(player, result)
+        return result
+
+    # Native read-only inspection fallback when no Playwright/CDP session is attached yet
+    if action in ("get_url", "get_text", "inspect") and not _registry.has(browser):
+        bname = browser or _detect_default_browser()
+        tabs = inspect_open_chrome_tabs_local(bname)
+        if tabs:
+            result = outcome.done(
+                "browser_control", verified=True, browser=bname,
+                title=tabs[0], page_state=_classify_page_state(tabs[0]),
+                open_tabs="; ".join(tabs[:5]),
+            )
+        else:
+            result = outcome.unverified(
+                "browser_control",
+                "no controllable browser tab or active Chrome window title was found",
+                browser=bname, page_state="unverified", verification_step="open_browser_window",
+            )
         _log(player, result)
         return result
 
@@ -1803,6 +2031,10 @@ def _browser_control_impl(
             result = sess.run(sess.get_text())
         elif action == "get_url":
             result = sess.run(sess.get_url())
+        elif action == "inspect":
+            result = sess.run(sess.inspect_page())
+        elif action == "switch_tab":
+            result = sess.run(sess.switch_tab(params.get("target") or params.get("text") or ""))
         elif action == "press":
             result = sess.run(sess.press(params.get("key", "Enter")))
         elif action == "close_tab":
@@ -1923,7 +2155,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | inspect | press | new_tab | switch_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
             },
             "browser": {
                 "type": "STRING",

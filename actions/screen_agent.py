@@ -236,6 +236,14 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
         return "Supported actions: observe, find, click, right_click, double_click, select, toggle, expand, collapse, hover, move, move_relative, type, press, scroll, focus_window, pause, resume, stop, set_mode."
 
     try:
+        if action in ("observe", "find"):
+            from memory.config_manager import get_local_screen_observation_enabled
+            if not get_local_screen_observation_enabled():
+                desktop_control.report(action, "refused: local screen observation disabled")
+                _publish(player)
+                return ("status=failed action=desktop_ui reason=\"Local screen observation is "
+                        "currently disabled or revoked. Enable LOCAL SCREEN OBSERVATION in the "
+                        "COMPUTER USE panel.\"")
         with desktop_control.action(action):
             _publish(player)
             before = _view()
@@ -252,7 +260,15 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                                         if target else None),
                               "clarification": why}
                 else:
-                    result = _describe(before)
+                    desc = _describe(before)
+                    try:
+                        from core.screen_observation import inspect_local_screen
+                        local_detail = inspect_local_screen(str(params.get("text") or ""))
+                        if "Local OCR text:" in local_detail or "Browser windows/tabs" in local_detail:
+                            desc = {"uia_view": desc, "local_screen": local_detail}
+                    except Exception:
+                        pass
+                    result = desc
                 desktop_control.report(action, "observed" if not before.degraded else
                                        "degraded observation; see source and reason", before.app)
                 _publish(player)

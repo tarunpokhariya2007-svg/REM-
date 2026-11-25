@@ -132,7 +132,273 @@
       "h": 144,
       "role": "eyes",
       "level": 1.0
+    },
+    "rem-eyes-happy-closed": {
+      "file": "rem-eyes-happy-closed.png",
+      "x": 411,
+      "y": 499,
+      "w": 517,
+      "h": 150,
+      "role": "eyes_expr"
+    },
+    "rem-eyes-angry-open": {
+      "file": "rem-eyes-angry-open.png",
+      "x": 427,
+      "y": 499,
+      "w": 486,
+      "h": 144,
+      "role": "eyes_expr"
+    },
+    "rem-eyes-angry-closed": {
+      "file": "rem-eyes-angry-closed.png",
+      "x": 411,
+      "y": 499,
+      "w": 517,
+      "h": 150,
+      "role": "eyes_expr"
+    },
+    "rem-eyes-sad-open": {
+      "file": "rem-eyes-sad-open.png",
+      "x": 411,
+      "y": 499,
+      "w": 517,
+      "h": 144,
+      "role": "eyes_expr"
+    },
+    "rem-eyes-sad-closed": {
+      "file": "rem-eyes-sad-closed.png",
+      "x": 411,
+      "y": 499,
+      "w": 517,
+      "h": 150,
+      "role": "eyes_expr"
+    },
+    "rem-eyes-shy": {
+      "file": "rem-eyes-shy.png",
+      "x": 413,
+      "y": 499,
+      "w": 512,
+      "h": 144,
+      "role": "eyes_expr"
+    },
+    "rem-eyes-sleepy": {
+      "file": "rem-eyes-sleepy.png",
+      "x": 411,
+      "y": 499,
+      "w": 517,
+      "h": 144,
+      "role": "eyes_expr"
+    },
+    "rem-eyes-wide": {
+      "file": "rem-eyes-wide.png",
+      "x": 427,
+      "y": 503,
+      "w": 485,
+      "h": 140,
+      "role": "eyes_expr"
+    },
+    "rem-brows-neutral": {
+      "file": "rem-brows-neutral.png",
+      "x": 438,
+      "y": 477,
+      "w": 464,
+      "h": 64,
+      "role": "brows"
+    },
+    "rem-brows-happy": {
+      "file": "rem-brows-happy.png",
+      "x": 438,
+      "y": 469,
+      "w": 464,
+      "h": 66,
+      "role": "brows"
+    },
+    "rem-brows-sad": {
+      "file": "rem-brows-sad.png",
+      "x": 438,
+      "y": 462,
+      "w": 464,
+      "h": 87,
+      "role": "brows"
+    },
+    "rem-brows-angry": {
+      "file": "rem-brows-angry.png",
+      "x": 439,
+      "y": 474,
+      "w": 462,
+      "h": 89,
+      "role": "brows"
+    },
+    "rem-brows-surprised": {
+      "file": "rem-brows-surprised.png",
+      "x": 438,
+      "y": 458,
+      "w": 465,
+      "h": 65,
+      "role": "brows"
+    },
+    "rem-brows-shy": {
+      "file": "rem-brows-shy.png",
+      "x": 438,
+      "y": 466,
+      "w": 464,
+      "h": 79,
+      "role": "brows"
+    },
+    "rem-brows-sleepy": {
+      "file": "rem-brows-sleepy.png",
+      "x": 438,
+      "y": 481,
+      "w": 464,
+      "h": 62,
+      "role": "brows"
+    },
+    "rem-mouth-sad": {
+      "file": "rem-mouth-sad.png",
+      "x": 598,
+      "y": 745,
+      "w": 114,
+      "h": 58,
+      "role": "mouth_expr"
+    },
+    "rem-mouth-angry-closed": {
+      "file": "rem-mouth-angry-closed.png",
+      "x": 598,
+      "y": 745,
+      "w": 114,
+      "h": 58,
+      "role": "mouth_expr"
+    },
+    "rem-mouth-angry": {
+      "file": "rem-mouth-angry.png",
+      "x": 586,
+      "y": 729,
+      "w": 138,
+      "h": 82,
+      "role": "mouth_expr"
+    },
+    "rem-mouth-shy": {
+      "file": "rem-mouth-shy.png",
+      "x": 598,
+      "y": 745,
+      "w": 114,
+      "h": 58,
+      "role": "mouth_expr"
+    },
+    "rem-mouth-surprised": {
+      "file": "rem-mouth-surprised.png",
+      "x": 598,
+      "y": 735,
+      "w": 114,
+      "h": 74,
+      "role": "mouth_expr"
+    },
+    "rem-mouth-sleepy": {
+      "file": "rem-mouth-sleepy.png",
+      "x": 598,
+      "y": 740,
+      "w": 114,
+      "h": 66,
+      "role": "mouth_expr"
+    },
+    "rem-mouth-love": {
+      "file": "rem-mouth-love.png",
+      "x": 598,
+      "y": 745,
+      "w": 114,
+      "h": 58,
+      "role": "mouth_expr"
+    },
+    "rem-mouth-happy": {
+      "file": "rem-mouth-happy.png",
+      "x": 580,
+      "y": 729,
+      "w": 150,
+      "h": 82,
+      "role": "mouth_expr"
+    },
+    "rem-blush-soft": {
+      "file": "rem-blush-soft.png",
+      "x": 375,
+      "y": 589,
+      "w": 566,
+      "h": 165,
+      "role": "cheek_fx"
+    },
+    "rem-blush-intense": {
+      "file": "rem-blush-intense.png",
+      "x": 361,
+      "y": 585,
+      "w": 594,
+      "h": 175,
+      "role": "cheek_fx"
+    },
+    "rem-tears": {
+      "file": "rem-tears.png",
+      "x": 449,
+      "y": 582,
+      "w": 441,
+      "h": 177,
+      "role": "cheek_fx"
+    },
+    "rem-fx-happy": {
+      "file": "rem-fx-happy.png",
+      "x": 202,
+      "y": 105,
+      "w": 149,
+      "h": 146,
+      "role": "fx"
+    },
+    "rem-fx-angry": {
+      "file": "rem-fx-angry.png",
+      "x": 721,
+      "y": 369,
+      "w": 93,
+      "h": 92,
+      "role": "fx"
+    },
+    "rem-fx-shy": {
+      "file": "rem-fx-shy.png",
+      "x": 221,
+      "y": 808,
+      "w": 122,
+      "h": 68,
+      "role": "fx"
+    },
+    "rem-fx-surprised": {
+      "file": "rem-fx-surprised.png",
+      "x": 220,
+      "y": 105,
+      "w": 134,
+      "h": 131,
+      "role": "fx"
+    },
+    "rem-fx-sleepy": {
+      "file": "rem-fx-sleepy.png",
+      "x": 198,
+      "y": 84,
+      "w": 213,
+      "h": 657,
+      "role": "fx"
+    },
+    "rem-fx-love": {
+      "file": "rem-fx-love.png",
+      "x": 194,
+      "y": 121,
+      "w": 818,
+      "h": 745,
+      "role": "fx"
     }
   },
-  "notes": "Generated by tools/build_rem_layers.py. Mouth keyframes other than closed/open are derived by scaling the original open mouth; they are not hand-drawn phoneme art."
+  "notes": "Generated by tools/build_rem_layers.py. Mouth keyframes other than closed/open are derived by scaling the original open mouth; they are not hand-drawn phoneme art.",
+  "expressions": [
+    "NEUTRAL",
+    "HAPPY",
+    "SAD",
+    "ANGRY",
+    "SHY",
+    "SURPRISED",
+    "SLEEPY",
+    "LOVE"
+  ]
 }

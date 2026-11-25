@@ -12,13 +12,14 @@ _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
 DEFAULT_THRESHOLDS = {
     "cpu":  90.0,
-    "ram":  90.0,
+    "ram":  95.0,
     "temp": 85.0,
     "gpu":  95.0,
 }
 
 _COOLDOWN   = 300
 _CPU_STREAK = 3
+_RAM_STREAK = 3
 
 # ── NVML DLL cache (Windows: nvml.dll, Linux: libnvidia-ml.so.1) ─────────────
 _nvml_lib: object = None
@@ -144,6 +145,7 @@ class SystemMonitor:
         self.thresholds   = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
         self._last_alert: dict[str, float] = {}
         self._cpu_streak  = 0
+        self._ram_streak  = 0
 
     def _can_alert(self, key: str) -> bool:
         return (time.monotonic() - self._last_alert.get(key, 0)) > _COOLDOWN
@@ -175,12 +177,17 @@ class SystemMonitor:
         else:
             self._cpu_streak = 0
 
-        if ram >= self.thresholds["ram"] and self._can_alert("ram"):
-            alerts.append(
-                f"[SYSTEM_ALERT] RAM is at {ram:.0f}% — nearly exhausted. "
-                "Warn the user in their language and suggest freeing memory."
-            )
-            self._record("ram")
+        if ram >= self.thresholds["ram"]:
+            self._ram_streak += 1
+            if self._ram_streak >= _RAM_STREAK and self._can_alert("ram"):
+                alerts.append(
+                    f"[SYSTEM_ALERT] RAM is at {ram:.0f}% — nearly exhausted. "
+                    "Warn the user in their language and suggest freeing memory."
+                )
+                self._record("ram")
+                self._ram_streak = 0
+        else:
+            self._ram_streak = 0
 
         if temp > 0 and temp >= self.thresholds["temp"] and self._can_alert("temp"):
             alerts.append(

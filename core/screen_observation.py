@@ -110,6 +110,15 @@ def prepare_image_for_live(image: bytes, mime_type: str) -> bytes:
     return raw
 
 
+def assert_local_observation_allowed() -> None:
+    """Gate local-only screen capture/inspection (independent of cloud image sharing)."""
+    from memory.config_manager import get_local_screen_observation_enabled
+    if not get_local_screen_observation_enabled():
+        raise PermissionError("Local screen observation is disabled or revoked.")
+    from core.screenview import assert_observation_allowed
+    assert_observation_allowed()
+
+
 def assert_cloud_image_egress_allowed() -> None:
     """Gate every desktop screenshot before pixels are captured or uploaded."""
     from memory.config_manager import get_cloud_screen_vision_enabled
@@ -117,6 +126,79 @@ def assert_cloud_image_egress_allowed() -> None:
         raise PermissionError("Cloud screen vision is disabled; desktop pixels were not shared.")
     from core.screenview import assert_observation_allowed
     assert_observation_allowed()
+
+
+def _detect_page_state(text: str, title: str = "", url: str = "") -> str:
+    combined = f"{title}\n{url}\n{text}".casefold()
+    if any(k in combined for k in (
+        "this site can't be reached", "err_name_not_resolved", "err_connection",
+        "err_internet_disconnected", "404 not found", "page isn't working",
+        "problem loading page", "dns_probe_finished",
+    )):
+        return "error"
+    if any(k in combined for k in (
+        "scan qr code", "use whatsapp on your computer", "link with phone number",
+        "sign in", "log in", "enter your password", "choose an account",
+    )):
+        return "login_required"
+    if any(k in combined for k in ("loading...", "connecting...", "starting up")):
+        return "loading"
+    if title.strip() or url.strip() or text.strip():
+        return "loaded"
+    return "unknown"
+
+
+def inspect_local_screen(question: str = "") -> str:
+    """Perform local-only screen observation (UIA + local OCR + open windows).
+
+    Never uploads screenshots or image bytes to any cloud service.
+    """
+    assert_local_observation_allowed()
+    from core import screenview
+
+    view = screenview.look(budget_s=1.5, allow_ocr=True)
+    summary = describe_view(view)
+    ocr_lines: list[str] = []
+
+    # If the foreground window was REM's own HUD ("self") or UIA returned few
+    # readable elements, run a strictly local OCR pass on the primary monitor so
+    # visible side-by-side windows (e.g. Chrome) can still be read locally.
+    if view.source in {"self", "none"} or (view.degraded and view.source != "ocr"):
+        try:
+            if screenview._HAS_OCR:
+                rect = screenview.monitor_rect(view)
+                ocr_els = screenview._scan_ocr(rect, __import__("time").monotonic() + 2.0)
+                for el in ocr_els[:40]:
+                    t = str(getattr(el, "name", "") or "").strip()
+                    if t:
+                        ocr_lines.append(t)
+        except Exception:
+            pass
+
+    if ocr_lines:
+        summary += "\nLocal OCR text:\n" + "\n".join(f"- {line}" for line in ocr_lines[:30])
+
+    # Include locally inspected Chrome/browser tab info if an automation/CDP session exists
+    browser_notes: list[str] = []
+    try:
+        from actions.browser_control import inspect_open_chrome_tabs_local
+        tabs = inspect_open_chrome_tabs_local()
+        if tabs:
+            browser_notes.extend(tabs[:6])
+    except Exception:
+        pass
+    if browser_notes:
+        summary += "\nBrowser windows/tabs detected locally:\n" + "\n".join(f"- {t}" for t in browser_notes)
+
+    page_state = _detect_page_state(
+        summary, title=str(getattr(view, "title", "") or ""),
+    )
+    print(
+        f"[Vision] Local screen observation ok source={view.source} "
+        f"app={view.app or 'unknown'} ocr_items={len(ocr_lines)} "
+        f"page_state={page_state} cloud_upload=false"
+    )
+    return summary
 
 
 def vision_question(question: str, context: str, *, user_request: str = "") -> str:
