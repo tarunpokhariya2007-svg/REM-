@@ -210,6 +210,23 @@ def _confirmed_shortcut(key: str, app: str, title: str, player=None) -> str:
         return f"Confirmed window close stopped safely: {exc}"
 
 
+def _try_browser_dom_point(before, target_text: str):
+    """If a browser window is active and UIA lacked page DOM controls, resolve
+    verified desktop coordinates from an attached browser session."""
+    try:
+        from actions import browser_control
+        pt = browser_control.locate_control_screen_point(target_text, app_hint=before.app)
+        if pt and isinstance(pt, dict) and "x" in pt and "y" in pt:
+            return screenact.Point(
+                int(pt["x"]), int(pt["y"]),
+                origin="element",
+                label=str(target_text or pt.get("url") or "browser control"),
+            )
+    except Exception:
+        pass
+    return None
+
+
 def screen_agent(parameters: dict, player=None, speak=None, response=None,
                  session_memory=None) -> str:
     params = parameters or {}
@@ -321,6 +338,29 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                     elif len(surfaces) > 1:
                         why = "I found multiple editable-looking text surfaces; name the intended editor."
                 if why:
+                    dom_point = _try_browser_dom_point(before, target_text)
+                    if dom_point is not None and action in {"hover", "move", "click", "right_click", "double_click", "type"}:
+                        if action == "hover":
+                            outcome = screenact.hover(dom_point)
+                        elif action == "move":
+                            outcome = screenact.move_cursor(dom_point)
+                        elif action == "right_click":
+                            outcome = screenact.right_click(dom_point, expect_process=before.app)
+                        elif action == "double_click":
+                            outcome = screenact.double_click(dom_point, expect_process=before.app)
+                        elif action == "click":
+                            outcome = screenact.click(dom_point, expect_process=before.app)
+                        else:
+                            text = str(params.get("text", ""))
+                            if not text:
+                                return "Tell me what text to enter."
+                            outcome = screenact.type_text(
+                                text, target=dom_point,
+                                clear_first=bool(params.get("clear_first", True)),
+                            )
+                        desktop_control.report(action, str(outcome), before.app)
+                        _publish(player)
+                        return str(outcome)
                     desktop_control.report(action, "not executed: target ambiguous or missing", before.app)
                     _publish(player)
                     return why

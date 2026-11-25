@@ -193,10 +193,25 @@ def inspect_local_screen(question: str = "") -> str:
     page_state = _detect_page_state(
         summary, title=str(getattr(view, "title", "") or ""),
     )
+    uia_items = len(getattr(view, "elements", ()) or ()) if view.source in ("uia", "ax", "atspi") else 0
+    useful_signals = uia_items + len(ocr_lines) + len(browser_notes)
+    if useful_signals == 0 or (view.source in ("ocr", "none") and len(ocr_lines) == 0 and not browser_notes):
+        confidence = "uncertain"
+        if page_state == "loaded":
+            page_state = "unverified"
+        summary += (
+            "\nObservation uncertainty: No UI controls or OCR text were extracted from "
+            "the visible content (confidence=uncertain)."
+        )
+    elif uia_items > 0 or browser_notes:
+        confidence = "high"
+    else:
+        confidence = "medium"
+
     print(
-        f"[Vision] Local screen observation ok source={view.source} "
-        f"app={view.app or 'unknown'} ocr_items={len(ocr_lines)} "
-        f"page_state={page_state} cloud_upload=false"
+        f"[Vision] Local screen observation source={view.source} "
+        f"app={view.app or 'unknown'} uia_items={uia_items} ocr_items={len(ocr_lines)} "
+        f"page_state={page_state} confidence={confidence} cloud_upload=false"
     )
     return summary
 

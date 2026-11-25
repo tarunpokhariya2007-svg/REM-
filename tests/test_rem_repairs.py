@@ -362,5 +362,209 @@ with patch.object(config_manager, "CONFIG_FILE", cfg):
             self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
 
 
+class CursorChromeMonitorAndSequenceTests(unittest.TestCase):
+    def test_close_tab_executes_without_prompt_when_clean_and_confirms_if_dirty(self):
+        class CleanPage:
+            url = "https://www.youtube.com/watch?v=123"
+            def __init__(self, dirty=False):
+                self._dirty = dirty
+                self.closed = False
+            def is_closed(self): return self.closed
+            async def evaluate(self, _js): return self._dirty
+            async def close(self): self.closed = True
+
+        clean = CleanPage(dirty=False)
+        fallback = CleanPage(dirty=False)
+        ctx = SimpleNamespace(pages=[fallback, clean])
+        clean.context = ctx
+        fallback.context = ctx
+        sess = object.__new__(browser_control._BrowserSession)
+        sess.browser_name = "chrome"
+        sess._browser = None
+        sess._spec = None
+        sess._page = clean
+        sess._context = ctx
+
+        sess.run = lambda c: _run_immediate(c)
+        with patch.object(browser_control._registry, "has", return_value=True), \
+             patch.object(browser_control._registry, "get", return_value=sess), \
+             patch("core.confirm.request", side_effect=AssertionError("close_tab must not prompt when requested")):
+            res = browser_control._browser_control_impl({"action": "close_tab", "browser": "chrome"})
+        self.assertIn("status=done", res)
+        self.assertTrue(clean.closed)
+
+        dirty_page = CleanPage(dirty=True)
+        dirty_page.context = ctx
+        sess2 = object.__new__(browser_control._BrowserSession)
+        sess2.browser_name = "chrome"
+        sess2._browser = None
+        sess2._spec = None
+        sess2._page = dirty_page
+        sess2._context = ctx
+        confirm_res = _run_immediate(sess2.close_tab())
+        self.assertTrue(str(confirm_res).startswith("CONFIRM_REQUIRED:"))
+
+    def test_chrome_never_silently_substitutes_edge(self):
+        old_active = browser_control._registry._active_browser
+        try:
+            with patch("actions.browser_control._resolve_browser", return_value={"engine": "chromium", "exe": None, "channel": None}), \
+                 patch("actions.browser_control._find_exe_windows", return_value=None), \
+                 patch("actions.browser_control.appidentity.running", return_value=[]):
+                res = browser_control._open_native("https://www.youtube.com/", "chrome")
+            self.assertIn("status=failed", res)
+            self.assertIn("did not substitute another browser", res)
+            self.assertIn("browser=chrome", res)
+        finally:
+            browser_control._registry._active_browser = old_active
+
+    def test_explicit_chrome_sets_active_browser_and_reuses_running(self):
+        old_active = browser_control._registry._active_browser
+        try:
+            with patch("actions.browser_control._resolve_browser", return_value={"engine": "chromium", "exe": "chrome.exe", "channel": None}), \
+                 patch("actions.browser_control.appidentity.running", return_value=["chrome.exe"]), \
+                 patch("actions.browser_control.subprocess.Popen") as popen, \
+                 patch("actions.browser_control._verify_native_browser",
+                       return_value="status=done action=browser_control browser=chrome reused_existing=True verified=True"):
+                res = browser_control._open_native("https://www.youtube.com/", "chrome")
+            popen.assert_called_once()
+            self.assertEqual(browser_control._registry._active_browser, "chrome")
+            self.assertIn("browser=chrome", res)
+            self.assertIn("reused_existing=True", res)
+        finally:
+            browser_control._registry._active_browser = old_active
+
+    def test_youtube_search_typing_verifies_real_value_and_submission(self):
+        class FakeInput:
+            def __init__(self, visible=True, editable=True, ph="Search"):
+                self._visible = visible
+                self._editable = editable
+                self._ph = ph
+                self._val = ""
+                self._focused = False
+            async def count(self): return 1
+            async def is_visible(self): return self._visible
+            async def is_editable(self): return self._editable
+            async def get_attribute(self, name):
+                return self._ph if name == "placeholder" else "search"
+            async def click(self, timeout=5000): self._focused = True
+            async def evaluate(self, js):
+                if "activeElement" in js:
+                    return self._focused
+                return {"tag": "INPUT", "type": "search", "role": "combobox", "label": "Search", "placeholder": self._ph, "name": "search_query", "editable": True}
+            async def fill(self, text): self._val = text
+            async def input_value(self): return self._val
+
+        yt_input = FakeInput()
+
+        class FakeKeyboard:
+            def __init__(self, page): self._p = page
+            async def press(self, key):
+                if key.lower() == "enter":
+                    self._p.url = "https://www.youtube.com/results?search_query=Savarana"
+                    self._p._title = "Savarana - YouTube"
+
+        async def _z(): return 0
+
+        class FakeYTPage:
+            def __init__(self):
+                self.url = "https://www.youtube.com/"
+                self._title = "YouTube"
+                self.keyboard = FakeKeyboard(self)
+            def is_closed(self): return False
+            async def evaluate(self, js):
+                if "visibilityState" in js: return True
+                return {"sx": 0, "sy": 0, "ow": 1280, "oh": 800, "iw": 1280, "ih": 720}
+            async def title(self): return self._title
+            def locator(self, sel):
+                if "search" in sel or sel == ":focus":
+                    return yt_input
+                return SimpleNamespace(count=_z)
+            def get_by_role(self, *_a, **_k):
+                return SimpleNamespace(count=_z)
+
+        page = FakeYTPage()
+        sess = object.__new__(browser_control._BrowserSession)
+        sess.browser_name = "chrome"
+        sess._browser = None
+        sess._spec = None
+        sess._page = page
+        sess._context = SimpleNamespace(pages=[page])
+
+        typed = _run_immediate(sess.smart_type("search bar", "Savarana"))
+        self.assertIn("status=done", typed)
+        self.assertIn("field_detected=true", typed)
+        self.assertIn("field_focused=true", typed)
+        self.assertIn("text_entered=true", typed)
+        self.assertIn("entered_text=Savarana", typed)
+        self.assertIn("submission_completed=false", typed)
+        self.assertNotIn("method=placeholder", typed)
+
+        submitted = asyncio.run(sess.press("Enter"))
+        self.assertIn("status=done", submitted)
+        self.assertIn("submission_completed=true", submitted)
+        self.assertIn("page_state=search_results_loaded", submitted)
+
+    def test_real_cursor_movement_and_uncertainty_when_zero_ocr(self):
+        from core import screenact
+
+        with patch("core.screenact.available", return_value=(True, "")), \
+             patch("core.screenact._on_screen", return_value=True), \
+             patch("core.screenact.pyautogui.moveTo") as mto, \
+             patch("core.screenact.get_cursor_pos", return_value=(420, 180)), \
+             patch("core.screenact.time.sleep"):
+            act = screenact.move_cursor(screenact.Point(420, 180, origin="element", label="search bar"))
+        self.assertTrue(act.ok)
+        self.assertEqual(act.point, (420, 180))
+        self.assertIn("cursor_verified", act.detail)
+        mto.assert_called_once()
+
+        empty_view = SimpleNamespace(app="chrome.exe", title="YouTube - Chrome", source="none", degraded=True, elements=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "api_keys.json"
+            with patch.object(config_manager, "CONFIG_FILE", cfg), \
+                 patch("core.screenview.look", return_value=empty_view), \
+                 patch("core.screen_observation.describe_view", return_value="chrome.exe"), \
+                 patch("actions.browser_control.inspect_open_chrome_tabs_local", return_value=[]):
+                obs = screen_observation.inspect_local_screen("what is visible?")
+        self.assertIn("confidence=uncertain", obs)
+
+    def test_authorization_multistep_youtube_chrome_and_cursor_commands(self):
+        full_cmd = "Open YouTube in Chrome, click the search bar, type Savarana, and search."
+        for tool, args in (
+            ("browser_control", {"action": "go_to", "url": "https://www.youtube.com/", "browser": "chrome"}),
+            ("browser_control", {"action": "smart_click", "description": "search bar", "browser": "chrome"}),
+            ("browser_control", {"action": "smart_type", "description": "search bar", "text": "Savarana", "browser": "chrome"}),
+            ("browser_control", {"action": "press", "key": "Enter", "browser": "chrome"}),
+            ("desktop_ui", {"action": "move", "target": "search bar"}),
+        ):
+            with self.subTest(tool=tool, action=args["action"]):
+                ok, reason = desktop_control.authorize_user_request(full_cmd, tool, args, source="voice")
+                self.assertTrue(ok, reason)
+
+        self.assertTrue(desktop_control.authorize_user_request(
+            "Move the cursor to the center",
+            "desktop_ui", {"action": "move", "position": "center"}, source="voice")[0])
+
+        self.assertTrue(desktop_control.authorize_user_request(
+            "Put the cursor on the YouTube search bar",
+            "desktop_ui", {"action": "move", "target": "search bar"}, source="voice")[0])
+        self.assertTrue(desktop_control.authorize_user_request(
+            "Close this tab.",
+            "browser_control", {"action": "close_tab"}, source="voice")[0])
+        self.assertFalse(desktop_control.authorize_user_request(
+            "Open YouTube in Chrome",
+            "send_message", {"receiver": "Alex", "message_text": "hello"}, source="voice")[0])
+
+    def test_ram_monitor_suppresses_intrusions_and_preserves_diagnostic(self):
+        mon = SystemMonitor()
+        with patch("actions.system_monitor.psutil.cpu_percent", return_value=15.0), \
+             patch("actions.system_monitor.psutil.virtual_memory", return_value=SimpleNamespace(percent=99.0)), \
+             patch("actions.system_monitor._get_cpu_temp", return_value=-1.0), \
+             patch("actions.system_monitor._get_gpu_usage", return_value=-1.0):
+            for _ in range(7):
+                self.assertIsNone(mon.check())
+        self.assertEqual(mon.status_summary().get("ram_percent"), 99.0)
+
+
 if __name__ == "__main__":
     unittest.main()

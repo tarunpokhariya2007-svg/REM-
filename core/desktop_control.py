@@ -251,58 +251,60 @@ def authorize_user_request(user_request: str, tool: str, args: dict, *,
 
     intents = {
         "screen_agent": {
-            "observe": {"screen", "desktop", "window", "application", "look", "see", "visible", "show", "search", "open", "click", "type", "find", "scroll", "switch", "focus", "read", "inspect", "check", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube"},
-            "find": {"find", "locate", "search", "where", "identify", "look", "open", "see", "check", "whether", "visible", "whatsapp", "youtube", "chrome", "tab"},
-            "click": {"click", "select", "choose", "open", "press"},
+            "observe": {"screen", "desktop", "window", "application", "look", "see", "visible", "show", "search", "open", "click", "type", "find", "scroll", "switch", "focus", "read", "inspect", "check", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "cursor", "mouse", "put", "place"},
+            "find": {"find", "locate", "search", "where", "identify", "look", "open", "see", "check", "whether", "visible", "whatsapp", "youtube", "chrome", "tab", "cursor", "bar"},
+            "click": {"click", "select", "choose", "open", "press", "put", "focus", "search", "bar", "tap"},
             "right_click": {"right", "click", "context"},
             "double_click": {"double", "click"},
             "select": {"select", "choose"},
             "toggle": {"toggle", "enable", "disable", "turn", "switch"},
             "expand": {"expand", "open"},
             "collapse": {"collapse", "close"},
-            "hover": {"hover", "move", "cursor", "mouse"},
-            "move": {"move", "cursor", "mouse"},
-            "move_relative": {"move", "cursor", "mouse", "left", "right", "up", "down"},
-            "type": {"type", "enter", "write", "search", "fill", "paste"},
-            "press": {"press", "enter", "keyboard", "key", "shortcut", "search", "query"},
+            "hover": {"hover", "move", "cursor", "mouse", "point", "put", "place", "click", "focus", "search"},
+            "move": {"move", "cursor", "mouse", "point", "put", "place", "control", "position", "click", "focus", "search"},
+            "move_relative": {"move", "cursor", "mouse", "left", "right", "up", "down", "point", "nudge"},
+            "type": {"type", "enter", "write", "search", "fill", "paste", "put"},
+            "press": {"press", "enter", "keyboard", "key", "shortcut", "search", "query", "submit", "close", "tab"},
             "scroll": {"scroll", "page", "down", "up"},
-            "focus_window": {"focus", "switch", "bring", "window", "open"},
-            "set_mode": {"mode", "computer", "control", "assist"},
+            "focus_window": {"focus", "switch", "bring", "window", "open", "chrome", "youtube"},
+            "set_mode": {"mode", "computer", "control", "assist", "cursor"},
             "pause": {"pause", "stop", "halt"},
             "resume": {"resume", "continue", "unpause"},
             "stop": {"stop", "halt", "emergency"},
             "emergency_stop": {"stop", "halt", "emergency"},
         },
         "browser_control": {
-            "go_to": {"open", "go", "visit", "navigate", "website", "url", "browser", "chrome"},
-            "search": {"search", "find", "look", "google", "bing", "web"},
+            "go_to": {"open", "go", "visit", "navigate", "website", "url", "browser", "chrome", "youtube", "google"},
+            "search": {"search", "find", "look", "google", "bing", "web", "youtube", "query"},
             "new_tab": {"tab", "open", "new"},
-            "switch_tab": {"tab", "switch", "open", "focus", "whatsapp", "youtube", "chrome", "browser"},
-            "inspect": {"inspect", "open", "see", "check", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "page", "site", "website", "tab", "status", "loaded", "login", "url", "read"},
-            "smart_click": {"click", "open", "select", "choose", "press"},
-            "click": {"click", "open", "select", "choose"},
-            "smart_type": {"type", "enter", "search", "fill", "write"},
-            "type": {"type", "enter", "search", "fill", "write"},
+            "switch_tab": {"tab", "switch", "open", "focus", "whatsapp", "youtube", "chrome", "browser", "current"},
+            "inspect": {"inspect", "open", "see", "check", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "page", "site", "website", "tab", "status", "loaded", "login", "url", "read", "search", "cursor"},
+            "smart_click": {"click", "open", "select", "choose", "press", "search", "focus", "bar", "put", "cursor"},
+            "click": {"click", "open", "select", "choose", "focus", "search", "bar"},
+            "smart_type": {"type", "enter", "search", "fill", "write", "put"},
+            "type": {"type", "enter", "search", "fill", "write", "put"},
             "fill_form": {"fill", "form", "enter", "complete"},
             "get_text": {"read", "summarize", "page", "website", "screen", "text", "search", "open", "check", "see", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "tab", "loaded"},
             "get_url": {"url", "address", "website", "page", "where", "open", "check", "see", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "tab", "loaded"},
-            "list_browsers": {"browser", "chrome", "open", "see", "check", "whether", "verify", "which"},
+            "list_browsers": {"browser", "chrome", "edge", "open", "see", "check", "whether", "verify", "which"},
             "scroll": {"scroll", "down", "up", "page"},
-            "press": {"press", "enter", "keyboard", "key"},
+            "press": {"press", "enter", "keyboard", "key", "search", "submit", "go"},
             "back": {"back", "previous"}, "forward": {"forward", "next"},
-            "close_tab": {"close", "tab"}, "reload": {"reload", "refresh"},
+            "close_tab": {"close", "tab", "shut", "dismiss"}, "reload": {"reload", "refresh"},
+            "switch": {"switch", "use", "chrome", "edge", "firefox", "browser"},
             "close": {"close", "quit", "exit"},
             "close_all": {"close", "quit", "exit", "all"},
         },
         "computer_control": {
-            "click": {"click"}, "left_click": {"click"}, "double_click": {"double", "click"},
-            "right_click": {"right", "click"}, "type": {"type", "write", "enter"},
-            "smart_type": {"type", "write", "enter"}, "press": {"press", "key"},
-            "hotkey": {"shortcut", "hotkey", "keyboard", "press"},
-            "scroll": {"scroll", "down", "up"}, "move": {"move", "cursor", "mouse"},
+            "click": {"click", "tap", "focus"}, "left_click": {"click"}, "double_click": {"double", "click"},
+            "right_click": {"right", "click"}, "type": {"type", "write", "enter", "search"},
+            "smart_type": {"type", "write", "enter", "search"}, "press": {"press", "key", "enter", "search"},
+            "hotkey": {"shortcut", "hotkey", "keyboard", "press", "close", "tab"},
+            "scroll": {"scroll", "down", "up"},
+            "move": {"move", "cursor", "mouse", "put", "place", "point", "control"},
             "drag": {"drag"}, "screenshot": {"screenshot", "screen", "capture"},
             "screen_find": {"find", "locate", "screen", "where"},
-            "screen_click": {"click", "screen"}, "focus_window": {"focus", "switch", "window"},
+            "screen_click": {"click", "screen"}, "focus_window": {"focus", "switch", "window", "chrome"},
             "close_app": {"close", "quit", "exit"},
         },
         "open_app": {"open_app": {"open", "launch", "start"}},
@@ -365,7 +367,7 @@ def authorize_user_request(user_request: str, tool: str, args: dict, *,
                 port = parsed.port
             except ValueError:
                 return False, "The browser destination is malformed; no navigation was authorized."
-            generic_labels = {"www", "com", "org", "net", "edu", "gov", "io",
+            generic_labels = {"www", "web", "m", "com", "org", "net", "edu", "gov", "io",
                               "dev", "app", "ai", "co", "uk", "in", "us"}
             host_tokens = {part for part in _tokens(host)
                            if part not in generic_labels}
@@ -383,7 +385,7 @@ def authorize_user_request(user_request: str, tool: str, args: dict, *,
                    or (t == "browser_control" and action in {"smart_click", "click", "smart_type", "type"})
                    or (t == "computer_control" and action == "close_app")):
         target_words = {w for w in _tokens(target)
-                        if len(w) > 2 and w not in {"button", "field", "bar", "area", "window", "control"}}
+                        if len(w) > 2 and w not in {"button", "field", "bar", "box", "input", "area", "window", "control"}}
         if target_words and not (target_words & words):
             return False, "The target was not named in your request. I will not act on a target supplied by page content."
 
@@ -399,7 +401,7 @@ def authorize_user_request(user_request: str, tool: str, args: dict, *,
         url = str((args or {}).get("url") or (args or {}).get("text") or "").strip()
         host = urllib.parse.urlparse(url if "://" in url else "https://" + url).hostname or ""
         host_words = {w for w in _tokens(host)
-                      if len(w) > 2 and w not in {"www", "com", "org", "net", "co"}}
+                      if len(w) > 2 and w not in {"www", "web", "m", "com", "org", "net", "co"}}
         if host_words and not (host_words & words):
             return False, "The destination was not named in your request. I will not navigate to a site suggested by page content."
 

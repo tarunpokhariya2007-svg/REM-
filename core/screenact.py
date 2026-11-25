@@ -380,10 +380,64 @@ def _occluding_process(point: Point) -> str:
         return ""
 
 
-def _move_to(point: Point) -> None:
-    pyautogui.moveTo(point.x, point.y, duration=MOVE_S)
+def get_cursor_pos() -> tuple[int, int] | None:
+    """Return the actual OS desktop pointer position as (x, y), or None if unavailable."""
+    try:
+        if _HAS_PYAUTOGUI:
+            x, y = pyautogui.position()
+            return int(x), int(y)
+    except Exception:
+        pass
+    if _platform.system() == "Windows":
+        try:
+            import ctypes
+            class _POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+            pt = _POINT()
+            if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+                return int(pt.x), int(pt.y)
+        except Exception:
+            pass
+    return None
+
+
+def _win32_set_cursor_pos(x: int, y: int) -> bool:
+    if _platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.SetCursorPos(int(x), int(y)))
+    except Exception:
+        return False
+
+
+def _move_to(point: Point) -> tuple[tuple[int, int] | None, bool]:
+    """Move the real OS cursor to `point` and verify the pointer position."""
+    tx, ty = int(point.x), int(point.y)
+    moved = False
+    last_err = None
+    try:
+        pyautogui.moveTo(tx, ty, duration=MOVE_S)
+        moved = True
+    except Exception as exc:
+        last_err = exc
+    if not moved and _win32_set_cursor_pos(tx, ty):
+        moved = True
+    if not moved and last_err is not None:
+        raise last_err
     if HOVER_S:
         time.sleep(HOVER_S)
+    pos = get_cursor_pos()
+    if pos is not None:
+        # On multi-DPI Windows setups, SetCursorPos may land cleanly where a
+        # simulated moveTo was offset or blocked; verify and correct within ±4px.
+        if abs(pos[0] - tx) > 4 or abs(pos[1] - ty) > 4:
+            if _win32_set_cursor_pos(tx, ty):
+                time.sleep(0.02)
+                pos = get_cursor_pos() or pos
+        verified = abs(pos[0] - tx) <= 6 and abs(pos[1] - ty) <= 6
+        return pos, verified
+    return (tx, ty), True
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +489,14 @@ def click(target: Target, *, button: str = "left", clicks: int = 1,
 
     warnings: list[str] = _aim_warnings(target)
     try:
-        _move_to(point)
+        move_res = _move_to(point)
+        if isinstance(move_res, tuple) and len(move_res) == 2:
+            actual, ptr_ok = move_res
+            if not ptr_ok:
+                return _fail(action,
+                             f"pointer remained at {actual} instead of target {(point.x, point.y)}",
+                             target=point.label, origin=point.origin,
+                             point=actual or (point.x, point.y))
 
         ok, why = available()
         if not ok:
@@ -496,12 +557,17 @@ def hover(target: Target) -> Act:
         return refusal
     assert point is not None
     try:
-        _move_to(point)
+        actual, ptr_ok = _move_to(point)
+        if not ptr_ok:
+            return _fail("hover",
+                         f"pointer remained at {actual} instead of target {(point.x, point.y)}",
+                         target=point.label, origin=point.origin, point=actual or (point.x, point.y))
     except Exception as e:
         return _fail("hover", f"the cursor could not be moved: {e}",
                      target=point.label, origin=point.origin)
+    ap = actual or (point.x, point.y)
     return Act(ok=True, action="hover", target=point.label, origin=point.origin,
-               point=(point.x, point.y))
+               point=ap, detail=f"cursor_verified at {ap[0]},{ap[1]}")
 
 
 def move_cursor(target: Target) -> Act:
@@ -514,16 +580,21 @@ def move_cursor(target: Target) -> Act:
         return refusal
     assert point is not None
     try:
-        _move_to(point)
+        actual, ptr_ok = _move_to(point)
         ok, why = available()
         if not ok:
             return _fail("move", why, target=point.label, origin=point.origin,
-                         point=(point.x, point.y))
+                         point=actual or (point.x, point.y))
+        if not ptr_ok:
+            return _fail("move",
+                         f"pointer remained at {actual} instead of target {(point.x, point.y)}",
+                         target=point.label, origin=point.origin, point=actual or (point.x, point.y))
     except Exception as exc:
         return _fail("move", f"the cursor could not be moved: {exc}",
                      target=point.label, origin=point.origin)
+    ap = actual or (point.x, point.y)
     return Act(ok=True, action="move", target=point.label, origin=point.origin,
-               point=(point.x, point.y))
+               point=ap, detail=f"cursor_verified at {ap[0]},{ap[1]}")
 
 
 def move_relative(dx: int, dy: int, *, limit: int = 200) -> Act:
@@ -538,16 +609,26 @@ def move_relative(dx: int, dy: int, *, limit: int = 200) -> Act:
     if not ok:
         return _fail("move_relative", why)
     try:
-        x, y = pyautogui.position()
+        cur = get_cursor_pos()
+        if cur is None:
+            x, y = pyautogui.position()
+        else:
+            x, y = cur
         nx, ny = int(x) + dx, int(y) + dy
         if not _on_screen(nx, ny):
             return _fail("move_relative", "the resulting position is outside the desktop",
                          point=(nx, ny))
-        _move_to(Point(nx, ny, origin="relative", label="relative cursor position"))
+        actual, ptr_ok = _move_to(Point(nx, ny, origin="relative", label="relative cursor position"))
         ok, why = available()
         if not ok:
-            return _fail("move_relative", why, point=(nx, ny))
-        return Act(ok=True, action="move_relative", point=(nx, ny), origin="relative")
+            return _fail("move_relative", why, point=actual or (nx, ny))
+        if not ptr_ok:
+            return _fail("move_relative",
+                         f"pointer remained at {actual} instead of {(nx, ny)}",
+                         point=actual or (nx, ny))
+        ap = actual or (nx, ny)
+        return Act(ok=True, action="move_relative", point=ap, origin="relative",
+                   detail=f"cursor_verified at {ap[0]},{ap[1]}")
     except Exception as exc:
         return _fail("move_relative", f"the cursor could not be moved: {exc}")
 
@@ -577,11 +658,17 @@ def move_to_screen_position(position: str) -> Act:
     if not ok:
         return _fail("move", why)
     try:
-        _move_to(Point(x, y, origin="user", label=name))
+        actual, ptr_ok = _move_to(Point(x, y, origin="user", label=name))
         ok, why = available()
         if not ok:
-            return _fail("move", why, point=(x, y))
-        return Act(ok=True, action="move", target=name, origin="user", point=(x, y))
+            return _fail("move", why, point=actual or (x, y))
+        if not ptr_ok:
+            return _fail("move",
+                         f"pointer remained at {actual} instead of {(x, y)}",
+                         point=actual or (x, y))
+        ap = actual or (x, y)
+        return Act(ok=True, action="move", target=name, origin="user", point=ap,
+                   detail=f"cursor_verified at {ap[0]},{ap[1]}")
     except Exception as exc:
         return _fail("move", f"the cursor could not be moved: {exc}")
 

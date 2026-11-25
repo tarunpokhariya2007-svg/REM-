@@ -11,15 +11,15 @@ import psutil
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
 DEFAULT_THRESHOLDS = {
-    "cpu":  90.0,
-    "ram":  95.0,
-    "temp": 85.0,
-    "gpu":  95.0,
+    "cpu":  92.0,
+    "ram":  98.0,   # Critical OOM prevention only; normal ~90% RAM never triggers interruptions
+    "temp": 88.0,
+    "gpu":  98.0,
 }
 
-_COOLDOWN   = 300
-_CPU_STREAK = 3
-_RAM_STREAK = 3
+_COOLDOWN   = 1800  # Suppress duplicate warnings for 30 minutes
+_CPU_STREAK = 4
+_RAM_STREAK = 6     # Sustained critical memory pressure only
 
 # ── NVML DLL cache (Windows: nvml.dll, Linux: libnvidia-ml.so.1) ─────────────
 _nvml_lib: object = None
@@ -146,12 +146,18 @@ class SystemMonitor:
         self._last_alert: dict[str, float] = {}
         self._cpu_streak  = 0
         self._ram_streak  = 0
+        self.last_metrics: dict[str, float] = {}
+        self._ram_warned_episode = False
 
     def _can_alert(self, key: str) -> bool:
         return (time.monotonic() - self._last_alert.get(key, 0)) > _COOLDOWN
 
     def _record(self, key: str):
         self._last_alert[key] = time.monotonic()
+
+    def status_summary(self) -> dict:
+        """Return latest background diagnostic snapshot without raising alerts."""
+        return dict(self.last_metrics)
 
     def check(self) -> str | None:
         try:
@@ -162,15 +168,26 @@ class SystemMonitor:
         except Exception:
             return None
 
+        self.last_metrics = {
+            "cpu_percent": round(float(cpu), 1),
+            "ram_percent": round(float(ram), 1),
+            "cpu_temp_c": round(float(temp), 1) if temp > 0 else -1.0,
+            "gpu_percent": round(float(gpu), 1) if gpu >= 0 else -1.0,
+            "memory_pressure": "critical" if ram >= self.thresholds["ram"] else (
+                "elevated" if ram >= 85.0 else "normal"
+            ),
+        }
+
+        if ram < 85.0:
+            self._ram_warned_episode = False
+
         alerts: list[str] = []
 
         if cpu >= self.thresholds["cpu"]:
             self._cpu_streak += 1
             if self._cpu_streak >= _CPU_STREAK and self._can_alert("cpu"):
                 alerts.append(
-                    f"[SYSTEM_ALERT] CPU usage has been critically high ({cpu:.0f}%) "
-                    "for several seconds. Warn the user in their language and suggest "
-                    "closing heavy applications."
+                    f"[SYSTEM_ALERT] CPU usage has remained critical ({cpu:.0f}%)."
                 )
                 self._record("cpu")
                 self._cpu_streak = 0
@@ -179,29 +196,20 @@ class SystemMonitor:
 
         if ram >= self.thresholds["ram"]:
             self._ram_streak += 1
-            if self._ram_streak >= _RAM_STREAK and self._can_alert("ram"):
-                alerts.append(
-                    f"[SYSTEM_ALERT] RAM is at {ram:.0f}% — nearly exhausted. "
-                    "Warn the user in their language and suggest freeing memory."
-                )
+            if self._ram_streak >= _RAM_STREAK and not self._ram_warned_episode and self._can_alert("ram"):
+                print(f"[Monitor] Critical memory pressure diagnostic: RAM={ram:.0f}%")
                 self._record("ram")
+                self._ram_warned_episode = True
                 self._ram_streak = 0
+                # Background RAM pressure stays diagnostic unless caller explicitly checks;
+                # never emit intrusive "close programs" prompts that hijack user tasks.
         else:
             self._ram_streak = 0
 
         if temp > 0 and temp >= self.thresholds["temp"] and self._can_alert("temp"):
             alerts.append(
-                f"[SYSTEM_ALERT] CPU temperature is {temp:.0f}°C — above the safe limit. "
-                "Warn the user in their language and advise reducing system load "
-                "or checking cooling."
+                f"[SYSTEM_ALERT] CPU temperature is {temp:.0f}°C — above safe thermal limits."
             )
             self._record("temp")
-
-        if gpu >= 0 and gpu >= self.thresholds["gpu"] and self._can_alert("gpu"):
-            alerts.append(
-                f"[SYSTEM_ALERT] GPU load is at {gpu:.0f}%. "
-                "Briefly inform the user in their language."
-            )
-            self._record("gpu")
 
         return " ".join(alerts) if alerts else None

@@ -245,8 +245,12 @@ def _scroll(direction: str = "down", amount: int = 3) -> str:
 def _move(x: int, y: int, duration: float = 0.3) -> str:
     _ensure_control_active()
     _require_pyautogui()
-    pyautogui.moveTo(x, y, duration=duration)
-    return f"Mouse → ({x}, {y})"
+    from core import screenact
+    actual, ptr_ok = screenact._move_to(screenact.Point(int(x), int(y), origin="user", label="coordinates"))
+    if not ptr_ok:
+        raise RuntimeError(f"cursor remained at {actual} instead of ({x}, {y})")
+    ap = actual or (int(x), int(y))
+    return f"Mouse → ({ap[0]}, {ap[1]}) [cursor_verified]"
 
 
 def _drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5) -> str:

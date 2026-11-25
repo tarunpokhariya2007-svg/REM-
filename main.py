@@ -754,6 +754,7 @@ class RemLive:
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
+        self._active_tool_calls = 0
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
@@ -2020,6 +2021,13 @@ class RemLive:
         return out
 
     async def _execute_tool(self, fc, request_context=_REQUEST_CONTEXT_UNSET) -> types.FunctionResponse:
+        self._active_tool_calls = getattr(self, "_active_tool_calls", 0) + 1
+        try:
+            return await self._execute_tool_inner(fc, request_context=request_context)
+        finally:
+            self._active_tool_calls = max(0, getattr(self, "_active_tool_calls", 1) - 1)
+
+    async def _execute_tool_inner(self, fc, request_context=_REQUEST_CONTEXT_UNSET) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
         if request_context is _REQUEST_CONTEXT_UNSET:
@@ -3361,19 +3369,25 @@ class RemLive:
     # ── System monitor ──────────────────────────────────────────────────────────
 
     async def _run_system_monitor(self) -> None:
-        """Background task: voice alerts when metrics exceed thresholds."""
+        """Background task: diagnostic system monitoring that never interrupts active tasks."""
         while True:
             await asyncio.sleep(10)
             alert = await asyncio.to_thread(self._sys_monitor.check)
             if not alert or not self.session or not self._awake:
                 continue
-            # Don't interrupt an active conversation or an active expression pose
+            # Strictly respect EXPLICIT USER REQUEST > ACTIVE TASK EXECUTION > BACKGROUND MONITORING
             with self._speaking_lock:
                 speaking = self._is_speaking
             now_m = time.monotonic()
             if (speaking
-                    or (now_m - self._last_user_speech) < 60
+                    or getattr(self, "_active_tool_calls", 0) > 0
+                    or (now_m - self._last_user_speech) < 120
                     or now_m < getattr(self, "_explicit_expr_until", 0.0)):
+                continue
+            # Never hijack conversation with unsolicited RAM/close-program warnings;
+            # keep non-critical alerts as internal diagnostics only.
+            if "RAM" in alert:
+                print(f"[Monitor] Diagnostic suppressed to protect user workflow: {alert}")
                 continue
             try:
                 await self.session.send_client_content(

@@ -543,6 +543,60 @@ def _detect_default_browser() -> str:
     return "chrome"
 
 
+def _detect_running_browser() -> str:
+    """Return an already-running browser, preferring foreground then Chrome first."""
+    try:
+        from core import screenview
+        fg_app, _fg_title, _pid, _hwnd = screenview._foreground()
+        fg_cf = str(fg_app or "").casefold()
+        for b in ("chrome", "firefox", "brave", "opera", "vivaldi", "edge"):
+            if b in fg_cf or (b == "edge" and "msedge" in fg_cf):
+                return b
+    except Exception:
+        pass
+    for b in ("chrome", "firefox", "brave", "opera", "vivaldi", "edge"):
+        try:
+            if appidentity.running(b):
+                return b
+        except Exception:
+            continue
+    return ""
+
+
+def _discover_running_cdp_endpoint(browser_name: str) -> str | None:
+    """Best-effort loopback CDP discovery ONLY for an already-running browser."""
+    import socket
+    browser = str(browser_name or "").casefold().strip()
+    if browser not in {"chrome", "edge"}:
+        return None
+    try:
+        if not appidentity.running(browser):
+            return None
+    except Exception:
+        return None
+    candidates: list[tuple[str, int]] = []
+    if _OS == "Windows" and browser == "chrome":
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            port_file = Path(local) / "Google" / "Chrome" / "User Data" / "DevToolsActivePort"
+            if port_file.exists():
+                try:
+                    lines = port_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    port = int(lines[0].strip())
+                    if 1024 <= port <= 65535:
+                        candidates.append(("127.0.0.1", port))
+                except Exception:
+                    pass
+    candidates.append(("127.0.0.1", 9222))
+    for host, port in candidates:
+        try:
+            with socket.create_connection((host, port), timeout=0.15):
+                return f"http://{host}:{port}"
+        except OSError:
+            continue
+    return None
+
+
 _SEARCH_ENGINES: dict[str, str] = {
     "google":     "https://www.google.com/search?q=",
     "bing":       "https://www.bing.com/search?q=",
@@ -653,7 +707,8 @@ def inspect_open_chrome_tabs_local(browser_name: str = "chrome") -> list[str]:
     return found
 
 
-def _verify_native_browser(name: str, url: str, *, timeout_s: float | None = None) -> str:
+def _verify_native_browser(name: str, url: str, *, timeout_s: float | None = None,
+                           reused_existing: bool = False) -> str:
     """Verify native browser launch and active window/tab state when possible."""
     import time as _time
     if timeout_s is None:
@@ -700,16 +755,17 @@ def _verify_native_browser(name: str, url: str, *, timeout_s: float | None = Non
 
     if not url:
         if running:
-            print(f"[Browser] Verified launch browser={name} windows={len(all_browser_titles)}")
+            print(f"[Browser] Verified launch browser={name} reused={reused_existing} windows={len(all_browser_titles)}")
             return outcome.done("browser_control", browser=name, opened=True,
                                 verified=True, browser_launched=True,
+                                reused_existing=reused_existing,
                                 page_state="loaded" if all_browser_titles else "open")
         print(f"[Browser] Unverified launch browser={name} (process not detected)")
         return outcome.unverified(
             "browser_control",
             "the browser was launched but has not appeared in the process list yet",
-            browser=name, browser_launched=False, page_state="unverified",
-            verification_step="process_presence",
+            browser=name, browser_launched=False, reused_existing=reused_existing,
+            page_state="unverified", verification_step="process_presence",
         )
 
     if matched_title:
@@ -720,17 +776,20 @@ def _verify_native_browser(name: str, url: str, *, timeout_s: float | None = Non
                 "browser_control",
                 f"the page reported an error ({matched_title})",
                 browser=name, url=observed_url or url, title=matched_title,
-                page_state="error", browser_launched=running, navigation_requested=True,
+                page_state="error", browser_launched=running,
+                reused_existing=reused_existing, navigation_requested=True,
             )
-        print(f"[Browser] Verified native navigation browser={name} url={observed_url or url} page_state={page_state}")
+        print(f"[Browser] Verified native navigation browser={name} reused={reused_existing} url={observed_url or url} page_state={page_state}")
         return outcome.done(
             "browser_control",
             verified=True,
             browser=name,
             url=observed_url or url,
             title=matched_title,
+            active_tab=matched_title,
             page_state=page_state,
             browser_launched=running,
+            reused_existing=reused_existing,
             navigation_requested=True,
             navigation_completed=True,
         )
@@ -742,6 +801,7 @@ def _verify_native_browser(name: str, url: str, *, timeout_s: float | None = Non
         browser=name,
         url=url,
         browser_launched=running,
+        reused_existing=reused_existing,
         navigation_requested=True,
         navigation_completed=False,
         page_state="unverified",
@@ -749,40 +809,42 @@ def _verify_native_browser(name: str, url: str, *, timeout_s: float | None = Non
     )
 
 
-def _native_outcome(name: str, url: str) -> str:
+def _native_outcome(name: str, url: str, *, reused_existing: bool = False) -> str:
     """Backward-compatible wrapper returning structured browser verification."""
-    return _verify_native_browser(name, url)
+    return _verify_native_browser(name, url, reused_existing=reused_existing)
 
 
 def _open_native(url: str, browser_name: Optional[str]) -> str:
     """
     Opens the user's REAL browser normally — with their own profile,
-    logged-in accounts and extensions. No automation attaches, so an
-    about:blank tab or a blank profile NEVER shows up.
-    If url is empty the browser starts with no URL (its own start page /
-    session restore) — exactly as if the user had opened it themselves.
-    Works on all three of Windows / macOS / Linux.
+    logged-in accounts and extensions. Never silently substitutes another
+    browser when `browser_name` is explicitly specified.
     """
     url = _normalize_url(url) if url and url.strip() else ""
     if url == "about:blank":
         url = ""
 
+    explicit_browser = bool(browser_name and str(browser_name).strip())
     name = None
-    if browser_name:
+    if explicit_browser:
         name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
-    elif not url:
-        # No URL → only a window will open; needs the default browser's exe
-        name = _detect_default_browser()
+        _registry.note_active_browser(name)
+    else:
+        name = _registry._active_browser or _detect_running_browser() or _detect_default_browser()
 
-    # Specific browser → launch its own executable, exactly like the user would.
+    # Specific browser → launch or reuse its own executable, never silently substitute Edge.
     if name:
+        try:
+            reused_existing = bool(appidentity.running(name))
+        except Exception:
+            reused_existing = False
         if _OS == "Darwin":
             app = _MAC_APP_NAMES.get(name)
             if app:
                 cmd = ["open", "-a", app] + ([url] if url else [])
                 try:
                     subprocess.run(cmd, check=True, timeout=10)
-                    return _native_outcome(name, url)
+                    return _native_outcome(name, url, reused_existing=reused_existing)
                 except Exception as e:
                     print(f"[Browser] 'open -a {app}' failed ({e}), trying binary…")
 
@@ -795,13 +857,23 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
                 exe = _find_exe_windows(_WIN_EXE_HINTS.get(name, name))
         if exe:
             try:
-                subprocess.Popen(
-                    [exe] + _launch_flags(name) + ([url] if url else []),
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                return _native_outcome(name, url)
+                args = [exe] + (_launch_flags(name) if not reused_existing else []) + ([url] if url else [])
+                subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return _native_outcome(name, url, reused_existing=reused_existing)
             except Exception as e:
                 print(f"[Browser] Native launch failed for {name}: {e}")
+                if explicit_browser:
+                    return outcome.failed(
+                        "browser_control",
+                        f"requested browser '{name}' failed to launch ({e}); did not substitute another browser",
+                        browser=name, url=url, reused_existing=reused_existing,
+                    )
+        if explicit_browser:
+            return outcome.failed(
+                "browser_control",
+                f"requested browser '{name}' was not found on this system; did not substitute another browser",
+                browser=name, url=url, reused_existing=False,
+            )
         print(f"[Browser] '{name}' not found — falling back to default browser.")
 
     if not url:
@@ -967,6 +1039,10 @@ class _BrowserSession:
                 self._browser = self._context = self._page = None
 
         endpoint = _configured_browser_cdp_endpoint(self.browser_name)
+        auto_cdp = False
+        if not endpoint:
+            endpoint = _discover_running_cdp_endpoint(self.browser_name)
+            auto_cdp = bool(endpoint)
         if endpoint:
             if self.browser_name in {"chrome", "edge"}:
                 browser = None
@@ -985,7 +1061,7 @@ class _BrowserSession:
                     # through the ordinary browser read tools before acting.
                     self._page = pages[-1] if pages else None
                     self.profile_kind = "attached"
-                    print(f"[Browser] Attached to explicitly configured local {self.browser_name.title()} CDP session")
+                    print(f"[Browser] Attached to existing local {self.browser_name.title()} CDP session")
                     return
                 except Exception as exc:
                     if browser is not None:
@@ -993,11 +1069,12 @@ class _BrowserSession:
                             await browser.close()
                         except Exception:
                             pass
-                    raise RuntimeError(
-                        "Could not attach to the configured local browser CDP endpoint; "
-                        "no browser action was taken. Check that the selected browser "
-                        "was explicitly started with a loopback-only debugging port."
-                    ) from exc
+                    if not auto_cdp:
+                        raise RuntimeError(
+                            "Could not attach to the configured local browser CDP endpoint; "
+                            "no browser action was taken. Check that the selected browser "
+                            "was explicitly started with a loopback-only debugging port."
+                        ) from exc
 
         if self._spec is None:
             raise RuntimeError(
@@ -1321,15 +1398,25 @@ class _BrowserSession:
                         return "Enter could submit this form; use an explicit named button, which will request confirmation when consequential."
             await page.keyboard.press(key)
             if search_submit:
-                await asyncio.sleep(0.25)
                 actual_url = page.url
-                if actual_url != before_url:
+                for _ in range(12):
+                    await asyncio.sleep(0.15)
+                    actual_url = page.url
+                    if actual_url != before_url:
+                        break
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ""
+                results_loaded = (actual_url != before_url) or ("search_query=" in actual_url) or ("q=" in actual_url)
+                if results_loaded:
                     return outcome.done(
                         "browser_control", action="search_submit", verified=True,
-                        navigation_confirmed=True, actual_url=actual_url)
+                        submission_completed=True, page_state="search_results_loaded",
+                        navigation_confirmed=True, actual_url=actual_url, title=title)
                 return outcome.unverified(
-                    "browser_control", "Enter was sent to the search field, but no URL change was confirmed",
-                    actual_url=actual_url)
+                    "browser_control", "Enter was sent to the search field, but no URL or results change was confirmed",
+                    submission_completed=False, actual_url=actual_url)
             return f"Pressed: {key}; current page: {page.url}"
         except Exception as e:
             return f"Key error: {e}"
@@ -1581,39 +1668,144 @@ class _BrowserSession:
         except Exception:
             return (page.url, "", "")
 
+    async def _locate_search_input(self, page):
+        """Return (method, locator) for a real visible editable search input (YouTube/generic)."""
+        try:
+            host = (urlsplit(page.url).hostname or "").casefold()
+        except Exception:
+            host = ""
+        selectors = []
+        if "youtube.com" in host:
+            selectors.extend([
+                ("youtube_search_selector", "ytd-searchbox input#search"),
+                ("youtube_search_selector", "input[name='search_query']"),
+                ("youtube_search_combobox", "input[role='combobox'][aria-label*='Search' i]"),
+            ])
+        selectors.extend([
+            ("searchbox_selector", "input[type='search']"),
+            ("role=searchbox", None),
+        ])
+        for method, sel in selectors:
+            try:
+                loc = page.locator(sel) if sel else page.get_by_role("searchbox")
+                cnt = await loc.count()
+                if cnt == 0:
+                    continue
+                for idx in range(min(cnt, 6)):
+                    cand = loc.nth(idx) if cnt > 1 else loc
+                    if await cand.is_visible() and await cand.is_editable():
+                        return method, cand, cnt
+            except Exception:
+                continue
+        return None, None, 0
+
+    async def locate_element_screen_rect(self, description: str) -> dict | None:
+        """Return desktop-screen coordinates for a DOM control when page is visible."""
+        page = await self._get_page()
+        if not await self._page_visible_for_action(page):
+            return None
+        desc_cf = str(description or "").strip().casefold()
+        loc = None
+        if desc_cf in {"search", "search bar", "search box", "search field", "searchbox", "youtube search bar"}:
+            _m, loc, _cnt = await self._locate_search_input(page)
+        if loc is None:
+            for probe in (
+                page.get_by_role("searchbox", name=description),
+                page.get_by_role("combobox", name=description),
+                page.get_by_role("textbox", name=description),
+                page.get_by_label(description, exact=False),
+                page.get_by_role("button", name=description),
+            ):
+                try:
+                    if await probe.count() == 1 and await probe.is_visible():
+                        loc = probe
+                        break
+                except Exception:
+                    continue
+        if loc is None:
+            return None
+        box = await loc.bounding_box()
+        if not box or box["width"] <= 0 or box["height"] <= 0:
+            return None
+        win = await page.evaluate(
+            "() => ({sx: window.screenX || 0, sy: window.screenY || 0, "
+            "ow: window.outerWidth || 0, oh: window.outerHeight || 0, "
+            "iw: window.innerWidth || 0, ih: window.innerHeight || 0})"
+        )
+        chrome_x = max(0.0, (float(win.get("ow", 0)) - float(win.get("iw", 0))) / 2.0)
+        chrome_y = max(0.0, float(win.get("oh", 0)) - float(win.get("ih", 0)) - 8.0)
+        cx = int(round(float(win.get("sx", 0)) + chrome_x + box["x"] + box["width"] / 2.0))
+        cy = int(round(float(win.get("sy", 0)) + chrome_y + box["y"] + box["height"] / 2.0))
+        return {
+            "x": cx, "y": cy,
+            "left": int(round(float(win.get("sx", 0)) + chrome_x + box["x"])),
+            "top": int(round(float(win.get("sy", 0)) + chrome_y + box["y"])),
+            "width": int(round(box["width"])),
+            "height": int(round(box["height"])),
+            "url": page.url,
+            "browser": self.browser_name,
+        }
+
     async def smart_type(self, description: str, text: str) -> str:
         page = await self._get_page()
         if not await self._page_visible_for_action(page):
             return outcome.unverified(
                 "browser_control", "browser page is hidden; no text was entered")
         generic_search = str(description or "").strip().casefold() in {
-            "search", "search bar", "search box", "search field", "searchbox",
+            "search", "search bar", "search box", "search field", "searchbox", "youtube search bar",
         }
-        searchboxes = page.get_by_role("searchbox")
         if generic_search:
             try:
-                count = await searchboxes.count()
-                if count > 1:
-                    return "Multiple search boxes are visible; no text was entered. Name the site or field."
-                if count == 1:
-                    if not await searchboxes.is_visible() or not await searchboxes.is_enabled():
-                        return "The search box is not visible and enabled; no text was entered."
-                    await searchboxes.fill(str(text))
-                    if await searchboxes.input_value() == str(text):
-                        return outcome.done("browser_control", field="search box",
-                                            method="role=searchbox", verified=True)
-                    return outcome.unverified(
-                        "browser_control", "search box text did not read back exactly")
+                method, el, cnt = await self._locate_search_input(page)
+                if el is None:
+                    return (
+                        "Multiple or no visible editable search boxes matched cleanly."
+                        if cnt > 1 else
+                        "No visible, editable search box was found on this page."
+                    )
+                if (await el.get_attribute("type") or "").casefold() == "password":
+                    return "Password fields are protected. Enter credentials yourself."
+                await el.click(timeout=5_000)
+                field_focused = bool(await el.evaluate("el => document.activeElement === el"))
+                await el.fill(str(text))
+                entered_value = await el.input_value()
+                placeholder_text = str(await el.get_attribute("placeholder") or "")
+                text_entered = (
+                    entered_value == str(text)
+                    and not (placeholder_text and entered_value == placeholder_text and str(text) != placeholder_text)
+                )
+                if text_entered:
+                    return outcome.done(
+                        "browser_control",
+                        field=description or "search bar",
+                        method=method,
+                        field_detected=True,
+                        field_focused=field_focused,
+                        text_entered=True,
+                        entered_text=entered_value,
+                        submission_completed=False,
+                        verified=True,
+                    )
+                return outcome.unverified(
+                    "browser_control",
+                    "search box input value did not match the requested text after typing",
+                    field_detected=True,
+                    field_focused=field_focused,
+                    text_entered=False,
+                    entered_text=entered_value,
+                    submission_completed=False,
+                )
             except Exception as exc:
                 return outcome.failed(
                     "browser_control",
                     f"the search box changed or became unavailable ({type(exc).__name__}); no result is confirmed")
+
         candidates = [
-            ("placeholder", page.get_by_placeholder(description, exact=False)),
             ("label",       page.get_by_label(description, exact=False)),
-            ("role",        page.get_by_role("textbox", name=description)),
+            ("role_textbox", page.get_by_role("textbox", name=description)),
             ("searchbox",   page.get_by_role("searchbox")),
             ("combobox",    page.get_by_role("combobox", name=description)),
+            ("placeholder_attr", page.get_by_placeholder(description, exact=False)),
         ]
         for method, loc in candidates:
             try:
@@ -1621,22 +1813,55 @@ class _BrowserSession:
                 if count == 0:
                     continue
                 if count > 1:
-                    return f"Multiple inputs match {description!r}; no text was entered."
-                el = loc
-                if not await el.is_editable():
+                    visible_matches = []
+                    for idx in range(min(count, 6)):
+                        cand = loc.nth(idx)
+                        if await cand.is_visible() and await cand.is_editable():
+                            visible_matches.append(cand)
+                    if len(visible_matches) != 1:
+                        return f"Multiple inputs match {description!r}; no text was entered."
+                    el = visible_matches[0]
+                else:
+                    el = loc
+                if not await el.is_visible() or not await el.is_editable():
+                    continue
+                meta = await el.evaluate(
+                    "el => ({tag: el.tagName, editable: !!el.isContentEditable, placeholder: el.getAttribute('placeholder') || ''})"
+                )
+                if meta.get("tag") not in ("INPUT", "TEXTAREA") and not meta.get("editable"):
                     continue
                 if (await el.get_attribute("type") or "").casefold() == "password":
                     return "Password fields are protected. Enter credentials yourself."
+                await el.click(timeout=5_000)
+                field_focused = bool(await el.evaluate("el => document.activeElement === el"))
                 await el.fill(str(text))
                 value = await el.input_value()
-                if value == str(text):
-                    return outcome.done("browser_control", field=description,
-                                        method=method, verified=True)
-                return outcome.unverified("browser_control",
-                                          f"text in {description!r} did not read back exactly")
+                ph = str(meta.get("placeholder") or "")
+                text_entered = value == str(text) and not (ph and value == ph and str(text) != ph)
+                if text_entered:
+                    return outcome.done(
+                        "browser_control",
+                        field=description,
+                        method="dom_editable_verified",
+                        field_detected=True,
+                        field_focused=field_focused,
+                        text_entered=True,
+                        entered_text=value,
+                        submission_completed=False,
+                        verified=True,
+                    )
+                return outcome.unverified(
+                    "browser_control",
+                    f"text in {description!r} did not read back exactly",
+                    field_detected=True,
+                    field_focused=field_focused,
+                    text_entered=False,
+                    entered_text=value,
+                    submission_completed=False,
+                )
             except Exception:
                 continue
-        return f"Could not find input: '{description}'"
+        return f"Could not find editable input: '{description}'"
 
     async def new_tab(self, url: str = "") -> str:
         page = await self._get_page()
@@ -1698,11 +1923,29 @@ class _BrowserSession:
     async def close_tab(self) -> str:
         page = self._page
         if page and not page.is_closed():
+            try:
+                dirty = await page.evaluate(
+                    "() => [...document.querySelectorAll('textarea, input:not([type=hidden])')]"
+                    ".some(el => el.type !== 'search' && el.getAttribute('role') !== 'searchbox' "
+                    "&& el.name !== 'search_query' && el.id !== 'search' "
+                    "&& (el.value || '').trim().length > 0 && el.value !== el.defaultValue)"
+                )
+                if dirty:
+                    return "CONFIRM_REQUIRED: close tab containing unsaved form input"
+            except Exception:
+                pass
             ctx   = page.context
+            closed_url = getattr(page, "url", "")
             await page.close()
             pages = ctx.pages
             self._page = pages[-1] if pages else None
-            return "Tab closed."
+            return outcome.done(
+                "browser_control",
+                action="close_tab",
+                closed_url=closed_url,
+                verified=True,
+                active_url=(self._page.url if self._page else ""),
+            )
         return "No active tab to close."
 
     async def screenshot(self, path: str = None) -> str:
@@ -1776,9 +2019,21 @@ class _SessionRegistry:
                 print(f"[Registry] New session: {browser_name}")
             return self._sessions[browser_name]
 
+    def note_active_browser(self, browser_name: str | None) -> str:
+        if not browser_name:
+            return self._active_browser
+        name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+        with self._lock:
+            self._active_browser = name
+        return name
+
     def get(self, browser_name: str | None = None) -> _BrowserSession:
         if not browser_name:
-            browser_name = self._active_browser or _detect_default_browser()
+            browser_name = (
+                self._active_browser
+                or _detect_running_browser()
+                or _detect_default_browser()
+            )
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
         sess = self._get_or_create(browser_name)
         self._active_browser = browser_name
@@ -1825,6 +2080,23 @@ class _SessionRegistry:
 
 
 _registry = _SessionRegistry()
+
+
+def locate_control_screen_point(description: str, app_hint: str = "") -> dict | None:
+    """Resolve desktop screen coordinates for a control in the active browser session."""
+    app_cf = str(app_hint or "").casefold()
+    browser = None
+    for b in ("chrome", "edge", "firefox", "brave", "opera", "vivaldi"):
+        if b in app_cf or (b == "edge" and "msedge" in app_cf):
+            browser = b
+            break
+    if not _registry.has(browser):
+        return None
+    try:
+        sess = _registry.get(browser)
+        return sess.run(sess.locate_element_screen_rect(description), timeout=8)
+    except Exception:
+        return None
 
 # Every action this tool answers to. One list, used by the failure message and
 # by nothing else — it exists so that being told "that is not an action" also
@@ -1874,6 +2146,9 @@ def _browser_control_impl(
     browser = params.get("browser", "").lower().strip() or None
     result  = _unknown_action(action)
 
+    if browser:
+        _registry.note_active_browser(browser)
+
     # A visible label/selector that implies a consequential click is never
     # trusted as permission by itself. The person approves it in the HUD.
     target_text = " ".join(str(params.get(k) or "") for k in
@@ -1885,7 +2160,7 @@ def _browser_control_impl(
     needs_confirm = (
         (action in ("click", "smart_click")
          and any(term in target_text for term in sensitive_terms))
-        or action in ("close", "close_all", "close_tab")
+        or action in ("close", "close_all")
     )
     if not _approved_internal and needs_confirm:
         from core import confirm
@@ -1970,9 +2245,9 @@ def _browser_control_impl(
         _log(player, result)
         return result
 
-    # Native read-only inspection fallback when no Playwright/CDP session is attached yet
+    # Native read-only inspection or explicit tab close when no Playwright session is attached yet
     if action in ("get_url", "get_text", "inspect") and not _registry.has(browser):
-        bname = browser or _detect_default_browser()
+        bname = browser or _registry._active_browser or _detect_running_browser() or _detect_default_browser()
         tabs = inspect_open_chrome_tabs_local(bname)
         if tabs:
             result = outcome.done(
@@ -1983,9 +2258,35 @@ def _browser_control_impl(
         else:
             result = outcome.unverified(
                 "browser_control",
-                "no controllable browser tab or active Chrome window title was found",
+                f"no controllable {bname} tab or active browser window title was found",
                 browser=bname, page_state="unverified", verification_step="open_browser_window",
             )
+        _log(player, result)
+        return result
+
+    if action == "close_tab" and not _registry.has(browser):
+        bname = browser or _registry._active_browser or _detect_running_browser() or _detect_default_browser()
+        try:
+            from core import screenact, screenview
+            act = screenact.focus_app(bname)
+            if act.ok:
+                fg_app, fg_title, _pid, _hwnd = screenview._foreground()
+                if bname in str(fg_app or "").casefold() or (bname == "edge" and "msedge" in str(fg_app or "").casefold()):
+                    key_act = screenact.press("ctrl+w")
+                    if key_act.ok:
+                        result = outcome.done(
+                            "browser_control", action="close_tab",
+                            browser=bname, closed_title=fg_title, verified=True,
+                        )
+                        _log(player, result)
+                        return result
+        except Exception:
+            pass
+        result = outcome.failed(
+            "browser_control",
+            f"no open {bname} tab or controllable browser session was found to close",
+            browser=bname,
+        )
         _log(player, result)
         return result
 
