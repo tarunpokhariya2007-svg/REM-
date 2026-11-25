@@ -193,7 +193,9 @@ def _write_file(
 ) -> str:
     model = _get_model(MODEL_WRITER)
 
-    file_path = file_info["path"]
+    file_path = _safe_rel(project_dir, file_info.get("path", ""))
+    if file_path is None:
+        raise ValueError("Refusing to write a project file outside its project directory.")
     file_desc = file_info.get("description", "")
     file_imports = file_info.get("imports", [])
 
@@ -255,7 +257,8 @@ Code for {file_path}:"""
         response = model.generate_content(prompt)
         code = _strip_fences(response.text)
 
-        full_path = project_dir / file_path
+        full_path = (project_dir / file_path).resolve()
+        full_path.relative_to(project_dir.resolve())
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(code, encoding="utf-8")
 
@@ -279,15 +282,18 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
 
 def _open_vscode(project_dir: Path) -> bool:
     vscode_candidates = [
-        "code",
-        rf"C:\Users\{Path.home().name}\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd",
-        r"C:\Program Files\Microsoft VS Code\bin\code.cmd",
+        shutil.which("Code.exe"),
+        shutil.which("code.exe"),
+        rf"C:\Users\{Path.home().name}\AppData\Local\Programs\Microsoft VS Code\Code.exe",
+        r"C:\Program Files\Microsoft VS Code\Code.exe",
     ]
     for cmd in vscode_candidates:
+        if not cmd:
+            continue
         try:
             subprocess.Popen(
                 [cmd, str(project_dir)],
-                shell=True,
+                shell=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
@@ -456,7 +462,12 @@ Fixed code for {fix_path}:"""
             response = model.generate_content(prompt)
             fixed = _strip_fences(response.text)
 
-            full_path = project_dir / fix_path
+            safe_fix_path = _safe_rel(project_dir, fix_path)
+            if safe_fix_path is None:
+                print(f"[DevAgent] Refused an unsafe repair path.")
+                continue
+            full_path = (project_dir / safe_fix_path).resolve()
+            full_path.relative_to(project_dir.resolve())
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(fixed, encoding="utf-8")
 
@@ -504,7 +515,24 @@ def _build_project(
     project_dir.mkdir(parents=True, exist_ok=True)
 
     files        = plan.get("files", [])
-    entry_point  = plan.get("entry_point", "main.py")
+    if not isinstance(files, list):
+        return "The generated project plan had an invalid file list; nothing was written."
+    sanitized_files = []
+    seen_paths = set()
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        safe_path = _safe_rel(project_dir, item.get("path", ""))
+        if safe_path is None:
+            return "The generated project plan included an unsafe file path; nothing was written."
+        if safe_path in seen_paths:
+            return "The generated project plan included duplicate file paths; nothing was written."
+        seen_paths.add(safe_path)
+        sanitized_files.append({**item, "path": safe_path})
+    files = sanitized_files
+    entry_point  = _safe_rel(project_dir, plan.get("entry_point", "main.py"))
+    if entry_point is None:
+        return "The generated project plan included an unsafe entry point; nothing was written."
     run_command  = plan.get("run_command", f"python {entry_point}")
     dependencies = plan.get("dependencies", [])
 
@@ -894,8 +922,13 @@ def _json_object(text: str) -> dict:
 def _safe_rel(folder: Path, rel: str) -> str | None:
     """A model-supplied path, as a clean relative path inside the folder, or
     None if it points anywhere else."""
-    rel = str(rel or "").strip().replace("\\", "/").lstrip("/")
-    if not rel or rel.startswith("~") or ":" in rel:
+    raw = str(rel or "").strip()
+    # Do not normalize absolute paths into apparently safe relative paths.
+    if (not raw or raw.startswith(("/", "\\", "~")) or
+            re.match(r"^[A-Za-z]:", raw) or "\x00" in raw):
+        return None
+    rel = raw.replace("\\", "/")
+    if rel.startswith("//"):
         return None
     parts = Path(rel).parts
     if ".." in parts or any(p in _SKIP_DIRS for p in parts):

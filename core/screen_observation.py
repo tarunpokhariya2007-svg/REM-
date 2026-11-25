@@ -88,6 +88,15 @@ def prepare_image_for_live(image: bytes, mime_type: str) -> bytes:
     return raw
 
 
+def assert_cloud_image_egress_allowed() -> None:
+    """Gate every desktop screenshot before pixels are captured or uploaded."""
+    from memory.config_manager import get_cloud_screen_vision_enabled
+    if not get_cloud_screen_vision_enabled():
+        raise PermissionError("Cloud screen vision is disabled; desktop pixels were not shared.")
+    from core.screenview import assert_observation_allowed
+    assert_observation_allowed()
+
+
 def vision_question(question: str, context: str, *, user_request: str = "") -> str:
     """Keep screen contents explicitly untrusted and send metadata with image."""
     return (

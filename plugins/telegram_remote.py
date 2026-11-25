@@ -6,6 +6,7 @@ on_text_command callback. It never evaluates text as code or invokes a shell.
 from __future__ import annotations
 
 import queue
+import hmac
 import threading
 import time
 from plugins._common import config, data_file, plugin, read_json, write_json, safe_run
@@ -15,6 +16,11 @@ PLUGIN_SETTINGS={"namespace":"telegram_remote","title":"Telegram Remote","fields
 
 _state={"running":False,"stopping":False,"turn_chat":None,"turn_open":False,"turn_at":0.0,"seen":0,"skew":None}
 _lock=threading.RLock(); _stop=threading.Event(); _thread=None; _player=None; _out=queue.Queue(maxsize=100); _offset=0
+_pair_attempts = {}
+_pair_global_attempts = []
+_PAIR_WINDOW_SECONDS = 900
+_PAIR_MAX_PER_CHAT = 5
+_PAIR_MAX_GLOBAL = 20
 
 def _cfg(): return config("telegram_remote")
 def _parse_ids(value):
@@ -57,7 +63,7 @@ def _send(item):
         _api(method,params=params,files={field:(item.get("name","file.bin"),io.BytesIO(item.get("data",b"")),item.get("mime","application/octet-stream"))},timeout=120)
 
 def _message(update):
-    global _offset
+    global _offset, _pair_global_attempts
     _offset=max(_offset,int(update.get("update_id",0))+1)
     msg=update.get("message") or update.get("edited_message") or {}
     chat=msg.get("chat",{}); cid=chat.get("id")
@@ -68,7 +74,24 @@ def _message(update):
     if int(cid) not in approved:
         parts=text.split(maxsplit=1)
         pair=str(cfg.get("pairing_code") or "").strip()
-        if parts and parts[0].lower() in ("/start","/pair") and len(parts)>1 and pair and parts[1].strip()==pair:
+        if parts and parts[0].lower() in ("/start","/pair") and len(parts)>1 and pair:
+            now = time.monotonic()
+            key = int(cid)
+            recent = [stamp for stamp in _pair_attempts.get(key, [])
+                      if now - stamp < _PAIR_WINDOW_SECONDS]
+            global_recent = [stamp for stamp in _pair_global_attempts
+                             if now - stamp < _PAIR_WINDOW_SECONDS]
+            if len(recent) >= _PAIR_MAX_PER_CHAT or len(global_recent) >= _PAIR_MAX_GLOBAL:
+                _pair_attempts[key] = recent
+                _pair_global_attempts = global_recent
+                return
+            recent.append(now)
+            global_recent.append(now)
+            _pair_attempts[key] = recent
+            _pair_global_attempts = global_recent
+        else:
+            return
+        if hmac.compare_digest(parts[1].strip().encode("utf-8"), pair.encode("utf-8")):
             approved.append(int(cid)); from memory.config_manager import save_plugin_config
             save_plugin_config("telegram_remote",{"allowed_chat_ids":",".join(map(str,sorted(set(approved)))),"pairing_code":""})
             _enqueue(cid,"This chat is paired with REM. Keep the pairing code private.")

@@ -32,6 +32,28 @@ def _tokens(value) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text))
 
 
+def _negates_action(request: str, action: str) -> bool:
+    """Reject an action the direct request explicitly forbids."""
+    aliases = {
+        "click": r"(?:left\s+)?click", "left_click": r"(?:left\s+)?click",
+        "smart_click": r"(?:left\s+)?click", "right_click": r"right\s+click|click",
+        "double_click": r"double\s+click|click", "type": r"type|write|enter",
+        "type_text": r"type|write|enter", "smart_type": r"type|write|enter",
+        "press": r"press|hit", "press_key": r"press|hit",
+        "hotkey": r"press|shortcut|hotkey", "move": r"move|place", "hover": r"hover|move",
+        "scroll": r"scroll", "drag": r"drag", "close": r"close|quit|exit",
+        "close_app": r"close|quit|exit", "send_message": r"send|message",
+        "screen_click": r"click", "screen_find": r"find|locate",
+    }
+    verbs = aliases.get(action)
+    if not verbs:
+        return False
+    return bool(re.search(
+        rf"\b(?:do\s+not|don't|dont|never|not|without|refrain\s+from|stop)"
+        rf"(?:\s+\w+){{0,4}}\s+(?:{verbs})\b",
+        request, flags=re.IGNORECASE))
+
+
 def _is_screen_observation_request(value: str) -> bool:
     """Recognize a direct, read-only request to inspect the visible desktop.
 
@@ -130,6 +152,9 @@ def authorize_user_request(user_request: str, tool: str, args: dict, *,
                          .get("action") or "")
         except Exception:
             action = ""
+
+    if _negates_action(request, action or t):
+        return False, "Your request explicitly forbids that action; nothing was done."
 
     # The existing screen_agent plugin can sequence bounded native steps or
     # route to selected tools. Authorize each concrete step against the same

@@ -217,7 +217,18 @@ def save_cloud_screen_vision_enabled(enabled: bool) -> None:
 
 
 def get_desktop_observation_exclusions() -> list[str]:
-    values = load_api_keys().get("desktop_observation_exclusions", [])
+    # Read this privacy boundary strictly: load_api_keys intentionally falls
+    # back to defaults for ordinary settings, but exclusions must fail closed.
+    if not CONFIG_FILE.exists():
+        values = []
+    else:
+        try:
+            raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError("Desktop observation exclusions could not be read.") from exc
+        if not isinstance(raw, dict):
+            raise RuntimeError("Desktop observation configuration is invalid.")
+        values = raw.get("desktop_observation_exclusions", [])
     if isinstance(values, str):
         values = values.split(",")
     if not isinstance(values, (list, tuple)):

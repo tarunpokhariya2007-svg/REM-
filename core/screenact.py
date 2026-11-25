@@ -449,9 +449,11 @@ def click(target: Target, *, button: str = "left", clicks: int = 1,
         if expect_process:
             actual = _occluding_process(point)
             if actual and _differs(actual, expect_process):
-                warnings.append(
-                    f"the window at that point belongs to {actual}, not "
-                    f"{expect_process}; something may be covering it")
+                return _fail(action,
+                    f"click refused: the window at the target belongs to {actual}, "
+                    f"not {expect_process}; the target may be covered",
+                    target=point.label, origin=point.origin,
+                    point=(point.x, point.y))
 
         pyautogui.click(button=button, clicks=max(1, clicks),
                         interval=0.06 if clicks > 1 else 0.0)

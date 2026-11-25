@@ -1809,11 +1809,10 @@ def observation_exclusion(app: str, title: str) -> str:
     app_text, title_text = str(app or "").casefold(), str(title or "").casefold()
     if any(name in app_text for name in _ALWAYS_EXCLUDED_APPS):
         return "Windows sign-in, credential, lock, and consent surfaces are excluded."
-    try:
-        from memory.config_manager import get_desktop_observation_exclusions
-        exclusions = get_desktop_observation_exclusions()
-    except Exception:
-        exclusions = []
+    # An unreadable exclusion file must not silently become permission to
+    # observe every window. The configuration getter raises on malformed data.
+    from memory.config_manager import get_desktop_observation_exclusions
+    exclusions = get_desktop_observation_exclusions()
     if any(item.casefold() in app_text or item.casefold() in title_text
            for item in exclusions if item.strip()):
         return "This application or window is on the user's desktop-observation exclusion list."

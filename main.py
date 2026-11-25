@@ -1973,7 +1973,8 @@ class RemLive:
                         elif angle == "screen":
                             from core import desktop_control, screenview
                             from core.screen_observation import (
-                                capture_observation, prepare_image_for_live, vision_question,
+                                assert_cloud_image_egress_allowed, capture_observation,
+                                prepare_image_for_live, vision_question,
                             )
                             with desktop_control.action("observe"):
                                 img_b, mime_t, observed = await loop.run_in_executor(
@@ -1981,7 +1982,7 @@ class RemLive:
                                     lambda: capture_observation(
                                         _capture_screen,
                                         lambda: screenview.look(budget_s=1.2, allow_ocr=True),
-                                        preflight=screenview.assert_observation_allowed,
+                                        preflight=assert_cloud_image_egress_allowed,
                                     ),
                                 )
                             image_payload = prepare_image_for_live(img_b, mime_t)
@@ -2574,26 +2575,57 @@ class RemLive:
                         # remote input arriving while a worker runs must not
                         # replace authority between calls in this batch.
                         request_context = self._current_request_context()
-                        async with self._realtime_input_lock:
-                            try:
-                                fn_responses = []
-                                for fc in response.tool_call.function_calls:
-                                    print(f"[REM] 📞 {fc.name}")
-                                    fr = await self._execute_tool(fc, request_context)
-                                    fn_responses.append(fr)
-                                await self.session.send_tool_response(
-                                    function_responses=fn_responses
-                                )
-                                await self._flush_pending_vision(_input_lock_held=True)
-                            except BaseException:
-                                pending = self._pending_vision
-                                if pending:
-                                    self._finish_vision(pending[0])
-                                raise
+                        calls = list(response.tool_call.function_calls or [])
+                        seen = self.__dict__.setdefault("_live_tool_call_ids", set())
+                        unique_calls = []
+                        for fc in calls:
+                            call_id = str(getattr(fc, "id", "") or "")
+                            if call_id and call_id in seen:
+                                continue
+                            if call_id:
+                                seen.add(call_id)
+                            unique_calls.append(fc)
+                        if unique_calls:
+                            self._keep_task(asyncio.create_task(
+                                self._handle_tool_call_batch(unique_calls, request_context)))
         except Exception as e:
             print(f"[REM] ❌ Recv: {e}")
             traceback.print_exc()
             raise
+
+    async def _handle_tool_call_batch(self, function_calls, request_context) -> None:
+        """Execute a Live batch off the receive loop, preserving batch order."""
+        lock = self.__dict__.setdefault("_live_tool_batch_lock", asyncio.Lock())
+        async with lock:
+            session = self.session
+            responses = []
+            for fc in function_calls:
+                if session is not self.session:
+                    return
+                print(f"[REM] 📞 {fc.name}")
+                try:
+                    responses.append(await self._execute_tool(fc, request_context))
+                except asyncio.CancelledError:
+                    pending = self._pending_vision
+                    if pending:
+                        self._finish_vision(pending[0])
+                    raise
+                except Exception as exc:
+                    print(f"[REM] ❌ Live tool {fc.name}: {type(exc).__name__}: {exc}")
+                    responses.append(types.FunctionResponse(
+                        id=fc.id, name=fc.name,
+                        response={"result": "Tool execution failed; no success is confirmed."}))
+            if session is not self.session:
+                return
+            try:
+                await session.send_tool_response(function_responses=responses)
+            except Exception as send_exc:
+                print(f"[REM] ❌ Could not return Live tool response: {type(send_exc).__name__}")
+                return
+            try:
+                await self._flush_pending_vision()
+            except Exception as exc:
+                print(f"[REM] ❌ Pending vision flush failed: {type(exc).__name__}: {exc}")
 
     async def _play_audio(self):
         print("[REM] 🔊 Play started")

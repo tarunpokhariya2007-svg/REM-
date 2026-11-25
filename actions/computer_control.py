@@ -480,6 +480,8 @@ def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
 
 def _screen_find(description: str) -> tuple[int, int] | None:
     _ensure_control_active()
+    from core.screen_observation import assert_cloud_image_egress_allowed
+    assert_cloud_image_egress_allowed()
     api_key = _get_api_key()
     if not api_key:
         print("[ComputerControl] ⚠️ No API key for screen_find")

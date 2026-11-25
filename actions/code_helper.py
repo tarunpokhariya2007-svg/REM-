@@ -443,6 +443,12 @@ Optimized code:"""
 
 def _screen_debug_action(description, file_path, player, speak=None) -> str:
 
+    try:
+        from core.screen_observation import assert_cloud_image_egress_allowed
+        assert_cloud_image_egress_allowed()
+    except Exception as exc:
+        return f"Screen analysis was not sent: {exc}"
+
     if player:
         player.write_log("[Code] Taking screenshot for analysis...")
 
