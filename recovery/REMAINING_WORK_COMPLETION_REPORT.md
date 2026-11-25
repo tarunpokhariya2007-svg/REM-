@@ -236,8 +236,53 @@ Changed this pass: `core/windows_uia.py`, `core/screenview.py`, `tests/test_wind
 
 It discovered 25 elements and uniquely matched Search field (Edit/50004, `SearchBox`) and Run test search (Button/50000, `SearchButton`). ValuePattern was available and writable; `REM_INTEGRATED_UIA_TEST` was set and read back exactly both inside the adapter and on a fresh scan. InvokePattern was available and the button was invoked. A live screenshot of the fixture showed the exact status `Search completed: REM_INTEGRATED_UIA_TEST`.
 
-The same integrated action path also toggled and restored the checkbox, expanded/collapsed the combo box, and selected the Alpha list item. The UI afterward verified those fixture states. Tab children exposed SelectionItemPattern but had no RuntimeId, so identity-safe REM actions refused to target them. No WindowPattern was exposed by the scanned root. Combo SelectionPattern was not exposed. The list container's SelectionPattern is query-only for this API and was not treated as a selection action.
+The same integrated action path also toggled and restored the checkbox, expanded/collapsed the combo box, and selected the Alpha list item. The UI afterward verified those fixture states. Tab children exposed SelectionItemPattern but had no RuntimeId, so identity-safe REM actions refused to target them. The earlier scan did not probe WindowPattern; its live availability remains unverified. Combo SelectionPattern was not exposed. The list container's SelectionPattern is query-only for this API and was not treated as a selection action.
 
 This verifies the integrated adapter in a normal desktop security context, but the test was a `pythonw` acceptance process importing REM's real modules. The normal `main.py` app was not launched, so its own token/context, Gemini Live tool dispatch, actual speech, and voice-to-UIA path are still not tested. The previous low-integrity AppContainer cause applies to the diagnostic discrepancy; don't use it to infer the running app's context.
 
 A semantic Invoke error now stops without a physical-click retry, and ValuePattern SetValue checks exact readback. Full offline suite: **107 passed**. Compilation passed; `git diff --check` passed (with repository line-ending notices only). Existing unrelated modified files and `memory/routines.json` were preserved. No dependency install, staging, commit, or push was performed.
+
+## Screenshot-independent desktop and reliability continuation (2026-11-25)
+
+### Fixes made after the integrated UIA acceptance
+
+- Updated the `screen_process` Gemini declaration and model limits: local native-app inspection is explicitly through `desktop_ui`; cloud image inspection is an optional separately permissioned fallback. If cloud screen vision is off, the same authorized read-only `screen_process` request now dispatches to `desktop_ui` locally and never calls screenshot capture. The cloud-disabled test verifies this route and checks that `desktop_ui` and `browser_control` remain available in text-only model guidance.
+- Removed the PyWinAuto-installed flag as a prerequisite for the Windows `screenview.look()` branch. Windows capability reporting now recognizes CUIAutomation8/comtypes as primary and PyWinAuto as fallback.
+- The native action path now uses ValuePattern.SetValue + exact readback for a named writable UIA field, InvokePattern for buttons, TogglePattern/SelectionItemPattern for other single-click targets exposing those patterns, and SetFocus for named edit/combo controls. Failed semantic actions fail closed rather than immediately repeating as a physical input. Physical input remains the fallback where no suitable pattern is exposed. `actions/screen_agent.py` includes accessible values, bounds and hierarchy depth in its local structured response (never includes protected-field values).
+- CUIAutomation8 reads TextPattern DocumentRange text for supported Text/Document elements, bounded to 400 characters. The local-observation preference is now stored under requested key `persistent_local_observation_enabled`, while reading and writing the previous `persistent_desktop_observation_enabled` key remains supported for backward compatibility. Cloud permission remains a separate setting.
+- Authorization dispatch now uses ContextVar snapshots for async-task isolation and nested execution, while preserving the legacy thread-local adapter. Added concurrent worker, expired context, and nested-route regression tests.
+- Classified Gemini Live 1008 inactivity closure even when wrapped in TaskGroup ExceptionGroups. A rejected resumed handle is dropped once for a fresh connection; repeated fresh-session failures use bounded exponential retry. No synthetic heartbeat was added.
+- Added shutdown cancellation of the active Live run task on Qt `aboutToQuit`, stopped the playback worker before final wrap-up, guarded speaking-state callbacks during shutdown, and made `finish()` idempotent.
+- Bounded inbound playback PCM to 80 50-ms chunks. On saturation it sheds the oldest audio without blocking, counts loss and rate-limits a content-free warning. The existing bounded microphone-to-Live queue is retained.
+- Added tests that ensure UIA field setting and button activation do not invoke screenshots, keyboard entry, or physical clicking.
+
+### Validation
+
+`..\\.venv\\Scripts\\python.exe -m unittest discover -s tests -q` — **116 passed**. Python compileall across `core`, `actions`, `plugins`, `memory`, `tests`, and `recovery/windows_acceptance` passed. `git diff --check` passed; Git emitted line-ending conversion notices only.
+
+The latest changes after the 2025-11-25 integrated UIA real fixture run have **mocked/offline validation only**. Real integrated UIA success remains as documented in the preceding section; this continuation did not repeat the disposable fixture, launch full `main.py`, test microphone speech, run a live Gemini reconnection, or perform a Qt close while playback was active. The browser, OCR, mouse, and Gemini component results cited earlier are from their respective prior real-test records and were not repeated here.
+
+### Still incomplete / not claimed
+
+- No real natural spoken desktop command was run end-to-end through `main.py` to a native app or browser.
+- No live text-only/local model screen observation was exercised; local `desktop_ui` route has mocked coverage.
+- Tabs with empty UIA RuntimeIds remain safely non-actionable; no UIA event-fed observation cache exists (persistent mode polls).
+- Persistent-consent restart, exclusion, pause/resume and cloud-off local UIA were not validated in a live GUI session.
+- No live Chrome disconnect/restart recovery, WhatsApp DOM interaction, keyboard acceptance, Gemini 1008 recovery, active-playback Qt shutdown, queue saturation, or long-running resource measurement was performed here.
+- Memory remains the existing JSON implementation; no migration or duplicate DB was added. Real memory CRUD/restart acceptance remains outstanding.
+
+The worktree had existing modified files before this continuation; they remain preserved. `memory/routines.json` remains as found. No dependency installation, staging, commit, or push occurred.
+
+## Continuation update — screenshot independence and reliability (2026-11-25)
+
+The primary current failure mode was architectural wording/dispatch: `screen_process` described screenshots as the necessary way to inspect the display, and when cloud image permission was off it returned a refusal before trying local UI Automation. That made a read-only observation request look like “I can't see your screen” even when semantic access existed. The tool now describes cloud vision as optional and directs native-app inspection to `desktop_ui`. With cloud permission off, authorized screen observation calls the existing local desktop UIA observer and does not capture or transmit a screenshot. A regression test asserts the capture function is not called. This local route has mocked coverage; it was not run through a full normal `main.py` voice session.
+
+Windows screenview no longer requires the PyWinAuto package flag to enter the Windows scanner; capabilities report CUIAutomation8/comtypes as primary with PyWinAuto fallback. UIA values now use TextPattern for exposed Text/Document elements. The desktop agent uses ValuePattern.SetValue and exact readback for writable fields, InvokePattern for buttons, supported toggle/selection patterns for semantic clicks, and SetFocus for editable controls. Those operations avoid screenshots and physical input when the relevant pattern is available. Any semantic failure returns a failure instead of retrying a possibly completed action with a second physical click. Mock tests cover these no-screenshot paths; the integrated real UIA test remains the separate fixture evidence above.
+
+Authorization context now uses ContextVar to isolate simultaneous calls and carry the same expiring snapshot through nested calls. Persistent local observation settings use `persistent_local_observation_enabled` and preserve the older key for compatibility. Live 1008 inactivity errors are recognized through TaskGroup wrappers; a rejected resumption handle is dropped before retry, and subsequent failures back off without inventing heartbeat messages. Shutdown cancels the Live task tree before final persistence, avoids speaking-state Qt updates once closing, and `finish()` is idempotent. The server-to-speaker audio queue now has a fixed 80-chunk limit and a nonblocking, counted oldest-chunk shedding policy.
+
+Current test result: **117 tests passed**; compileall passed; `git diff --check` passed (line-ending notices only). No current turn tested actual voice-to-tool operation in full `main.py`, a live Gemini 1008 reconnect, GUI shutdown during active playback, local observation restart/exclusions, live browser disconnect, or sustained performance. Do not infer those results from unit tests or earlier component acceptance.
+
+Files changed in this continuation: `main.py`, `core/screenview.py`, `core/windows_uia.py`, `core/screenact.py`, `actions/screen_agent.py`, `memory/config_manager.py`, `tests/test_screen_observation.py`, `tests/test_windows_uia_adapter.py`, `tests/test_desktop_control_authorization.py`, `tests/test_persistent_observation.py`, `tests/test_visual_targeting_extensions.py`, and this report. Earlier changes in the worktree remain untouched; `memory/routines.json` was not edited by this continuation. No dependency installation, staging, commit, or push occurred.
+
+The adapter also now enumerates bounded TextPattern content and supports SelectionPattern readback plus WindowPattern visual-state operations. Those routes have not been real-Windows tested; UIA acceptance remains specifically the field/button, checkbox, combo expand/collapse, and list-item results recorded above. Current automated total: **117 passed**.

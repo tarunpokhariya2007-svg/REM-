@@ -104,6 +104,7 @@ _OS = {"Windows": "windows", "Darwin": "mac"}.get(platform.system(), "linux")
 # pays nothing for the ones it does not have.
 # ---------------------------------------------------------------------------
 _HAS_PYWINAUTO = _OS == "windows" and installed("pywinauto")
+_HAS_COMTYPES = _OS == "windows" and installed("comtypes")
 _HAS_PYOBJC = _OS == "mac" and installed("ApplicationServices")
 _HAS_ATSPI = _OS == "linux" and installed("pyatspi")
 _HAS_MSS = installed("mss")
@@ -1888,7 +1889,8 @@ def capabilities() -> dict:
     one that silently returns nothing is not.
     """
     backend = {
-        "windows": ("uia", _HAS_PYWINAUTO, "pywinauto"),
+        "windows": ("uia", _HAS_COMTYPES or _HAS_PYWINAUTO,
+                    "CUIAutomation8/comtypes" if _HAS_COMTYPES else "pywinauto"),
         "mac": ("ax", _HAS_PYOBJC, "pyobjc-framework-ApplicationServices"),
         "linux": ("atspi", _HAS_ATSPI, "pyatspi"),
     }[_OS]
@@ -2281,8 +2283,8 @@ def missing_packages() -> list[str]:
     """What to install to make this machine's perception work. Empty when it
     already does."""
     out: list[str] = []
-    if _OS == "windows" and not _HAS_PYWINAUTO:
-        out.append("pywinauto")
+    if _OS == "windows" and not (_HAS_COMTYPES or _HAS_PYWINAUTO):
+        out.append("comtypes (CUIAutomation8) or pywinauto")
     if _OS == "mac" and not _HAS_PYOBJC:
         out.append("pyobjc-framework-ApplicationServices")
     if _OS == "linux" and not _HAS_ATSPI:
@@ -2312,7 +2314,7 @@ def look(*, budget_s: float = SCAN_BUDGET_S, allow_ocr: bool = True,
     if _OS == "windows":
         _uia_diagnostic("foreground", hwnd=(hex(int(handle)) if handle else None),
                         process=app, process_id=int(pid or 0), window_title=title[:160],
-                        backend="pywinauto.uia")
+                        backend="CUIAutomation8")
     view = View(os_name=_OS, app=app, title=title, pid=pid, bounds=bounds)
     excluded = observation_exclusion(app, title)
     if excluded:
@@ -2380,7 +2382,7 @@ def look(*, budget_s: float = SCAN_BUDGET_S, allow_ocr: bool = True,
     else:
         try:
             elements: list[Element] = []
-            if _OS == "windows" and _HAS_PYWINAUTO and handle:
+            if _OS == "windows" and handle:
                 elements = _scan_windows(handle, scale, deadline, pid=pid,
                                          title=title)
                 elements = [replace(el, window_title=title)

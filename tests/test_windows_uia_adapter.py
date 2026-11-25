@@ -99,6 +99,42 @@ class WindowsUiaAdapterTests(unittest.TestCase):
         self.assertFalse(stopped[0])
         on_mta.assert_not_called()
 
+    def test_screenview_uses_cuia_even_without_pywinauto_and_without_screenshot(self):
+        from core import screenview
+        shell = screenview.Element(0, "window", "Fixture", "", 0, 0, 500, 400,
+                                   control_type="Window", runtime_id=(1, 1),
+                                   window_pid=55, window_title="Fixture")
+        field = screenview.Element(1, "edit", "Search field", "", 10, 30, 200, 25,
+                                  control_type="Edit", runtime_id=(1, 2),
+                                  window_pid=55, window_title="Fixture",
+                                  patterns=("value",))
+        button = screenview.Element(2, "button", "Run", "", 220, 30, 80, 25,
+                                   control_type="Button", runtime_id=(1, 3),
+                                   window_pid=55, window_title="Fixture",
+                                   patterns=("invoke",))
+        with patch.object(screenview, "_OS", "windows"), \
+             patch.object(screenview, "_HAS_PYWINAUTO", False), \
+             patch.object(screenview, "_physical_to_logical", return_value=1.0), \
+             patch.object(screenview, "_logical_screen", return_value=(0, 0, 1920, 1080)), \
+             patch.object(screenview, "_foreground", return_value=("fixture.exe", "Fixture", 55, 1234)), \
+             patch.object(screenview, "observation_exclusion", return_value=""), \
+             patch.object(screenview, "assert_observation_allowed", return_value=("fixture.exe", "Fixture", 55)), \
+             patch.object(screenview, "all_windows", return_value=[]), \
+             patch.object(screenview, "_foreground_rect", return_value=(0, 0, 500, 400)), \
+             patch.object(screenview, "_is_own_window", return_value=False), \
+             patch.object(screenview, "_is_slow", return_value=False), \
+             patch.object(screenview, "_scan_windows", return_value=[shell, field, button]) as scan, \
+             patch.object(screenview, "_thinness_reason", return_value=""), \
+             patch.object(screenview, "_digest_elements", return_value="digest"), \
+             patch.object(screenview, "_digest_stable", return_value="stable"), \
+             patch.object(screenview, "_uia_diagnostic"), \
+             patch.object(screenview, "_scan_ocr", side_effect=AssertionError("OCR/screenshot fallback")):
+            view = screenview.look(allow_ocr=True)
+        self.assertEqual(view.source, "uia")
+        self.assertEqual([e.name for e in view.elements],
+                         ["Fixture", "Search field", "Run"])
+        scan.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

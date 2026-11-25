@@ -104,8 +104,7 @@ class DesktopControlAuthorizationTests(unittest.TestCase):
         rem._record_user_request("Turn the volume down", "dashboard")
         seen = rem._run_with_request_context(
             batch_context,
-            lambda: rem._usable_request_context(
-                getattr(rem._dispatch_context_local, "context", None)))
+            lambda: rem._usable_request_context(rem._bound_request_context()))
         self.assertEqual(seen, ("Open YouTube", "voice"))
         self.assertNotEqual(rem._current_request_context().task_id,
                             batch_context.task_id)
@@ -117,6 +116,33 @@ class DesktopControlAuthorizationTests(unittest.TestCase):
         expired = RequestContext.create("Check my screen", "voice",
                                         now=time.monotonic() - REQUEST_CONTEXT_TTL - 1)
         self.assertEqual(rem._usable_request_context(expired), ("", "untrusted"))
+
+    def test_contextvar_dispatch_isolated_between_concurrent_tasks(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from main import RemLive
+
+        rem = RemLive.__new__(RemLive)
+        import contextvars
+        rem._dispatch_context_local = contextvars.ContextVar("parallel_task_ctx", default=None)
+        a = RequestContext.create("Open YouTube", "voice")
+        b = RequestContext.create("Open Notepad", "dashboard")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(rem._run_with_request_context, ctx,
+                                   lambda: rem._bound_request_context().task_id)
+                       for ctx in (a, b)]
+            a_id, b_id = (future.result(timeout=5) for future in futures)
+        self.assertNotEqual(a_id, b_id)
+
+    def test_nested_routes_keep_expired_context_expired(self):
+        from main import RemLive
+
+        rem = RemLive.__new__(RemLive)
+        rem._dispatch_context_local = threading.local()
+        expired = RequestContext.create(
+            "Open YouTube", "voice", now=time.monotonic() - REQUEST_CONTEXT_TTL - 5)
+        seen = rem._run_with_request_context(
+            expired, lambda: rem._usable_request_context(rem._bound_request_context()))
+        self.assertEqual(seen, ("", "untrusted"))
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ except Exception as _e:
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import contextvars
 import os
 import re
 import threading
@@ -325,11 +326,14 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
 
     if has_vision:
         out.append(
-            "- Your sight is not continuous. You see nothing until you call a "
-            "vision tool, and then only that single frame at that moment — you "
-            "cannot watch, monitor or notice something changing on screen.")
+            "- Cloud visual analysis is a one-frame capability used only when UIA or browser DOM is insufficient. "
+            "For ordinary native apps use desktop_ui to inspect controls and values without sending an image. "
+            "You cannot continuously watch or notice changes unless local observation is enabled.")
     else:
-        out.append("- You have no sight at all in this build.")
+        out.append(
+            "- Cloud image analysis is unavailable in this build or is not permitted. "
+            "This does not mean you lack all desktop context: use desktop_ui for local UI Automation "
+            "and browser_control for DOM/CDP. Do not claim inability to inspect a screen solely because cloud images are unavailable.")
     if has_mic:
         out.append(
             "- You hear nothing while the microphone is muted, and you cannot "
@@ -420,14 +424,16 @@ TOOL_DECLARATIONS = [
     {
         "name": "screen_process",
         "description": (
-            "Read-only screen observation: captures the current desktop, identifies the "
-            "foreground application and window, and supplies available UI Automation/OCR "
-            "text plus the screenshot for visual analysis. Call this for 'check my screen', "
-            "'what is on my screen', 'describe the current window', visible error messages, "
-            "or looking at a project. No target, click, or coordinate is needed. "
+            "Cloud visual inspection of a screen or camera frame. For ordinary native-app "
+            "inspection or desktop control, use desktop_ui first: it reads the local Windows "
+            "UI Automation tree and does not require a screenshot or cloud vision. Use this "
+            "tool only when the user asks about visual details that UI Automation/browser "
+            "structure cannot answer (for example colors, layout, or an image). Screen image "
+            "transmission is separately permission-gated. No target, click, or coordinate is needed. "
             "Also captures webcam images when explicitly requested. "
-            "You have NO visual ability without this tool. "
-            "After the image is captured it is sent directly to you — describe what you see and answer the user's question. "
+            "When cloud screen vision is disabled, this request falls back to a local semantic "
+            "desktop observation and does not capture or transmit an image. "
+            "After an image is captured and sent, describe only what that image supports and answer the user's question. "
             "When using camera: the live view stays open until user says close it or calls close_camera."
         ),
         "parameters": {
@@ -595,6 +601,21 @@ def _is_reconnect_signal(exc: BaseException) -> bool:
     return False
 
 
+def _is_live_inactivity_close(exc: BaseException) -> bool:
+    """Identify Gemini Live's documented 1008 inactivity close, including
+    the ExceptionGroup wrapper produced by asyncio.TaskGroup.
+
+    Do not synthesize heartbeat traffic. The caller drops a rejected resume
+    handle and reconnects through the normal session lifecycle.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_live_inactivity_close(sub) for sub in exc.exceptions)
+    message = str(exc).casefold()
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    return ((str(code) == "1008" or "1008" in message)
+            and ("inactiv" in message or "client inactivity" in message))
+
+
 def _keep_context_of(exc: BaseException) -> bool:
     """Read `keep_context` off a reconnect signal, unwrapping the group the
     TaskGroup put it in. Defaults to True: an unexpected shape must not silently
@@ -620,7 +641,12 @@ class RemLive:
         self.out_queue            = None
         self._audio_queue_overflows = 0
         self._audio_overflow_notice_at = 0.0
+        self._playback_queue_overflows = 0
+        self._playback_overflow_notice_at = 0.0
         self._loop                     = None
+        self._closing                  = False
+        self._finish_lock              = threading.Lock()
+        self._finish_started           = False
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
@@ -638,7 +664,8 @@ class RemLive:
         self._last_user_command_source = ""  # voice | typed | dashboard; tool output is never a source
         self._request_context_lock = threading.Lock()
         self._request_context = None
-        self._dispatch_context_local = threading.local()
+        self._dispatch_context_local = contextvars.ContextVar(
+            f"rem_request_context_{id(self)}", default=None)
         self._interrupted          = False   # True while draining audio after user interrupt
         # Which engine is holding the conversation, and what it can do.
         # None means Gemini Live — the default and, unless somebody has gone to
@@ -960,7 +987,7 @@ class RemLive:
                              "browser_control", "screen_process", "open_app", "send_message"}
             if name in control_tools:
                 from core import desktop_control
-                context = getattr(self._dispatch_context_local, "context", None)
+                context = self._bound_request_context()
                 if context is None:
                     context = self._current_request_context()
                 user_request, request_source = self._usable_request_context(context)
@@ -1015,10 +1042,21 @@ class RemLive:
         return context.instruction, context.source
 
     def _run_with_request_context(self, context, fn):
-        """Bind a snapshot to a worker and its nested plugin tool routes."""
+        """Bind one immutable request snapshot to this dispatch context.
+
+        ContextVars isolate concurrent asyncio tasks and propagate into child
+        tasks. Thread-local remains supported for older embedders and tests.
+        """
         local = getattr(self, "_dispatch_context_local", None)
         if local is None:
-            local = self._dispatch_context_local = threading.local()
+            local = self._dispatch_context_local = contextvars.ContextVar(
+                f"rem_request_context_{id(self)}", default=None)
+        if isinstance(local, contextvars.ContextVar):
+            token = local.set(context)
+            try:
+                return fn()
+            finally:
+                local.reset(token)
         previous = getattr(local, "context", None)
         local.context = context
         try:
@@ -1031,6 +1069,12 @@ class RemLive:
                     pass
             else:
                 local.context = previous
+
+    def _bound_request_context(self):
+        local = getattr(self, "_dispatch_context_local", None)
+        if isinstance(local, contextvars.ContextVar):
+            return local.get()
+        return getattr(local, "context", None)
 
     def _confirmation_result(self, title: str, status: str, detail: str) -> None:
         """Feed a human's later confirmation decision into the active session.
@@ -1153,12 +1197,31 @@ class RemLive:
             print(f"[Tasks] shutdown: {e}")
 
     def finish(self, timeout: float = 15.0) -> None:
-        """Called on the Qt thread after the window has closed. The window is
-        already gone, so this wait is not something anybody sits through."""
+        """Cancel session/playback tasks before waiting on final persistence.
+
+        Called after the Qt window closes. Cancellation is awaited on the
+        session loop so audio streams close and no playback callback can keep
+        touching deleted Qt objects while the summary is saved.
+        """
+        with self._finish_lock:
+            if self._finish_started:
+                return
+            self._finish_started = True
+            self._closing = True
         loop = getattr(self, "_loop", None)
         if loop is not None and loop.is_running():
             try:
-                asyncio.run_coroutine_threadsafe(self._wrap_up(), loop).result(timeout)
+                async def _shutdown_on_loop():
+                    current = asyncio.current_task()
+                    tasks = [task for task in asyncio.all_tasks(loop)
+                             if task is not current and not task.done()]
+                    for task in tasks:
+                        task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    await self._wrap_up()
+
+                asyncio.run_coroutine_threadsafe(_shutdown_on_loop(), loop).result(timeout)
             except Exception as e:
                 print(f"[REM] wrap-up cut short: {e!r}")
         self._stop_engines()
@@ -1469,10 +1532,21 @@ class RemLive:
             # still needs it to recognise our own voice. It is dropped when the
             # tail expires. What the guard learned about the room always stays.
             self._out_level = 0.0
-        if value:
-            self.ui.set_state("SPEAKING")
-        elif not self.ui.muted:
-            self.ui.set_state("LISTENING")
+        if not getattr(self, "_closing", False):
+            if value:
+                self.ui.set_state("SPEAKING")
+            elif not self.ui.muted:
+                self.ui.set_state("LISTENING")
+
+    def request_shutdown(self) -> None:
+        """Stop the Live task tree as soon as the Qt application is quitting."""
+        self._closing = True
+        loop = getattr(self, "_loop", None)
+        if loop is None or not loop.is_running():
+            return
+        task = getattr(self, "_run_task", None)
+        if task is not None:
+            loop.call_soon_threadsafe(task.cancel)
 
     def set_push_to_talk(self, enabled: bool) -> str:
         """Turn hold-to-talk on or off. Returns the scope actually achieved."""
@@ -1826,22 +1900,41 @@ class RemLive:
                 response={"result": "ok", "silent": True}
             )
 
+        loop = asyncio.get_event_loop()
         if (name == "screen_process"
                 and str(args.get("angle", "screen")).strip().lower() == "screen"):
             from memory.config_manager import get_cloud_screen_vision_enabled
             if not get_cloud_screen_vision_enabled():
-                result = (
-                    "Cloud screen vision is disabled. Enable it in the COMPUTER USE "
-                    "settings after reviewing the separate screen-sharing consent. "
-                    "No screenshot was captured or sent."
-                )
+                # A screen question does not grant cloud image permission, but
+                # it can still be answered from the local UIA tree. Reuse the
+                # existing desktop_ui observer, which returns semantic control
+                # text and only reaches OCR/screenshot fallback when UIA lacks
+                # enough data. The cloud vision setting never gates this route.
+                from core import desktop_control
+                local_args = {"action": "observe"}
+                local_allowed, local_reason = desktop_control.authorize_user_request(
+                    user_request, "desktop_ui", local_args, source=request_source)
+                if not local_allowed:
+                    result = ("Local semantic observation was refused: "
+                              + local_reason + " No image was captured or sent.")
+                elif not self._action_registry.has("desktop_ui"):
+                    result = ("Cloud screen vision is disabled and local desktop "
+                              "observation is unavailable. No screenshot was captured or sent.")
+                else:
+                    _ctx = {"player": self.ui,
+                            "session_memory": {"user_request": user_request}}
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: self._run_with_request_context(
+                            request_context,
+                            lambda: self._action_registry.run(
+                                "desktop_ui", local_args, _ctx)))
                 if not self.ui.muted:
                     self.ui.set_state("LISTENING")
-                print("[Vision] Refused cloud delivery: separate screen-vision permission is off")
+                print("[Vision] Cloud image permission is off; used local semantic observation")
                 return types.FunctionResponse(
                     id=fc.id, name=name, response={"result": result})
 
-        loop   = asyncio.get_event_loop()
         result = "Done."
 
         try:
@@ -2112,6 +2205,38 @@ class RemLive:
                     pass
             return accepted
 
+    def _queue_playback_audio(self, chunk: bytes) -> bool:
+        """Keep server PCM bounded and fresh without blocking the Live reader."""
+        queue = self.audio_in_queue
+        if queue is None:
+            return False
+        try:
+            queue.put_nowait(chunk)
+            return True
+        except asyncio.QueueFull:
+            self._playback_queue_overflows = getattr(self, "_playback_queue_overflows", 0) + 1
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                accepted = False
+            else:
+                accepted = True
+            now = time.monotonic()
+            last = getattr(self, "_playback_overflow_notice_at", 0.0)
+            if now - last >= 30.0:
+                self._playback_overflow_notice_at = now
+                try:
+                    self.ui.write_log(
+                        "SYS: Playback queue is full; older output audio was dropped "
+                        f"(overflows: {self._playback_queue_overflows}).")
+                except Exception:
+                    pass
+            return accepted
+
     async def _listen_audio(self):
         print("[REM] 🎤 Mic started")
         loop = asyncio.get_event_loop()
@@ -2342,7 +2467,7 @@ class RemLive:
                             _audio_data = response.data
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
-                                self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
+                                self._queue_playback_audio(_audio_data[_i : _i + _SLICE])
 
                     if response.server_content:
                         sc = response.server_content
@@ -3116,6 +3241,7 @@ class RemLive:
 
     async def run(self):
         self._loop = asyncio.get_event_loop()
+        self._run_task = asyncio.current_task()
         self._reconnect_event = asyncio.Event()
 
         # ── Wire the shared core services to the interface ───────────────────
@@ -3151,7 +3277,7 @@ class RemLive:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
 
-        while True:
+        while not self._closing:
             try:
                 self._ensure_executor()
                 print("[REM] Connecting...")
@@ -3213,7 +3339,7 @@ class RemLive:
 
                     self.session          = session
                     self._realtime_input_lock = asyncio.Lock()
-                    self.audio_in_queue   = asyncio.Queue()
+                    self.audio_in_queue   = asyncio.Queue(maxsize=80)
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
                     self._rx_deadline     = None
@@ -3340,6 +3466,23 @@ class RemLive:
                     self._conn_backoff = 0
                     continue
 
+                if self._closing:
+                    print("[REM] Session tasks cancelled for application shutdown")
+                    return
+
+                if _is_live_inactivity_close(e) and _resumed_with:
+                    # A resumed session itself closed with 1008 inactivity.
+                    # Do not replay the same handle indefinitely; TaskGroup
+                    # has already cancelled its sibling send/receive/audio
+                    # tasks. Start one clean session, then back off if that
+                    # also closes before becoming resumable.
+                    self._resume_handle = None
+                    self._conn_backoff = 0
+                    self.ui.write_log(
+                        "SYS: Live session closed after inactivity; reconnecting with a fresh session.")
+                    print("[REM] Live 1008 inactivity close — dropping resumed handle")
+                    continue
+
                 # A resumption handle the server will not accept — expired, or
                 # belonging to a session it has since dropped. Without this, the
                 # same dead handle would be replayed on every retry and the
@@ -3424,20 +3567,24 @@ class RemLive:
                 is_net_err = any(k in err_str for k in (
                     "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
                     "ConnectionRefusedError", "OSError", "Cannot connect",
-                ))
+                )) or _is_live_inactivity_close(e)
                 if is_net_err:
                     _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
                     self._conn_backoff = _conn_backoff
-                    self.ui.write_log(
-                        f"NET: Connection failed — retrying in {_conn_backoff}s. "
-                        "(a VPN may be required)"
-                    )
+                    if _is_live_inactivity_close(e):
+                        self.ui.write_log(
+                            f"SYS: Live session closed after inactivity — retrying in {_conn_backoff}s.")
+                    else:
+                        self.ui.write_log(
+                            f"NET: Connection failed — retrying in {_conn_backoff}s. "
+                            "(a VPN may be required)"
+                        )
                 else:
                     self._conn_backoff = 3
             finally:
                 self.session = None
                 # Only save if there was a real conversation (≥3 turns)
-                if len(self._session_log) >= 3:
+                if len(self._session_log) >= 3 and not self._closing:
                     self._keep_task(asyncio.create_task(self._save_session_summary()))
 
             self.set_speaking(False)
@@ -3479,6 +3626,10 @@ def main():
         ui.wait_for_api_key()
         rem = RemLive(ui)
         holder["rem"] = rem
+        try:
+            ui._app.aboutToQuit.connect(rem.request_shutdown)
+        except Exception as exc:
+            print(f"[REM] Qt shutdown hook unavailable: {type(exc).__name__}")
         try:
             asyncio.run(rem.run())
         except KeyboardInterrupt:

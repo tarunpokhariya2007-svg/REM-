@@ -33,7 +33,10 @@ def _describe(view, cap=65):
         for el in view.elements[:cap]:
             row = {"id": el.eid, "role": el.role,
                    "name": el.name or el.value or "(unnamed)",
-                   "enabled": el.enabled}
+                   "enabled": el.enabled, "bounds": list(el.rect),
+                   "depth": el.depth}
+            if el.value and not el.protected:
+                row["value"] = el.value
             if el.automation_id:
                 row["automation_id"] = el.automation_id
             if el.control_type:
@@ -42,8 +45,6 @@ def _describe(view, cap=65):
                 row["parent"] = el.parent_name
             if el.patterns:
                 row["patterns"] = list(el.patterns)
-            if el.focused:
-                row["focused"] = True
             if el.focused:
                 row["focused"] = True
             if el.protected:
@@ -272,6 +273,46 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                     desktop_control.report(action, verification, after.app)
                     _publish(player)
                     return f"{action.title()} {target.label}; {verification}."
+                if action == "type":
+                    text = str(params.get("text", ""))
+                    if not text:
+                        return "Tell me what text to enter."
+                    if target.protected:
+                        return "That field is protected; enter the secret yourself."
+                    if "value" in target.patterns:
+                        ok, detail = screenview.perform_uia_pattern(
+                            target, "value", text)
+                        if not ok:
+                            desktop_control.report(action, f"failed: {detail}", before.app)
+                            _publish(player)
+                            return (f"I could not set the target through its fresh UI Automation "
+                                    f"ValuePattern: {detail}. No keyboard fallback was attempted.")
+                        after, verification = _verified_after(
+                            before, target=target, typed_text=text)
+                        desktop_control.report(action, verification, after.app)
+                        _publish(player)
+                        return f"Entered text in {target.label}; {verification}."
+                if action == "click":
+                    semantic_pattern = next((pattern for pattern in (
+                        "invoke", "toggle", "selection_item")
+                        if pattern in target.patterns), None)
+                    if target.role in (screenview.ROLE_EDIT, screenview.ROLE_COMBOBOX):
+                        semantic_pattern = "focus"
+                    if semantic_pattern:
+                        semantic_value = None
+                        if semantic_pattern == "expand_collapse":
+                            semantic_value = "expand"
+                        ok, detail = screenview.perform_uia_pattern(
+                            target, semantic_pattern, semantic_value)
+                        if not ok:
+                            desktop_control.report(action, f"failed: {detail}", before.app)
+                            _publish(player)
+                            return (f"I could not activate the freshly observed control through "
+                                    f"UI Automation: {detail}. No physical click was attempted.")
+                        after, verification = _verified_after(before, target=target)
+                        desktop_control.report(action, verification, after.app)
+                        _publish(player)
+                        return f"Activated {target.label} semantically; {verification}."
                 if action in {"click", "right_click", "double_click"} and any(
                         word in fold(target.label) for word in _CONSEQUENTIAL_LABELS):
                     from core import confirm

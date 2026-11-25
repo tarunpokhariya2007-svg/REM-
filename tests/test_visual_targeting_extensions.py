@@ -227,6 +227,53 @@ class UiaSemanticActionTests(unittest.TestCase):
                 self.assertIn("verified", result)
                 perform.assert_called_once_with(element, pattern, value)
 
+    def test_named_type_uses_valuepattern_without_keyboard_or_screenshot(self):
+        from contextlib import nullcontext
+        from actions import screen_agent
+        from core.screenview import Element, View
+        element = Element(1, "edit", "Search field", "", 10, 10, 200, 24,
+                          patterns=("value",), runtime_id=(8, 9),
+                          window_pid=10, window_title="Test window")
+        view = View(source="uia", degraded=False, app="fixture.exe",
+                    title="Test window", pid=10, elements=[element])
+        with patch.object(screen_agent, "_view", return_value=view), \
+             patch.object(screen_agent.desktop_control, "action", return_value=nullcontext()), \
+             patch.object(screen_agent, "_verified_after",
+                          return_value=(view, "verified: exact UIA value")), \
+             patch.object(screen_agent.screenview, "perform_uia_pattern",
+                          return_value=(True, "ValuePattern readback matched")) as perform, \
+             patch.object(screen_agent.screenact, "type_text",
+                          side_effect=AssertionError("physical typing should not run")), \
+             patch.object(screen_agent.screenview, "capture",
+                          side_effect=AssertionError("screenshot should not run")):
+            result = screen_agent.screen_agent({
+                "action": "type", "target": "Search field", "text": "safe query"})
+        self.assertIn("verified", result)
+        perform.assert_called_once_with(element, "value", "safe query")
+
+    def test_named_button_click_uses_invoke_without_screen_capture(self):
+        from contextlib import nullcontext
+        from actions import screen_agent
+        from core.screenview import Element, View
+        element = Element(1, "button", "Run", "", 10, 10, 80, 24,
+                          patterns=("invoke",), runtime_id=(8, 9),
+                          window_pid=10, window_title="Test window")
+        view = View(source="uia", degraded=False, app="fixture.exe",
+                    title="Test window", pid=10, elements=[element])
+        with patch.object(screen_agent, "_view", return_value=view), \
+             patch.object(screen_agent.desktop_control, "action", return_value=nullcontext()), \
+             patch.object(screen_agent, "_verified_after",
+                          return_value=(view, "verified: status changed")), \
+             patch.object(screen_agent.screenview, "perform_uia_pattern",
+                          return_value=(True, "InvokePattern completed")) as perform, \
+             patch.object(screen_agent.screenact, "click",
+                          side_effect=AssertionError("physical click should not run")), \
+             patch.object(screen_agent.screenview, "capture",
+                          side_effect=AssertionError("screenshot should not run")):
+            result = screen_agent.screen_agent({"action": "click", "target": "Run"})
+        self.assertIn("verified", result)
+        perform.assert_called_once_with(element, "invoke", None)
+
 
 class UIADiagnosticLoggingTests(unittest.TestCase):
     def test_diagnostic_logging_is_off_by_default(self):

@@ -42,12 +42,16 @@ _PATTERNS_BY_ROLE = {
     "combobox": ("value", "expand_collapse"), "edit": ("value",),
     "slider": ("range_value",), "list": ("selection", "scroll"),
     "table": ("selection", "scroll"), "group": ("scroll",),
+    "text": ("text",), "document": ("text",),
+    "window": ("window",),
 }
 _PATTERN_IDS = {
     "invoke": 10000, "selection": 10001, "value": 10002,
     "range_value": 10003, "scroll": 10004,
     "expand_collapse": 10005, "selection_item": 10010,
     "toggle": 10015,
+    "text": 10014,
+    "window": 10009,
 }
 _PATTERN_INTERFACES = {
     "invoke": "IUIAutomationInvokePattern",
@@ -58,6 +62,8 @@ _PATTERN_INTERFACES = {
     "expand_collapse": "IUIAutomationExpandCollapsePattern",
     "selection_item": "IUIAutomationSelectionItemPattern",
     "toggle": "IUIAutomationTogglePattern",
+    "text": "IUIAutomationTextPattern",
+    "window": "IUIAutomationWindowPattern",
 }
 
 
@@ -202,6 +208,12 @@ def _element(raw: Any, eid: int, depth: int, parent_name: str,
                             getattr(uia, _PATTERN_INTERFACES[pattern_name]))
                         values["value"] = str(value_pattern.CurrentValue or "")[:_VALUE_LIMIT]
                         value_read_only = bool(value_pattern.CurrentIsReadOnly)
+                    elif pattern_name == "text" and not protected:
+                        from comtypes.gen import UIAutomationClient as uia
+                        text_pattern = pattern.QueryInterface(
+                            getattr(uia, _PATTERN_INTERFACES[pattern_name]))
+                        text_range = text_pattern.DocumentRange
+                        values["value"] = str(text_range.GetText(_VALUE_LIMIT) or "")[:_VALUE_LIMIT]
             except Exception:
                 # An unsupported or stale pattern does not discard the element.
                 continue
@@ -330,6 +342,10 @@ def perform(hwnd: int, pid: int, title: str, runtime_id: tuple[int, ...],
                 pattern.Toggle()
             elif requested == "selection_item":
                 pattern.Select()
+            elif requested == "selection":
+                selection = pattern.GetCurrentSelection()
+                count = int(selection.Length)
+                return True, f"SelectionPattern read {count} selected item(s)"
             elif requested == "expand_collapse":
                 if str(value or "expand").lower() == "collapse":
                     pattern.Collapse()
@@ -340,6 +356,13 @@ def perform(hwnd: int, pid: int, title: str, runtime_id: tuple[int, ...],
             elif requested == "scroll":
                 horizontal, vertical = value or (0, 1)
                 pattern.Scroll(int(horizontal), int(vertical))
+            elif requested == "window":
+                states = {"normal": 0, "restore": 0, "maximize": 1,
+                          "minimize": 2, "maximized": 1, "minimized": 2}
+                state = states.get(str(value or "").lower())
+                if state is None:
+                    return False, "WindowPattern requires normal, restore, maximize, or minimize"
+                pattern.SetWindowVisualState(state)
         if stop():
             return False, "desktop control was stopped after the UIA action"
         return True, "UI Automation pattern completed"

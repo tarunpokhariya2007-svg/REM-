@@ -90,6 +90,66 @@ class ScreenObservationTests(unittest.TestCase):
                 lambda: self._view(),
             )
 
+    def test_live_inactivity_close_is_classified_through_taskgroup(self):
+        import main
+        leaf = RuntimeError("APIError 1008: Session closed due to client inactivity")
+        self.assertTrue(main._is_live_inactivity_close(leaf))
+        self.assertTrue(main._is_live_inactivity_close(
+            ExceptionGroup("session task failed", [leaf])))
+        self.assertFalse(main._is_live_inactivity_close(
+            RuntimeError("APIError 1008: invalid configuration")))
+
+    def test_playback_audio_queue_is_bounded_and_sheds_oldest_without_blocking(self):
+        import asyncio
+        import main
+
+        class UI:
+            def __init__(self): self.logs = []
+            def write_log(self, text): self.logs.append(text)
+
+        rem = main.RemLive.__new__(main.RemLive)
+        rem.audio_in_queue = asyncio.Queue(maxsize=2)
+        rem.audio_in_queue.put_nowait(b"old-1")
+        rem.audio_in_queue.put_nowait(b"old-2")
+        rem.ui = UI()
+        rem._playback_queue_overflows = 0
+        rem._playback_overflow_notice_at = 0.0
+        self.assertTrue(rem._queue_playback_audio(b"new"))
+        self.assertEqual(rem.audio_in_queue.qsize(), 2)
+        self.assertEqual(rem.audio_in_queue.get_nowait(), b"old-2")
+        self.assertEqual(rem.audio_in_queue.get_nowait(), b"new")
+        self.assertEqual(rem._playback_queue_overflows, 1)
+        self.assertTrue(rem.ui.logs)
+
+    def test_shutdown_hook_cancels_live_run_and_finish_is_idempotent(self):
+        import threading
+        import main
+
+        class Loop:
+            def __init__(self): self.running = True; self.scheduled = []
+            def is_running(self): return self.running
+            def call_soon_threadsafe(self, callback): self.scheduled.append(callback)
+        class Task:
+            def __init__(self): self.cancelled = False
+            def cancel(self): self.cancelled = True
+
+        rem = main.RemLive.__new__(main.RemLive)
+        rem._closing = False
+        rem._finish_started = False
+        rem._finish_lock = threading.Lock()
+        rem._loop = Loop()
+        rem._run_task = Task()
+        rem.request_shutdown()
+        self.assertTrue(rem._closing)
+        self.assertEqual(len(rem._loop.scheduled), 1)
+        rem._loop.scheduled[0]()
+        self.assertTrue(rem._run_task.cancelled)
+        rem._loop.running = False
+        with patch.object(rem, "_stop_engines") as stop:
+            rem.finish()
+            rem.finish()
+        stop.assert_called_once()
+
     def test_excluded_secure_window_is_checked_before_screenshot_capture(self):
         events = []
         with self.assertRaisesRegex(PermissionError, "excluded"):
@@ -191,22 +251,38 @@ class GeminiLiveScreenDispatchTests(unittest.TestCase):
         import main
         declaration = next(d for d in main.TOOL_DECLARATIONS
                            if d.get("name") == "screen_process")
-        self.assertIn("read-only screen observation", declaration["description"].lower())
+        self.assertIn("local windows ui automation", declaration["description"].lower())
+        self.assertIn("cloud visual inspection", declaration["description"].lower())
         self.assertEqual(declaration["parameters"]["required"], ["text"])
         self.assertNotIn("target", declaration["parameters"]["properties"])
 
-    def test_cloud_permission_off_refuses_before_screenshot_capture(self):
+    def test_cloud_permission_off_uses_local_observation_without_capture(self):
         import main
         class Session:
             def __init__(self): self.inputs = []
-        rem, _loop = _bare_rem(main, Session())
+        rem, fake_loop = _bare_rem(main, Session())
+        calls = []
+        class Registry:
+            def has(self, name): return name == "desktop_ui"
+            def run(self, name, args, ctx):
+                calls.append((name, args, ctx))
+                return "local UIA observation: Code.exe — App.tsx, Edit Search field"
+        rem._action_registry = Registry()
         with patch("memory.config_manager.get_cloud_screen_vision_enabled", return_value=False), \
+             patch.object(main.asyncio, "get_event_loop", return_value=fake_loop), \
              patch.object(main, "_capture_screen", side_effect=AssertionError("must not capture")) as capture:
             response = _run_immediate(rem._execute_tool(SimpleNamespace(
                 name="screen_process", args={"text": "Check my screen"}, id="no-cloud")))
         capture.assert_not_called()
-        self.assertIn("disabled", response.response["result"].lower())
-        self.assertIn("No screenshot was captured", response.response["result"])
+        self.assertIn("local UIA observation", response.response["result"])
+        self.assertEqual(calls[0][0:2], ("desktop_ui", {"action": "observe"}))
+
+    def test_text_only_model_prompt_preserves_local_semantic_access(self):
+        import main
+        limits = main._describe_limits(has_vision=False, has_mic=True)
+        self.assertIn("desktop_ui", limits)
+        self.assertIn("browser_control", limits)
+        self.assertNotIn("no sight at all", limits.lower())
 
     def test_dispatch_queues_screenshot_and_returns_it_to_live(self):
         import main

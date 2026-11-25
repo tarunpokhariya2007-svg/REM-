@@ -240,3 +240,5 @@ This is a live integrated-adapter acceptance in the same normal desktop security
 A failed semantic Invoke now fails closed. The action layer no longer retries a UIA Invoke failure (including timeout/unknown completion) as a physical click, preventing a possible duplicate action. ValuePattern writes now verify exact CurrentValue readback before reporting completion.
 
 Final validation after these changes: 107 automated tests passed; Python compilation passed for core/actions/plugins/memory/tests/Windows acceptance harnesses; `git diff --check` passed (only existing LF/CRLF conversion notices). No unrelated modified files were reverted. `memory/routines.json` remained as found in the initially dirty worktree; no staging, commit, or push occurred.
+
+Additional adapter coverage: UIA TextPattern reads bounded visible text where exposed; SelectionPattern reports selected-item count, and WindowPattern routes normal/restore/maximize/minimize requests through `SetWindowVisualState`. These latest pattern routes are compilation/mock-reviewed only; no real window-management or WindowPattern acceptance has been performed. The current overall suite is 117 passed.

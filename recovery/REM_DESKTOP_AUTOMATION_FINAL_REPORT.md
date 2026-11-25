@@ -25,7 +25,7 @@ The earlier failing probe ran as a Low-integrity AppContainer; it could not insp
 | Windows UIA enumeration | **Real Windows tested — pass** | REM `screenview._scan_windows()` found 25 fixture elements through CUIAutomation8; exact HWND/PID/title verified. |
 | Edit ValuePattern | **Real Windows tested — pass** | Search field/Edit 50004, SearchBox, writable; integrated action set `REM_INTEGRATED_UIA_TEST`; immediate adapter and fresh scan readback matched. |
 | Button InvokePattern | **Real Windows tested — pass** | Run test search/Button 50000, SearchButton; integrated action invoked; visible status became `Search completed: REM_INTEGRATED_UIA_TEST`. |
-| Other semantic patterns | **Real Windows tested — partial** | Checkbox TogglePattern toggled and restored; combo ExpandCollapsePattern expanded/collapsed; Alpha ListItem SelectionItemPattern selected. Tabs had SelectionItemPattern but empty RuntimeIds, so REM's identity guard prevented action. No WindowPattern was exposed. |
+| Other semantic patterns | **Real Windows tested — partial** | Checkbox TogglePattern toggled and restored; combo ExpandCollapsePattern expanded/collapsed; Alpha ListItem SelectionItemPattern selected. Tabs had SelectionItemPattern but empty RuntimeIds, so REM's identity guard prevented action. The earlier scan did not probe WindowPattern; its live availability remains unverified. |
 | Native desktop control | **Implemented; partial live evidence** | Existing screen-agent, desktop-control and screenact routes remain; integrated UIA semantic path tested. Not every operation/window-management path was exercised in this acceptance. |
 | Mouse and keyboard | **Real Windows tested previously — partial/full mouse harness** | Prior disposable mouse report records physical movement, hover, clicks, scroll, drag/drop, release and emergency stop passing. No physical input was used in the current UIA acceptance. Keyboard application-level acceptance remains outstanding. |
 | Persistent local observation | **Implemented; mock/offline tested; lifecycle not real-tested** | Saved local preference, pause/resume/emergency behavior and observation/cloud permission separation exist. Restart restoration, GUI consent flow, exclusions and event-driven update acceptance remain outstanding; current implementation still polls rather than using a UIA event-fed cache. |
@@ -89,3 +89,16 @@ cd C:\important\Mark-LVII-main\Mark-LVII-main
 ```
 
 **Final status: UIA semantic acceptance through REM's integrated adapter is complete for the tested fixture paths. The broader REM desktop-intelligence and full voice-to-action mission remains partially complete; do not describe REM as fully accepted for real-world operation.**
+
+## Updated status — 2026-11-25 continuation
+
+Changes after integrated UIA acceptance:
+
+- Cloud screen permission no longer blocks local read-only observation. `screen_process` falls back to the existing authorized desktop UIA observer without screenshot capture when cloud image permission is disabled. Text-only model limits explicitly direct the model to desktop_ui and browser_control.
+- Native screen-agent actions use semantic ValuePattern write/readback, InvokePattern, TogglePattern/SelectionItemPattern, and SetFocus before physical input. Failed semantic actions do not retry as mouse clicks. The view reports bounded TextPattern content and accessible identity/geometry.
+- CUIAutomation8/comtypes is the reported primary Windows backend; PyWinAuto remains fallback. The local consent storage adds `persistent_local_observation_enabled` with the legacy key supported.
+- Request snapshots use ContextVar for concurrent tasks/nested dispatch; 1008 inactivity closure is recognized, session tasks are canceled/rebuilt under existing lifecycle, Qt shutdown cancels the Live task and guards playback state updates, and inbound PCM queue has a fixed bound with observable nonblocking loss handling.
+
+Mocked/offline validation: **117 tests passed**, compilation passed, `git diff --check` passed. Previously documented real integrated UIA on the disposable fixture passed field discovery, writable ValuePattern/readback, button Invoke/status, checkbox toggle/restore, combo expand/collapse, and list-item selection. The current continuation's new fallback/dispatch, ContextVar, inactivity and shutdown paths have no live full-app/voice test. No full Gemini Live reconnect test, GUI shutdown-during-audio test, persistent preference restart/exclusion test, memory restart CRUD, browser disconnect acceptance, or sustained resource test was run. Full mission remains incomplete.
+
+The latest adapter also has a local WindowPattern visual-state route (normal/restore/maximize/minimize), TextPattern bounded text extraction, and SelectionPattern selected-count readback. These were not exercised in a live window; see manual steps and retain their status as unverified.
