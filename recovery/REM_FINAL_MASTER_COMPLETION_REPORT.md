@@ -188,3 +188,14 @@ The `f68d061` commit explicitly deletes the 417-line `LICENSE` file without an e
 - Fresh mouse acceptance did **not** reproduce historical movement success: absolute move expected `(1018,472)` but actual cursor was `(865,609)`; Python dimensions were 1920x1080 while Win32 metrics were 1536x864, window DPI telemetry was 96 with 1.25 scaling, and direct Win32 `SetCursorPos` returned Access Denied. The acceptance process reported AppContainer=true. The runner stopped before any click; no restriction was bypassed.
 - Fresh UIA semantic acceptance was blocked because the fixture did not become foreground (Chrome remained foreground); the runner refused to act. Historical same-fixture UIA semantic acceptance remains valid evidence in the JSONL record, but the fresh rerun is not a pass.
 - Protected `memory/routines.json` was already modified before this continuation and was not edited by this continuation. `config/api_keys.json` remains untouched. LICENSE remains the verified exact 417-line parent copy, untracked. No stage, commit, or push was performed.
+
+## Voice stability and startup continuation — 2026-11-26
+
+- **Playback overflow root cause:** 80 × 50 ms chunks (4 s); old overflow behavior popped the oldest assistant PCM chunk. Fixed with a configurable bounded 30 s default (5–120 s), FIFO awaited backpressure, generation-tagged chunks, queue metrics, and close/drain on shutdown.
+- **Interrupt handling:** Voice barge-in was disabled in the mic callback. EchoGuard now classifies during playback, BargeInGate requires sustained evidence, and the installed SDK ActivityStart marker precedes resumed mic PCM. This is mocked/synthetic evidence only; no acoustic false-positive/true-interrupt test is verified.
+- **Startup news:** The startup routine used a two-phase greeting + automatic news fetch. Startup now emits a single greeting only; scheduled/manual briefing/news routes remain. Unit tests cover startup routing, not a real app-start speech.
+- **Authorization race:** Input-transcription chunks now refresh the immutable request snapshot before a possible Live tool call. No blanket local authorization was added. A real Live authorization/action chain remains unverified.
+- **Website-name ambiguity:** Unknown bare names no longer guess a `.com`; known site aliases map explicitly and unknown names ask one clarification. Mock-tested; browser real acceptance remains blocked/unverified as in the prior browser report.
+- **Audio device:** Real local digital loopback passed at 0.75 s write time for a 0.7 s tone (660 Hz component 195.0); physical audibility and Live/TTS output remain unverified.
+
+Latest regression: **210 tests passed, 0 failed**. `compileall -q main.py core actions memory tests` and `git diff --check` passed. See [REM_VOICE_STABILITY_AND_PLAYBACK_REPORT.md](REM_VOICE_STABILITY_AND_PLAYBACK_REPORT.md). No dependency installation or user-data change was made.

@@ -42,3 +42,13 @@ Current suite: **171 passed, 0 failed**. `compileall -q .` and `git diff --check
 Fresh acceptance deltas: mouse absolute movement failed in this AppContainer execution context (coordinate mismatch plus Win32 Access Denied); the UIA runner safely refused because the test window was not foreground; Chrome failed at temporary-profile Crashpad startup before CDP; Edge is not verified. Earlier real UIA, screen/OCR, CDP DOM, and digital audio loopback results remain historical evidence but are not upgrades to these fresh blocked attempts. Live voice-to-tool and audible playback remain unverified.
 
 The `pynvml` warning persists because the existing environment has both deprecated `pynvml` and maintained `nvidia-ml-py` distributions. No dependency was installed or removed. The pre-existing routine file modification remains untouched by this continuation.
+
+## Voice stability continuation — 2026-11-26
+
+Confirmed code defect: assistant PCM overflow used an 80-item (~4 s) bounded queue but evicted the oldest chunk when full; this is a direct mechanism for dropped words. Producer bursts could outpace the realtime output consumer, but the absence of historical per-response queue-rate telemetry means actual saturation frequency is unknown. The new queue applies finite 30 s default buffering (user-configurable 5–120 s), FIFO backpressure, generation tags, discard reasons, queue wait/high-water/latency/rate counters, and orderly close.
+
+Voice barge-in had been deliberately disabled in `_listen_audio`; this means the disabled speech detector was not causing false voice interruptions. The EchoGuard now filters playback reference during speaking and a sustained-block gate precedes an SDK-validated `ActivityStart`. Acoustic behavior remains unverified. The real local audio probe verifies Realtek digital loopback only.
+
+Startup's enabled opening-briefing routine led to a greeting plus unsolicited headline phase. Startup now dispatches one greeting independent of that routine; manual/scheduled briefing functionality remains. A transcript timing race is also addressed by recording each input-transcription chunk before tool dispatch can capture its task context. Unknown bare website names now ask for clarification instead of being guessed as `.com`.
+
+Latest tests: **210 passed, 0 failed**; compileall and diff check passed. No real Gemini voice session or physical audible output was established. See the focused voice report.

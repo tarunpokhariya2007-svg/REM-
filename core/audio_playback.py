@@ -22,12 +22,14 @@ class PlaybackBuffer:
         self.maxsize = int(maxsize)
         self._queue: asyncio.Queue[PlaybackChunk] = asyncio.Queue(maxsize=self.maxsize)
         self.generated = 0
+        self.enqueued = 0
         self.played = 0
         self.discarded: dict[str, int] = {}
         self.high_water = 0
         self.producer_wait_seconds = 0.0
         self.playback_latency_seconds = 0.0
         self._closed = False
+        self._created_at = time.monotonic()
 
     async def put(self, data: bytes, generation: int) -> bool:
         if self._closed:
@@ -37,6 +39,7 @@ class PlaybackBuffer:
         self.generated += 1
         started = time.monotonic()
         await self._queue.put(chunk)
+        self.enqueued += 1
         waited = time.monotonic() - started
         self.producer_wait_seconds += waited
         self.high_water = max(self.high_water, self.qsize())
@@ -106,10 +109,14 @@ class PlaybackBuffer:
         return self._queue.empty()
 
     def stats(self) -> dict:
+        elapsed = max(0.001, time.monotonic() - self._created_at)
         return {
             "size": self.qsize(), "capacity": self.maxsize,
             "high_water": self.high_water, "generated": self.generated,
+            "enqueued": self.enqueued,
             "played": self.played, "discarded": dict(self.discarded),
+            "generated_chunks_per_s": round(self.generated / elapsed, 2),
+            "played_chunks_per_s": round(self.played / elapsed, 2),
             "producer_wait_ms": round(self.producer_wait_seconds * 1000, 2),
             "mean_queue_latency_ms": round(
                 self.playback_latency_seconds * 1000 / max(1, self.played), 2),

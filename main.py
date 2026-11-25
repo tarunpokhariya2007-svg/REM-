@@ -92,7 +92,7 @@ from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.audio_playback       import PlaybackBuffer
-from core.voice_state          import VoicePhase, VoiceState
+from core.voice_state          import BargeInGate, VoicePhase, VoiceState
 from core.action_loader        import discover_actions
 from core.request_context      import RequestContext
 
@@ -655,7 +655,7 @@ class RemLive:
         self._playback_overflow_notice_at = 0.0
         self._playback_generation = 0
         self._playback_generation_lock = threading.Lock()
-        self._barge_in_blocks = 0
+        self._barge_in_gate = BargeInGate()
         self._voice_state = VoiceState()
         self._startup_greeting_sent = False
         self._loop                     = None
@@ -1249,10 +1249,20 @@ class RemLive:
                 return
             self._finish_started = True
             self._closing = True
+            state = getattr(self, "_voice_state", None)
+            if state is not None:
+                state.set(VoicePhase.STOPPED)
+            generation_lock = getattr(self, "_playback_generation_lock", None)
+            if generation_lock is not None:
+                with generation_lock:
+                    self._playback_generation += 1
         loop = getattr(self, "_loop", None)
         if loop is not None and loop.is_running():
             try:
                 async def _shutdown_on_loop():
+                    self._discard_playback_audio("shutdown")
+                    if self.audio_in_queue is not None:
+                        self.audio_in_queue.close("shutdown")
                     current = asyncio.current_task()
                     tasks = [task for task in asyncio.all_tasks(loop)
                              if task is not current and not task.done()]
@@ -1298,7 +1308,11 @@ class RemLive:
         loop = getattr(self, "_loop", None)
         if not loop or not self.session:
             raise RuntimeError("the assistant is not connected")
+        options = dict(options or {})
+        trigger_type = options.pop("_trigger_type", "")
         if name == "briefing":
+            if trigger_type == "startup":
+                return
             coro = self._send_startup_briefing(options)
         elif name == "checkin":
             coro = self._routine_checkin(options)
@@ -1565,6 +1579,7 @@ class RemLive:
                   "sync=text-viseme+playback-PCM")
         if value:
             self._tail_until = 0.0
+            self._voice_state.set(VoicePhase.SPEAKING)
         else:
             # Hold the guard open across the device's own output latency plus a
             # margin for the room. The microphone is NOT muted during it — the
@@ -1576,6 +1591,8 @@ class RemLive:
             # still needs it to recognise our own voice. It is dropped when the
             # tail expires. What the guard learned about the room always stays.
             self._out_level = 0.0
+            self._voice_state.set(VoicePhase.STOPPED if getattr(self, "_closing", False)
+                                  else VoicePhase.LISTENING)
         if not getattr(self, "_closing", False):
             if value:
                 self.ui.set_state("SPEAKING")
@@ -1585,9 +1602,18 @@ class RemLive:
     def request_shutdown(self) -> None:
         """Stop the Live task tree as soon as the Qt application is quitting."""
         self._closing = True
+        state = getattr(self, "_voice_state", None)
+        if state is not None:
+            state.set(VoicePhase.STOPPED)
+        generation_lock = getattr(self, "_playback_generation_lock", None)
+        if generation_lock is not None:
+            with generation_lock:
+                self._playback_generation += 1
         loop = getattr(self, "_loop", None)
         if loop is None or not loop.is_running():
+            self._discard_playback_audio("shutdown")
             return
+        loop.call_soon_threadsafe(lambda: self._discard_playback_audio("shutdown"))
         task = getattr(self, "_run_task", None)
         if task is not None:
             loop.call_soon_threadsafe(task.cancel)
@@ -1686,7 +1712,7 @@ class RemLive:
                 self._engine.interrupt()
             except Exception:
                 pass
-        self._barge_in_blocks = 0
+        self._barge_in_gate.reset()
         if not getattr(self, "_closing", False):
             self._voice_state.set(VoicePhase.LISTENING)
         self.ui.write_log("SYS: Interrupted — listening...")
@@ -1696,7 +1722,7 @@ class RemLive:
             return self._playback_generation
 
     def _discard_playback_audio(self, reason: str) -> int:
-        queue = self.audio_in_queue
+        queue = getattr(self, "audio_in_queue", None)
         if queue is None:
             return 0
         count = queue.discard_all(reason)
@@ -2245,15 +2271,44 @@ class RemLive:
             # Gemini 3.x Live rejects the old realtime_input.media_chunks field
             # (what `media=...` maps to) and closes the socket with a 1007. Send
             # mic / phone PCM through the new `audio` field instead. Queue items
-            # are {"data": <bytes>, "mime_type": <str>} from _listen_audio and
-            # the phone relay.
-            async with self._realtime_input_lock:
+            # are PCM dictionaries from _listen_audio/the phone relay, or an
+            # explicit activity-start marker after locally confirmed barge-in.
+            await self._send_realtime_message(msg)
+
+    async def _send_realtime_message(self, msg: dict) -> None:
+        async with self._realtime_input_lock:
+            if msg.get("activity_start"):
+                await self.session.send_realtime_input(
+                    activity_start=types.ActivityStart())
+            else:
                 await self.session.send_realtime_input(
                     audio=types.Blob(
                         data=msg["data"],
                         mime_type=msg.get("mime_type", "audio/pcm;rate=16000"),
                     )
                 )
+
+    async def _write_audio_batch(self, stream, data: bytes) -> None:
+        """Keep a blocking PortAudio write alive until it finishes or aborts."""
+        writer = asyncio.create_task(asyncio.to_thread(stream.write, data))
+        try:
+            await asyncio.shield(writer)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(writer),
+                    timeout=max(2.0, float(getattr(self, "_out_latency", 0.2)) + 1.0),
+                )
+            except asyncio.TimeoutError:
+                try:
+                    stream.abort()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(asyncio.shield(writer), timeout=1.0)
+                except Exception as exc:
+                    print(f"[REM] Audio write worker did not stop cleanly: {type(exc).__name__}")
+            raise
 
     def _queue_realtime_audio(self, message: dict) -> bool:
         """Enqueue live mic audio without blocking; keep the newest audio on overflow.
@@ -2298,7 +2353,11 @@ class RemLive:
         if queue is None:
             return False
         generation = self._playback_generation_now()
-        if self._interrupted or self._closing:
+        if self._closing:
+            queue.record_discard("shutdown")
+            return False
+        if self._interrupted:
+            queue.record_discard("interruption")
             return False
         accepted = await queue.put(chunk, generation)
         if generation != self._playback_generation_now() or self._interrupted:
@@ -2342,14 +2401,19 @@ class RemLive:
             # the echo of what we are playing right now", sustained long enough
             # that a cough or a keystroke cannot trigger it.
             if rem_speaking:
-                # Nothing is streamed while REM talks.
-                #
-                # Interrupting by voice used to live here: `EchoGuard` can pick a
-                # user out from under our own echo, and `core/echo.py` still does
-                # that for the tail below. Re-enabling is small — classify each
-                # block here and call interrupt() after `required_blocks` of
-                # agreement — but it depends on the listener's room, so it stays
-                # out until it can be tried on real hardware.
+                # Never send REM's speaker echo to Live. Require sustained
+                # content-separated speech before interrupting, with a longer
+                # debounce in rooms where echo classification is less reliable.
+                try:
+                    _user_speech = self._echo.is_user_speech(
+                        indata, SEND_SAMPLE_RATE, _pcm_level(indata))
+                    if self._barge_in_gate.observe(
+                            _user_speech, self._echo.required_blocks):
+                        loop.call_soon_threadsafe(
+                            self._queue_realtime_audio, {"activity_start": True})
+                        loop.call_soon_threadsafe(self.interrupt)
+                except Exception:
+                    self._barge_in_gate.reset()
                 return
 
             # ── Echo tail ────────────────────────────────────────────────────
@@ -2366,7 +2430,7 @@ class RemLive:
                     self._tail_until = 0.0      # a real voice ends the tail early
                 except Exception:
                     return
-            elif self._echo._hist:
+            elif self._echo.has_history:
                 self._echo.reset()
 
             # ── Push-to-talk ─────────────────────────────────────────────────
@@ -2533,8 +2597,12 @@ class RemLive:
 
                     if response.data:
                         if self._interrupted:
-                            pass  # discard: interrupted
+                            if self.audio_in_queue is not None:
+                                self.audio_in_queue.record_discard(
+                                    "interruption",
+                                    max(1, (len(response.data) + 2399) // 2400))
                         else:
+                            self._voice_state.set(VoicePhase.GENERATING_AUDIO)
                             if self._turn_done_event and self._turn_done_event.is_set():
                                 self._turn_done_event.clear()
                             # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
@@ -2542,7 +2610,9 @@ class RemLive:
                             _audio_data = response.data
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
-                                self._queue_playback_audio(_audio_data[_i : _i + _SLICE])
+                                if not await self._queue_playback_audio(
+                                        _audio_data[_i : _i + _SLICE]):
+                                    break
 
                     if response.server_content:
                         sc = response.server_content
@@ -2574,12 +2644,16 @@ class RemLive:
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
+                                self._voice_state.set(VoicePhase.THINKING)
                                 # A fresh direct voice turn invalidates any
                                 # prior typed/dashboard request before its own
                                 # transcript is complete.
                                 if not in_buf:
                                     self._record_user_request("", "voice")
                                 in_buf.append(txt)
+                                # Bind partial direct speech before a tool-call
+                                # event can arrive ahead of turn_complete.
+                                self._record_user_request(" ".join(in_buf), "voice")
                                 self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
@@ -2590,6 +2664,7 @@ class RemLive:
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
                                 self._interrupted = False
+                                self._voice_state.set(VoicePhase.LISTENING)
                                 in_buf  = []
                                 out_buf = []
                                 self._visemes.reset()
@@ -2733,6 +2808,7 @@ class RemLive:
 
         try:
             stream = _open_spk(_spk_dev)
+            _using_default_output = _spk_dev is None
         except Exception as _e:
             # A chosen output that the host API accepts by name but refuses to
             # open (exclusive mode, wrong sample rate, device asleep) must not
@@ -2742,6 +2818,7 @@ class RemLive:
             print(f"[REM] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
             self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
             stream = _open_spk(None)
+            _using_default_output = True
 
         # Ask the device how far behind the speakers actually are, rather than
         # assuming. This is what the echo tail is sized from, so a machine with a
@@ -2795,17 +2872,25 @@ class RemLive:
                         self.set_speaking(False, reason="audio-gap-timeout")
                     continue
 
+                if chunk.generation != self._playback_generation_now():
+                    self.audio_in_queue.record_discard("stale_generation")
+                    continue
                 self.set_speaking(True)
 
-                # Batch all immediately-available chunks into one write to reduce
-                # thread-pool round-trips (was one asyncio.to_thread per 50ms slice).
-                # Cap at ~200 ms so interrupt() still stops audio within ~200 ms.
-                batch = bytearray(chunk)
-                while len(batch) < 9600:   # 9600 bytes ≈ 200 ms at 24 kHz / 16-bit mono
+                # Batch available chunks to reduce thread-pool round-trips while
+                # keeping an in-flight output write near 100 ms for interruption.
+                batch = bytearray(chunk.data)
+                batch_chunks = [chunk]
+                while len(batch) < 4800:   # 100 ms bounds in-flight speech on cancellation
                     try:
-                        batch.extend(self.audio_in_queue.get_nowait())
+                        next_chunk = self.audio_in_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+                    if next_chunk.generation != chunk.generation:
+                        self.audio_in_queue.record_discard("stale_generation")
+                        continue
+                    batch.extend(next_chunk.data)
+                    batch_chunks.append(next_chunk)
 
                 # Drive the HUD waveform and the avatar's mouth from REM's
                 # own voice. The batch is up to 200 ms long, so we hand over a
@@ -2858,19 +2943,96 @@ class RemLive:
                     pass
 
                 try:
-                    await asyncio.to_thread(stream.write, bytes(batch))
+                    if chunk.generation != self._playback_generation_now() or self._closing:
+                        self.audio_in_queue.record_discard(
+                            "shutdown" if self._closing else "interruption",
+                            len(batch_chunks))
+                        continue
+                    self._voice_state.set(VoicePhase.SPEAKING)
+                    _write_started = time.monotonic()
+                    await self._write_audio_batch(stream, bytes(batch))
                     last_audio_write = time.monotonic()
-                except (RuntimeError, asyncio.CancelledError):
-                    break   # executor shutting down — exit cleanly
+                    for item in batch_chunks:
+                        self.audio_in_queue.mark_played(queued_at=item.queued_at)
+                    if time.monotonic() - _write_started > 1.0:
+                        print("[REM] Audio output write exceeded 1s; device may be stalled")
+                except asyncio.CancelledError:
+                    break   # _write_audio_batch waits for its worker before cleanup
+                except Exception as write_exc:
+                    self.audio_in_queue.record_discard("device_failure", len(batch_chunks))
+                    if _using_default_output:
+                        raise RuntimeError("system-default audio output failed") from write_exc
+                    try:
+                        stream.stop()
+                    except Exception:
+                        pass
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    try:
+                        stream = _open_spk(None)
+                    except Exception as fallback_exc:
+                        raise RuntimeError("selected and system-default audio outputs failed") from fallback_exc
+                    _using_default_output = True
+                    self._play_cursor = 0.0
+                    self._echo.reset()
+                    self.ui.write_log(
+                        "SYS: Selected speaker stopped during playback; continuing on system default.")
         except Exception as e:
             print(f"[REM] ❌ Play: {e}")
             raise
         finally:
+            self._voice_state.set(VoicePhase.STOPPED if self._closing else VoicePhase.LISTENING)
             self.set_speaking(False, reason="playback-stopped")
+            if self.audio_in_queue is not None:
+                self.audio_in_queue.close(
+                    "shutdown" if self._closing else "session_replaced")
             stream.stop()
             stream.close()
 
-    # ── Morning briefing ────────────────────────────────────────────────────────
+    # ── Startup greeting and on-demand/scheduled briefing ───────────────────────
+
+    async def _send_startup_greeting(self) -> None:
+        """Send one short startup greeting without fetching news or markets."""
+        if self._startup_greeting_sent or not self.session:
+            return
+        self._startup_greeting_sent = True
+        try:
+            identity = load_memory().get("identity", {})
+        except Exception:
+            identity = {}
+
+        def _identity_value(key: str) -> str:
+            entry = identity.get(key, {}) if isinstance(identity, dict) else {}
+            return (entry.get("value", "") if isinstance(entry, dict)
+                    else str(entry)).strip()
+
+        lang, name = _identity_value("language"), _identity_value("name")
+        hour = datetime.now().hour
+        greeting = ("Good morning" if 5 <= hour < 12 else
+                    "Good afternoon" if 12 <= hour < 17 else
+                    "Good evening" if 17 <= hour < 21 else "It's quite late")
+        prompt = (
+            f"You are REM, the user's devoted and caring personal maid and AI companion, "
+            "inspired by Rem from Re:Zero. Speak affectionately, elegantly and naturally. "
+            f"{'Speak this greeting in ' + lang + '. ' if lang else ''}"
+            f"{'Address the user as ' + name + '. ' if name else ''}"
+            "Greet Master naturally and briefly, say you are ready to help, and ask what "
+            "they would like to do. Do not announce news, markets, reminders, or other "
+            "briefings. Use at most two short sentences; do not call tools."
+        )
+        if self._turn_done_event:
+            self._turn_done_event.clear()
+        try:
+            await self.session.send_client_content(
+                turns={"role": "user", "parts": [{"text": f"{greeting}: {prompt}"}]},
+                turn_complete=True,
+            )
+        except Exception:
+            self._startup_greeting_sent = False
+            raise
+        print("[REM] Startup greeting sent (no briefing).")
 
     async def _send_startup_briefing(self, options: dict | None = None) -> None:
         """
@@ -3456,7 +3618,13 @@ class RemLive:
 
                     self.session          = session
                     self._realtime_input_lock = asyncio.Lock()
-                    self.audio_in_queue   = asyncio.Queue(maxsize=80)
+                    with self._playback_generation_lock:
+                        self._playback_generation += 1
+                    _buffer_seconds = get_playback_buffer_seconds()
+                    _buffer_chunks = max(1, int(_buffer_seconds / 0.05))
+                    self.audio_in_queue = PlaybackBuffer(maxsize=_buffer_chunks)
+                    print(f"[REM] Playback buffer capacity={_buffer_chunks} chunks "
+                          f"(~{_buffer_seconds}s at 50ms/chunk)")
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
                     self._rx_deadline     = None
@@ -3464,6 +3632,8 @@ class RemLive:
                     # Reset transient state that must not carry over from a previous session
                     self._reset_vision_state(reset_cooldown=True)
                     self._interrupted          = False
+                    self._voice_state.set(VoicePhase.LISTENING)
+                    self._barge_in_gate.reset()
 
                     print("[REM] Connected.")
                     if _resumed_with:
@@ -3551,16 +3721,10 @@ class RemLive:
                     if self._engine is not None:
                         tg.create_task(self._engine.warmup())
 
-                    # Morning briefing — fires once per process launch (if enabled).
-                    # Skipped in wake-word mode: it comes up asleep, and a briefing
-                    # would mean talking while "asleep".
-                    # With routines it is the "Opening briefing" routine, which
-                    # keeps the same rules (first connect only, not asleep).
                     if self._routines is not None:
                         self._routines.session_started(self._awake)
-                    elif not self._briefing_sent and get_brief_enabled() and self._awake:
-                        self._briefing_sent = True
-                        tg.create_task(self._send_startup_briefing())
+                    if self._awake and not self._startup_greeting_sent:
+                        tg.create_task(self._send_startup_greeting())
 
             except KeyboardInterrupt:
                 raise

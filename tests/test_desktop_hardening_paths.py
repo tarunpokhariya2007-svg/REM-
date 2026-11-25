@@ -51,6 +51,12 @@ class ChromeCdpConfigurationTests(unittest.TestCase):
         self.assertEqual(browser_control._normalize_url("localhost:5173"),
                          "http://localhost:5173")
 
+    def test_ambiguous_bare_website_name_asks_instead_of_guessing(self):
+        session = object.__new__(browser_control._BrowserSession)
+        result = _run_immediate(session.go_to("portal"))
+        self.assertTrue(result.startswith("status=ask action=browser_control"))
+        self.assertIn("Which website", result)
+
     def test_navigation_host_and_port_must_be_in_direct_request(self):
         self.assertTrue(desktop_control.authorize_user_request(
             "Open YouTube", "browser_control",

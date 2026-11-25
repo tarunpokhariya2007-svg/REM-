@@ -39,3 +39,23 @@ class VoiceState:
     def transitions(self) -> int:
         with self._lock:
             return self._transitions
+
+
+class BargeInGate:
+    """Debounce EchoGuard's per-frame decisions before interrupting playback."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._positive = 0
+
+    def observe(self, is_user_speech: bool, required_blocks: int) -> bool:
+        with self._lock:
+            self._positive = self._positive + 1 if is_user_speech else 0
+            if self._positive < max(1, int(required_blocks)):
+                return False
+            self._positive = 0
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._positive = 0

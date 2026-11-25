@@ -90,3 +90,17 @@ See [REM_RUNTIME_ERROR_AUDIT.md](REM_RUNTIME_ERROR_AUDIT.md) and [REM_AUTONOMOUS
 | Dependency warning | **PARTIAL** | Both `pynvml` 13.0.1 and `nvidia-ml-py` 13.615.71 remain installed; deprecation warning persists. No package changes. |
 
 The full run used `..\.venv\Scripts\python.exe -m unittest discover -s tests`: 171 passed, 0 failed. Compilation and diff hygiene passed. These automated results do not upgrade blocked physical acceptance.
+
+## Voice stability continuation — 2026-11-26
+
+| Area | Latest status | Evidence and limits |
+|---|---|---|
+| Output queue | **PASS (mocked)** | Bounded default increased from 80 chunks / 4 s to 600 chunks / 30 s; configurable 5–120 s. Awaited FIFO backpressure replaces oldest-chunk eviction. 500-chunk ordering/backpressure and generation discard tests pass. |
+| Voice state / interruption | **PARTIAL** | Thread-safe voice phases, EchoGuard and sustained BargeInGate, SDK ActivityStart event, generation invalidation, queue drain and shutdown cleanup implemented. Synthetic tests pass; no real Live/acoustic barge-in acceptance. |
+| Audio device loopback | **PASS (real digital loopback)** | 0.7 s local tone write took 0.75 s; local microphone captured 660 Hz component 195.0; no raw audio saved. Does not establish physical audibility. |
+| Live speech playback / TTS | **NOT VERIFIED** | No real Gemini response audio or TTS playback in this continuation; physical audibility was not evaluated by a listener. |
+| Startup announcement | **PASS (unit-tested)** | Startup now schedules one greeting and suppresses only startup-triggered briefing. Scheduled/manual briefing and news features remain. Real application startup speech not tested. |
+| Authorization context | **PARTIAL** | Voice transcript chunks now update the bound expiring task snapshot before tool dispatch. Added unit test; no new Live voice tool call. |
+| Website-name resolution | **PASS (unit-tested)** | Known names map explicitly; ambiguous bare names ask rather than guessing `.com`. No browser smoke test in this continuation. |
+
+Full suite: **210 passed, 0 failed**. Compilation and diff checks passed. See [REM_VOICE_STABILITY_AND_PLAYBACK_REPORT.md](REM_VOICE_STABILITY_AND_PLAYBACK_REPORT.md). Overall REM acceptance remains partial.

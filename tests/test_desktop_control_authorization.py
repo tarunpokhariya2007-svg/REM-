@@ -118,6 +118,25 @@ class DesktopControlAuthorizationTests(unittest.TestCase):
                                         now=time.monotonic() - REQUEST_CONTEXT_TTL - 1)
         self.assertEqual(rem._usable_request_context(expired), ("", "untrusted"))
 
+    def test_growing_voice_transcript_can_authorize_requested_navigation(self):
+        from main import RemLive
+        rem = RemLive.__new__(RemLive)
+        rem._request_context_lock = threading.Lock()
+        rem._request_context = None
+        rem._last_user_command = ""
+        rem._last_user_command_source = ""
+        rem._record_user_request("", "voice")
+        rem._record_user_request("Open", "voice")
+        partial = rem._current_request_context()
+        self.assertFalse(authorize_user_request(
+            partial.instruction, "browser_control",
+            {"action": "go_to", "url": "https://youtube.com"}, source=partial.source)[0])
+        rem._record_user_request("Open YouTube", "voice")
+        complete = rem._current_request_context()
+        self.assertTrue(authorize_user_request(
+            complete.instruction, "browser_control",
+            {"action": "go_to", "url": "https://youtube.com"}, source=complete.source)[0])
+
     def test_contextvar_dispatch_isolated_between_concurrent_tasks(self):
         from concurrent.futures import ThreadPoolExecutor
         from main import RemLive

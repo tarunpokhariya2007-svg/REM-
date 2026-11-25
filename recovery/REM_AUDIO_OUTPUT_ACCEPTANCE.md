@@ -43,3 +43,13 @@ No new acoustic or Live audio playback test was performed. The runtime transport
 ## Latest mission continuation — 2026-11-25
 
 No physical audibility, fresh Gemini output playback, or TTS fallback acceptance was performed in this continuation. The existing report's digital loopback evidence remains the latest positive physical-device-path evidence, but it is not proof of acoustic audibility. Overall status remains **PARTIAL**; Live playback and physical speaker/headphone audibility remain **NOT VERIFIED**. Full software suite 171/171 passed; this does not change hardware acceptance.
+
+## Voice stability continuation — 2026-11-26
+
+Root cause established in code: the old assistant playback queue held 80 × 50 ms = **4 seconds**, and on full capacity it discarded the oldest chunk. This can truncate words in a producer burst. Playback now uses the bounded `playback_buffer_seconds` config (default 30 seconds, clamped 5–120 seconds), FIFO backpressure, generation-tagged chunks, explicit discard reasons, high-water/throughput/latency metrics, and shutdown closure. User input queue behavior remains separate.
+
+Voice barge-in was previously disabled; the existing EchoGuard filtered only the post-playback tail. The microphone now uses EchoGuard plus sustained-block debounce (5 blocks normally, 12 in difficult acoustics), sends the SDK `ActivityStart` event after confirmed local speech, invalidates queued old playback, and then continues mic PCM. A new synchronized phase tracker represents listening/thinking/generating/speaking/interruption/cancellation/stopped. These behaviors have synthetic/unit coverage but no fresh real acoustic or Gemini Live barge-in acceptance.
+
+Fresh local Windows digital loopback: selected Realtek output consumed a 0.7-second tone in 0.75 seconds; the Realtek microphone array captured a 660 Hz component of 195.0. Raw audio was not saved. This is digital loopback evidence only, not physical audibility or REM Live speech.
+
+Full suite after these changes: **210 passed, 0 failed**. Compilation and diff hygiene passed. See [REM_VOICE_STABILITY_AND_PLAYBACK_REPORT.md](REM_VOICE_STABILITY_AND_PLAYBACK_REPORT.md). Physical speech continuity, speaker audibility, TTS and Live output remain **NOT VERIFIED**.

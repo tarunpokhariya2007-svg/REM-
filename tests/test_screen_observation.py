@@ -196,8 +196,9 @@ class ScreenObservationTests(unittest.TestCase):
         rem._run_task = Task()
         rem.request_shutdown()
         self.assertTrue(rem._closing)
-        self.assertEqual(len(rem._loop.scheduled), 1)
-        rem._loop.scheduled[0]()
+        self.assertEqual(len(rem._loop.scheduled), 2)
+        for callback in rem._loop.scheduled:
+            callback()
         self.assertTrue(rem._run_task.cancelled)
         rem._loop.running = False
         with patch.object(rem, "_stop_engines") as stop:

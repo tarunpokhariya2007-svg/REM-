@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from core.audio_playback import PlaybackBuffer
-from core.voice_state import VoicePhase, VoiceState
+from core.voice_state import BargeInGate, VoicePhase, VoiceState
 from tests.manual_async import manual_loop, run_ready
 
 
@@ -70,6 +70,31 @@ class PlaybackBufferTests(unittest.TestCase):
         self.assertEqual(buffer.get_nowait().data, b"new-1")
         self.assertEqual(buffer.stats()["discarded"], {"interruption": 2})
 
+    def test_blocked_producer_cannot_enqueue_stale_audio_after_interrupt(self):
+        import threading
+        import main
+
+        with manual_loop():
+            rem = main.RemLive.__new__(main.RemLive)
+            rem.audio_in_queue = PlaybackBuffer(maxsize=1)
+            rem._playback_generation = 0
+            rem._playback_generation_lock = threading.Lock()
+            rem._interrupted = False
+            rem._closing = False
+            run_ready(rem.audio_in_queue.put(b"queued-old", 0))
+            producer = rem._queue_playback_audio(b"blocked-old")
+            waiter = producer.send(None)
+            self.assertFalse(waiter.done())
+            with rem._playback_generation_lock:
+                rem._playback_generation += 1
+            rem.audio_in_queue.discard_all("interruption")
+            with self.assertRaises(StopIteration) as completed:
+                producer.send(None)
+            self.assertFalse(completed.exception.value)
+            self.assertTrue(rem.audio_in_queue.empty())
+            self.assertEqual(rem.audio_in_queue.stats()["discarded"],
+                             {"interruption": 2})
+
     def test_close_discards_buffer_and_rejects_future_audio(self):
         buffer = PlaybackBuffer(maxsize=2)
         run_ready(buffer.put(b"queued", 1))
@@ -91,6 +116,37 @@ class VoiceStateTests(unittest.TestCase):
         state.set(VoicePhase.LISTENING)
         self.assertEqual(state.phase, VoicePhase.LISTENING)
         self.assertEqual(state.transitions, 7)
+
+    def test_barge_in_requires_sustained_echo_guard_evidence(self):
+        gate = BargeInGate()
+        self.assertFalse(gate.observe(True, 4))
+        self.assertFalse(gate.observe(False, 4))  # one noisy frame resets the run
+        self.assertFalse(gate.observe(True, 4))
+        self.assertFalse(gate.observe(True, 4))
+        self.assertFalse(gate.observe(True, 4))
+        self.assertTrue(gate.observe(True, 4))
+        self.assertFalse(gate.observe(True, 4))
+
+    def test_live_barge_in_marker_uses_installed_sdk_activity_start(self):
+        import main
+        from google.genai import types
+
+        class Lock:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+
+        class Session:
+            def __init__(self): self.calls = []
+            async def send_realtime_input(self, **kwargs): self.calls.append(kwargs)
+
+        rem = main.RemLive.__new__(main.RemLive)
+        rem._realtime_input_lock = Lock()
+        rem.session = Session()
+        run_ready(rem._send_realtime_message({"activity_start": True}))
+        self.assertIsInstance(rem.session.calls[0]["activity_start"], types.ActivityStart)
+        run_ready(rem._send_realtime_message(
+            {"data": b"pcm", "mime_type": "audio/pcm;rate=16000"}))
+        self.assertEqual(rem.session.calls[1]["audio"].data, b"pcm")
 
 
 class PlaybackConfigurationTests(unittest.TestCase):

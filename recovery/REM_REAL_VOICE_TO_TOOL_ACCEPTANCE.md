@@ -43,3 +43,9 @@ No new microphone/Live attempt was made because the provided material contained 
 A central result adapter now supplies concise, truthful response instructions to Gemini after final tool dispatch and sanitizes known technical browser/UIA failures. Its focused tests and the full **171/171** unittest suite pass. This only verifies the local response payload construction; it does not verify that a real Live model produced or spoke the desired response.
 
 No new real Live phrase test completed in this continuation. There remains no confirmed chain of microphone recognition, intent, task authorization, harmless desktop execution, observation/readback, returned tool result, and response audio. Overall status remains **NOT VERIFIED**.
+
+## Voice stability continuation — 2026-11-26
+
+Playback's former 80-chunk (about 4-second) queue discarded the oldest PCM chunk on overflow. The new default is a bounded 30-second buffer (600 chunks), configurable from 5 to 120 seconds, with FIFO producer backpressure and interruption/session/shutdown generation invalidation. Synthetic tests validate sequence preservation, bounded operation, backpressure, and stale-generation discard.
+
+EchoGuard-driven local barge-in now requires sustained speech and emits the installed SDK `ActivityStart` marker before the continuing mic frames. This path is unit-tested, not verified in an actual Gemini Live conversation or by room acoustics. No real voice command, transcript, action, tool result, or spoken response was produced in this continuation. Overall voice-to-tool status remains **NOT VERIFIED**.

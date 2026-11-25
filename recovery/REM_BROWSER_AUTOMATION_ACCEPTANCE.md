@@ -53,3 +53,7 @@ The browser module now accepts optional `REM_EDGE_CDP_URL` as well as `REM_CHROM
 Fresh Chrome result: **BLOCKED before CDP**. Chrome with a new temporary profile exited with Crashpad `TransactNamedPipe: The pipe has been ended` / crash-server startup failure (exit `4294930433`). No search or result selection was performed. The disposable Edge attempt returned no verified startup or CDP result and is **NOT VERIFIED**. No personal browser profile was accessed. Historical CDP attach/DOM pass and hidden-page foreground block remain as recorded above.
 
 Full regression: 171/171 passed; compileall and diff check passed. The new model-facing conversational result guidance is unit-tested, not live-speech-tested.
+
+## Website-name clarification continuation — 2026-11-26
+
+The browser URL normalizer previously appended `.com` to every bare word, despite the tool contract saying not to invent addresses. It now maps a short explicit list of common sites and returns one `ask` outcome for an unknown bare name; complete domains and validated URLs continue to navigate normally. A unit test verifies ambiguous-name clarification. No fresh live Chrome or Edge interaction was attempted, so visible navigation remains at its prior acceptance status.
