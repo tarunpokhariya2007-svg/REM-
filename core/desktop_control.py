@@ -347,9 +347,10 @@ def _is_composition_request(request: str, spoken_hist: str = "") -> bool:
     combined = f"{request} {spoken_hist}".casefold()
     phrases = (
         "write something", "write by yourself", "by yourself", "write a message",
-        "write a hindi", "write an english", "in hindi", "in english", "into english", "into hindi",
+        "write a hindi", "write a short", "write an english", "in hindi", "in english", "into english", "into hindi",
         "translate", "translation", "replace", "remove the previous", "remove previous", "remove the hindi",
-        "write this one", "type this one", "replace it", "his day", "her day", "own wording",
+        "write this one", "type this one", "type it again", "replace it", "with english", "with hindi",
+        "clear the text", "clear all", "remove all", "his day", "her day", "own wording",
         "write about", "how your day", "compose", "draft a message", "draft",
         "create a friendly", "say anything nice", "5 to 10 lines", "5-10 lines",
         "make it more natural", "more natural", "make it shorter", "shorten it",
@@ -573,6 +574,8 @@ def classify_action(tool: str, args: dict | None) -> dict:
             category = "contact.select"
         elif raw_action in ("compose_message", "compose_draft", "update_draft", "edit_draft"):
             category = "message.compose"
+        elif raw_action == "clear_field":
+            category = "message.clear"
         elif raw_action in ("smart_click", "click", "left_click", "right_click", "double_click"):
             category = "browser.click"
         elif raw_action in ("smart_type", "type"):
@@ -940,7 +943,8 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
             "hover": {"hover", "move", "cursor", "mouse", "point", "put", "place", "click", "focus", "search", "video", "second", "third", "first"},
             "move": {"move", "go", "cursor", "mouse", "pointer", "point", "put", "place", "control", "position", "coordinates", "click", "focus", "search", "box", "bar", "video", "result", "here", "center", "middle", "corner", "top", "bottom", "left", "right", "screen"},
             "move_relative": {"move", "cursor", "mouse", "pointer", "left", "right", "up", "down", "point", "nudge"},
-            "type": {"type", "enter", "write", "search", "fill", "paste", "put"},
+            "type": {"type", "enter", "write", "search", "fill", "paste", "put", "text", "message", "draft", "replace", "again", "english", "hindi", "translate", "clear", "remove"},
+            "clear_field": {"clear", "remove", "empty", "erase", "delete", "clean", "reset", "message", "text", "draft", "composer", "bar", "box", "field", "all", "everything"},
             "press": {"press", "enter", "return", "escape", "esc", "tab", "backspace", "delete", "arrow", "up", "down", "left", "right", "home", "end", "ctrl", "select", "all", "copy", "paste", "undo", "keyboard", "key", "shortcut", "hotkey", "search", "query", "submit", "close", "tab", "play", "pause", "replay"},
             "scroll": {"scroll", "page", "down", "up", "left", "right"},
             "focus_window": {"focus", "switch", "bring", "window", "open", "chrome", "youtube"},
@@ -957,15 +961,16 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
             "new_tab": {"tab", "open", "new"},
             "switch_tab": {"tab", "switch", "open", "focus", "whatsapp", "youtube", "chrome", "edge", "browser", "current"},
             "inspect": {"inspect", "open", "see", "check", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "page", "site", "website", "tab", "status", "loaded", "login", "url", "read", "search", "cursor", "play", "pause", "resume", "replay", "video", "videos", "result", "results", "first", "second", "third", "fourth", "fifth", "titled", "title"},
-            "smart_click": {"click", "left", "open", "select", "choose", "press", "search", "focus", "bar", "put", "cursor", "play", "replay", "again", "restart", "pause", "resume", "video", "videos", "result", "results", "recommended", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "last", "next", "previous", "titled", "title", "tab", "youtube", "1st", "2nd", "3rd", "4th", "5th", "it", "that", "this", "one", "yes"},
+            "smart_click": {"click", "left", "open", "select", "choose", "press", "search", "focus", "bar", "put", "cursor", "play", "replay", "again", "restart", "pause", "resume", "video", "videos", "result", "results", "recommended", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "last", "next", "previous", "titled", "title", "tab", "youtube", "rio", "chat", "contact", "1st", "2nd", "3rd", "4th", "5th", "it", "that", "this", "one", "yes"},
             "click": {"click", "left", "open", "select", "choose", "focus", "search", "bar", "play", "pause", "resume", "replay", "it", "that", "this", "one", "yes"},
             "left_click": {"click", "left", "open", "select", "focus", "bar", "video", "result", "play", "it", "that", "this", "one", "yes"},
-            "smart_type": {"type", "enter", "search", "fill", "write", "put", "that", "it", "yes", "compose", "write", "message", "draft", "natural", "shorter", "rewrite", "rio"},
-            "type": {"type", "enter", "search", "fill", "write", "put", "that", "it", "yes", "compose", "write", "message", "draft", "natural", "shorter", "rewrite"},
-            "compose_message": {"compose", "write", "message", "draft", "yourself", "friendly", "nice", "natural", "shorter", "rewrite", "reply", "say"},
-            "update_draft": {"shorter", "shorten", "natural", "rewrite", "change", "edit", "update", "draft", "make", "more"},
-            "search_contact": {"search", "find", "look", "rio", "contact", "chat", "whatsapp", "for"},
-            "select_contact": {"open", "click", "select", "chat", "contact", "rio", "it", "that", "whatsapp"},
+            "smart_type": {"type", "enter", "search", "fill", "write", "put", "that", "it", "yes", "compose", "write", "message", "draft", "text", "replace", "remove", "clear", "english", "hindi", "translate", "again", "natural", "shorter", "rewrite", "rio"},
+            "type": {"type", "enter", "search", "fill", "write", "put", "that", "it", "yes", "compose", "write", "message", "draft", "text", "replace", "remove", "clear", "english", "hindi", "translate", "again", "natural", "shorter", "rewrite"},
+            "clear_field": {"clear", "remove", "empty", "erase", "delete", "clean", "reset", "message", "text", "draft", "composer", "bar", "box", "field", "all", "everything", "previous", "old", "it"},
+            "compose_message": {"compose", "write", "message", "draft", "yourself", "friendly", "nice", "natural", "shorter", "rewrite", "reply", "say", "hindi", "english", "translate", "replace", "text", "again"},
+            "update_draft": {"shorter", "shorten", "natural", "rewrite", "change", "edit", "update", "draft", "make", "more", "replace", "remove", "translate", "english", "hindi", "text"},
+            "search_contact": {"search", "find", "look", "rio", "contact", "chat", "whatsapp", "for", "is", "there"},
+            "select_contact": {"open", "click", "select", "chat", "contact", "first", "second", "third", "one", "rio", "it", "that", "again", "whatsapp"},
             "screenshot": {"screenshot", "screen", "capture", "see", "look", "check", "inspect", "what", "visible", "youtube", "whatsapp"},
             "fill_form": {"fill", "form", "enter", "complete"},
             "pause_video": {"pause", "stop", "halt", "video", "playback", "roko"},
@@ -1077,7 +1082,7 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
     intent_words = intents[t].get(action, set())
     routine_followup_actions = {
         "click", "left_click", "double_click", "hover", "move", "move_relative",
-        "scroll", "screenshot", "type", "smart_type", "press", "focus_window", "focus_search",
+        "scroll", "screenshot", "type", "smart_type", "clear_field", "press", "focus_window", "focus_search",
         "search_contact", "select_contact", "compose_message", "update_draft",
         "find", "observe", "inspect", "get_url", "get_text", "list_browsers",
         "smart_click", "play_video", "replay_video", "pause_video", "resume_video",
@@ -1118,7 +1123,7 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
             "play_video", "replay_video", "seek_forward", "seek_backward",
             "set_playback_position", "focus_search", "volume_up",
             "volume_down", "mute", "unmute",
-            "search_contact", "select_contact", "compose_message", "update_draft",
+            "search_contact", "select_contact", "compose_message", "update_draft", "clear_field",
         }
         if browser_task_id and action in routine_substeps and auth_context is not None and not auth_context.is_expired() and not should_stop():
             print(f"[Auth] ALLOW tool=browser_control action={action} browser_task={browser_task_id} source={source}")
@@ -1150,7 +1155,7 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
     target = str(target_value or "").strip()
     if target and target.casefold() not in {"here", "there", "current", "current position", "current location", "cursor", "mouse"} and (
             (t == "screen_agent" and action in {"find", "click", "left_click", "right_click", "double_click", "select", "toggle", "expand", "collapse", "hover", "move", "type", "focus_window", "scroll"})
-            or (t == "browser_control" and action in {"smart_click", "click", "left_click", "smart_type", "type", "play_video", "replay_video"})
+            or (t == "browser_control" and action in {"smart_click", "click", "left_click", "smart_type", "type", "clear_field", "play_video", "replay_video"})
             or (t == "computer_control" and action == "close_app")):
         target_words = {w for w in _tokens(target)
                         if len(w) > 2 and w not in {
@@ -1161,16 +1166,14 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
                             "item", "screen", "chrome", "youtube", "page",
                             "play", "pause",
                         }}
-        if action in {"smart_type", "type"} and target.casefold() in {
+        if action in {"smart_type", "type", "clear_field", "smart_click"} and target.casefold() in {
             "search", "search box", "search bar", "search input", "search field",
             "youtube search", "youtube search bar", "youtube search box", "youtube search field",
+            "message", "message bar", "message box", "message input", "message field",
+            "composer", "chat box", "chat input", "type a message", "text box",
             "focused", "active", "current",
         }:
-            target_words.discard("search")
-            target_words.discard("youtube")
-            target_words.discard("focused")
-            target_words.discard("active")
-            target_words.discard("current")
+            target_words -= {"search", "youtube", "focused", "active", "current", "message", "composer", "chat", "type", "text"}
         is_coord_target = bool(re.fullmatch(r"\(?\s*-?\d+\s*[, ]\s*-?\d+\s*\)?", target))
         target_match_tokens = context_words if has_live_task_chain else words
         resolved_active = None
@@ -1221,8 +1224,11 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
                          if len(w) > 2 and w not in {"the", "and", "for", "with", "please"}}
         payload_match_tokens = set(context_words if has_live_task_chain else words)
         active_payload = get_active_typing_payload(auth_context) if has_live_task_chain else ""
-        if active_payload and (words & {"that", "it", "yes", "enter", "type"}):
+        if active_payload and (words & {"that", "it", "yes", "enter", "type", "again"}):
             payload_match_tokens |= _tokens(active_payload)
+        comp_state = get_active_composition_state(auth_context)
+        if comp_state and comp_state.get("generated_content") and (words & {"again", "it", "that", "retype"}):
+            payload_match_tokens |= _tokens(comp_state["generated_content"])
 
         # Trusted Autonomous Composition Pathway:
         # Distinguishes AI-generated text explicitly requested by the user ("Write a friendly message...",
@@ -1233,7 +1239,6 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
             or (t == "computer_control" and action in {"type", "smart_type"})
             or (t == "computer_settings" and action == "type_text")
         )
-        comp_state = get_active_composition_state(auth_context)
         comp_requested = bool(
             is_typing_action
             and (auth_context is None or not auth_context.is_expired())

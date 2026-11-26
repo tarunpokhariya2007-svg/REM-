@@ -76,8 +76,11 @@ def format_tool_result(tool_name: str, result: object) -> str:
 
 def tool_result_guidance(result: object) -> str:
     """Return concise response rules based on a tool's declared outcome."""
-    match = _STATUS.match(str(result or ""))
+    text = str(result or "")
+    match = _STATUS.match(text)
     status = match.group(1).casefold() if match else "unknown"
+    if status == "done" and ("verified=false" in text.casefold() or "selected_chat_verified=false" in text.casefold()):
+        status = "unverified"
     rules = {
         "done": (
             "The tool says the result was verified. Give one short, warm confirmation "

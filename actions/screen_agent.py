@@ -453,7 +453,7 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                             text = str(params.get("text", ""))
                             if not text:
                                 return "Tell me what text to enter."
-                            if comp_box is not None:
+                            if comp_box.get("composer_found"):
                                 pt = screenact.Point(comp_box["x"], comp_box["y"], origin="element", label=comp_box["label"])
                                 mv = screenact.move_cursor(pt)
                                 clk = screenact.click(pt, expect_process=before.app)

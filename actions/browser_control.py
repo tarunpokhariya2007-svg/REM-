@@ -2186,11 +2186,66 @@ class _BrowserSession:
             "browser": self.browser_name,
         }
 
+    async def clear_field(self, description: str = "") -> str:
+        """Focus and clear an editable DOM input / WhatsApp Web lexical composer and verify empty."""
+        page = await self._get_page()
+        if not await self._page_visible_for_action(page):
+            return outcome.unverified("browser_control", "browser page is hidden; nothing was cleared", action="clear_field")
+        if "web.whatsapp.com" in str(page.url or "").casefold():
+            from plugins import _whatsapp_core as _wa
+            chat_v = await _wa.dom_verify_active_chat(page)
+            if not chat_v.get("verified"):
+                return outcome.failed("browser_control", chat_v.get("reason") or "WhatsApp active chat is not verified; nothing was cleared.", action="clear_field", verified=False)
+            try:
+                loc = page.locator('#main footer div[contenteditable="true"], div[contenteditable="true"][data-tab="10"], footer [role="textbox"]').first
+                await loc.click(timeout=5_000)
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+                await page.keyboard.press("Delete")
+                after = await _wa.dom_locate_whatsapp_composer(page)
+                empty = not bool(str(after.get("composer_text") or "").strip())
+                if empty:
+                    from core import desktop_control as _dc
+                    _dc.set_active_composition_state(composition_requested=True, selected_contact=chat_v.get("active_contact", ""), generated_content="", typing_authorized=True, message_sent=False)
+                    _dc.record_diagnostics(composition_status="cleared", typing_status="empty_verified", sending_status="not_sent")
+                    return outcome.done("browser_control", action="clear_field", browser=self.browser_name, composer_found=True, composer_empty=True, focus_verified=bool(after.get("focus_verified")), active_chat_id=chat_v.get("chat_id", ""), verified=True, detail="The message box is empty now.")
+                return outcome.unverified("browser_control", "Cleared composer, but residual text remained.", action="clear_field", composer_empty=False, verified=False)
+            except Exception as exc:
+                return outcome.failed("browser_control", f"clearing WhatsApp composer failed: {type(exc).__name__}", action="clear_field", verified=False)
+        try:
+            _m, el, _cnt = await self._locate_search_input(page)
+            if el is None:
+                return outcome.failed("browser_control", f"no editable input matching {description or 'field'!r} was found", action="clear_field", verified=False)
+            await el.click(timeout=5_000)
+            await el.fill("")
+            val = await el.input_value()
+            empty = (val == "")
+            return outcome.done("browser_control", action="clear_field", browser=self.browser_name, composer_empty=empty, verified=empty) if empty else outcome.unverified("browser_control", "field still contains text", action="clear_field", verified=False)
+        except Exception as exc:
+            return outcome.failed("browser_control", f"clear_field failed: {type(exc).__name__}", action="clear_field", verified=False)
+
     async def smart_type(self, description: str, text: str) -> str:
         page = await self._get_page()
         if not await self._page_visible_for_action(page):
             return outcome.unverified(
                 "browser_control", "browser page is hidden; no text was entered")
+        if "web.whatsapp.com" in str(page.url or "").casefold() and not _is_search_bar_query(description):
+            from plugins import _whatsapp_core as _wa
+            try:
+                loc = page.locator('#main footer div[contenteditable="true"], div[contenteditable="true"][data-tab="10"], footer [role="textbox"]').first
+                if await loc.count() == 1 and await loc.is_visible():
+                    await loc.click(timeout=5_000)
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await page.keyboard.type(str(text))
+                    after = await _wa.dom_locate_whatsapp_composer(page)
+                    read_txt = str(after.get("composer_text") or "").strip()
+                    ok_txt = bool(str(text).strip() and str(text).strip()[:20].casefold() in read_txt.casefold())
+                    if ok_txt:
+                        return outcome.done("browser_control", action="smart_type", field="Type a message", method="dom_contenteditable", field_detected=True, field_focused=bool(after.get("focus_verified")), text_entered=True, entered_text=read_txt, message_sent=False, verified=True)
+                    return outcome.unverified("browser_control", "composer text did not match typed draft", action="smart_type", field_detected=True, text_entered=False, message_sent=False)
+            except Exception:
+                pass
         generic_search = str(description or "").strip().casefold() in {
             "search", "search bar", "search box", "search field", "searchbox", "youtube search bar",
         }
@@ -3190,13 +3245,14 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
         ).strip()
         if expected_contact == "—":
             expected_contact = ""
-        chat_hdr = _wa.verify_selected_chat(view, expected_contact=expected_contact)
+        chat_hdr = _wa.verify_whatsapp_active_chat(view, expected_contact=expected_contact, tab_title=sync.get("title", ""), tab_url=sync.get("url", ""))
         comp_box = _wa.locate_whatsapp_composer(view)
-        if comp_box is None:
+        if not comp_box.get("composer_found"):
             return outcome.failed(
                 "browser_control",
-                "Could not locate the active conversation's message composer; nothing was typed or sent.",
+                f"I found {chat_hdr.get('active_contact') or expected_contact or 'the chat'}, but I couldn't locate the message box.",
                 action=action, browser=bname,
+                composer_found=False, active_chat_id=comp_box.get("active_chat_id", ""),
                 dispatch_status="completed", input_status="not_executed", verification_status="unverified",
                 message_sent=False,
             )
@@ -3395,39 +3451,128 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
         time.sleep(0.35)
         _registry.invalidate_sync(bname)
         after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
-        hdr = _wa.verify_selected_chat(after.get("view"), expected_contact=chosen["display_name"])
-        chat_id = str(chosen.get("id") or _wa.draft_hash(chosen["display_name"]))
-        _dc.set_active_target(
-            target_type="contact", exact_target_name=chosen["display_name"],
-            browser=bname, tab_title=after.get("title", ""), tab_url=after.get("url", ""),
-            result_position=chosen.get("position", 1), point=chosen["point"], rect=chosen.get("rect"),
-            confidence=chosen.get("confidence", "high"), extraction_source=chosen.get("source", ""),
-            auth_context=_auth_ctx,
-        )
-        _dc.set_active_composition_state(
-            composition_requested=False,
-            composition_task_id=str(getattr(_auth_ctx, "task_id", "") or ""),
-            selected_contact=chosen["display_name"],
-            generated_content="",
-            typing_authorized=False,
-            message_sent=False,
-            auth_context=_auth_ctx,
-        )
+        hdr = _wa.verify_whatsapp_active_chat(after.get("view"), expected_contact=chosen["display_name"], tab_title=after.get("title", ""), tab_url=after.get("url", ""))
+        if not hdr.get("verified"):
+            time.sleep(0.35)
+            after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
+            hdr = _wa.verify_whatsapp_active_chat(after.get("view"), expected_contact=chosen["display_name"], tab_title=after.get("title", ""), tab_url=after.get("url", ""))
+        chat_id = str(hdr.get("chat_id") or chosen.get("id") or "")
+        chat_ok = bool(hdr.get("verified"))
+        if chat_ok:
+            _dc.set_active_target(
+                target_type="contact", exact_target_name=chosen["display_name"],
+                browser=bname, tab_title=after.get("title", ""), tab_url=after.get("url", ""),
+                result_position=chosen.get("position", 1), point=chosen["point"], rect=chosen.get("rect"),
+                confidence=chosen.get("confidence", "high"), extraction_source=chosen.get("source", ""),
+                auth_context=_auth_ctx,
+            )
+            _dc.set_active_composition_state(
+                composition_requested=False,
+                composition_task_id=str(getattr(_auth_ctx, "task_id", "") or ""),
+                selected_contact=chosen["display_name"],
+                generated_content="",
+                typing_authorized=False,
+                message_sent=False,
+                auth_context=_auth_ctx,
+            )
         _dc.record_diagnostics(
             active_application="WhatsApp (Chrome)",
-            active_contact=chosen["display_name"],
+            active_contact=(chosen["display_name"] if chat_ok else "—"),
             active_chat_id=chat_id,
-            selected_chat_verified=bool(hdr.get("verified")),
+            selected_chat_verified=chat_ok,
             unique_contact_count=len(contacts),
         )
+        if not chat_ok:
+            return outcome.unverified(
+                "browser_control",
+                f"I clicked {chosen['display_name']}, but I couldn't confirm that the chat opened.",
+                action="select_contact", browser=bname,
+                resolved_target=chosen["display_name"], active_chat_id=chat_id,
+                unique_contact_count=len(contacts), selected_chat_verified=False,
+                verification_status="unverified", cursor_moved=mv.ok, click_executed=clk.ok,
+                verified=False, **cdiag,
+            )
         return outcome.done(
             "browser_control", action="select_contact", browser=bname,
             resolved_target=chosen["display_name"], active_contact=chosen["display_name"],
             active_chat_id=chat_id, unique_contact_count=len(contacts),
-            selected_chat_verified=bool(hdr.get("verified")),
-            verification_status=("verified" if hdr.get("verified") else "input_dispatched"),
+            selected_chat_verified=True,
+            verification_status="verified",
             cursor_moved=mv.ok, click_executed=clk.ok, verified=True, **cdiag,
         )
+
+    if action == "clear_field":
+        from core import desktop_control as _dc
+        from plugins import _whatsapp_core as _wa
+
+        desc = str(params.get("description") or params.get("selector") or "").strip()
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
+        view = sync.get("view")
+        is_wa_page = "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold()
+        if is_wa_page:
+            comp = _wa.locate_whatsapp_composer(view)
+            if not comp.get("composer_found"):
+                return outcome.failed(
+                    "browser_control",
+                    "I found the WhatsApp window, but I couldn't locate the message box to clear.",
+                    action="clear_field", browser=bname, composer_found=False, verified=False,
+                )
+            pt = screenact.Point(comp["x"], comp["y"], origin="element", label=comp["label"])
+            mv, clk, cdiag = _click_diag("click", pt)
+            if not clk.ok:
+                return outcome.failed("browser_control", f"focusing WhatsApp composer failed: {clk.error}", action="clear_field", browser=bname, **cdiag)
+            time.sleep(0.08)
+            screenact.press("ctrl+a")
+            screenact.press("backspace")
+            screenact.press("delete")
+            time.sleep(0.12)
+            _registry.invalidate_sync(bname)
+            after_v = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
+            rb_ok, rb_val = _wa.composer_text_value(after_v.get("view"))
+            empty = rb_ok and not rb_val.strip()
+            _dc.set_active_composition_state(
+                composition_requested=True,
+                selected_contact=str(_dc.snapshot().get("active_contact") or ""),
+                generated_content=("" if empty else rb_val),
+                typing_authorized=True,
+                message_sent=False,
+            )
+            _dc.record_diagnostics(
+                composition_status=("cleared" if empty else "residual_text"),
+                typing_status=("empty_verified" if empty else "unverified"),
+                sending_status="not_sent",
+                last_keyboard_status="ok",
+            )
+            if empty:
+                return outcome.done(
+                    "browser_control", action="clear_field", browser=bname,
+                    composer_found=True, composer_empty=True, focus_verified=True,
+                    active_chat_id=comp.get("active_chat_id", ""),
+                    verification_status="verified", verified=True,
+                    detail="The message box is empty now.", **cdiag,
+                )
+            return outcome.unverified(
+                "browser_control",
+                "I tried to clear the message box, but I couldn't confirm it is completely empty.",
+                action="clear_field", browser=bname,
+                composer_found=True, composer_empty=False, verification_status="unverified",
+                verified=False, **cdiag,
+            )
+        # Non-WhatsApp generic visible field clear
+        target_el = None
+        if view is not None:
+            for el in getattr(view, "elements", ()) or ():
+                if str(getattr(el, "role", "") or "").casefold() in {"edit", "combobox", "searchbox"}:
+                    if not desc or desc.casefold() in str(getattr(el, "name", "") or "").casefold() or getattr(el, "focused", False):
+                        target_el = el
+                        break
+        if target_el is None:
+            return outcome.failed("browser_control", f"no editable field matching {desc or 'input'!r} was found to clear", action="clear_field", browser=bname)
+        pt = screenact.Point.from_element(target_el)
+        mv, clk, cdiag = _click_diag("click", pt)
+        screenact.press("ctrl+a")
+        screenact.press("backspace")
+        return outcome.done("browser_control", action="clear_field", browser=bname, composer_empty=True, verified=clk.ok, **cdiag)
 
     if action in ("smart_type", "type"):
         text_val = str(params.get("text") or "")
@@ -3483,8 +3628,8 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 or not desc
             ):
                 comp = _wa.locate_whatsapp_composer(view)
-                if comp is None:
-                    return outcome.failed("browser_control", "Could not locate active WhatsApp message composer.", action=action, browser=bname)
+                if not comp.get("composer_found"):
+                    return outcome.failed("browser_control", "Could not locate active WhatsApp message composer.", action=action, browser=bname, composer_found=False)
                 pt = screenact.Point(comp["x"], comp["y"], origin="element", label=comp["label"])
                 mv, clk, cdiag = _click_diag("click", pt)
                 if not clk.ok:
@@ -3681,29 +3826,41 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 time.sleep(0.35)
                 _registry.invalidate_sync(bname)
                 after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
-                hdr = _wa.verify_selected_chat(after.get("view"), expected_contact=chosen_c["display_name"])
-                chat_id = str(chosen_c.get("id") or _wa.draft_hash(chosen_c["display_name"]))
+                hdr = _wa.verify_whatsapp_active_chat(after.get("view"), expected_contact=chosen_c["display_name"], tab_title=after.get("title", ""), tab_url=after.get("url", ""))
+                chat_id = str(hdr.get("chat_id") or chosen_c.get("id") or "")
+                chat_ok = bool(hdr.get("verified"))
                 if _dc is not None:
-                    _dc.set_active_target(
-                        target_type="contact", exact_target_name=chosen_c["display_name"],
-                        browser=bname, tab_title=after.get("title", ""), tab_url=after.get("url", ""),
-                        result_position=chosen_c.get("position", 1), point=chosen_c["point"], rect=chosen_c.get("rect"),
-                        confidence=chosen_c.get("confidence", "high"), extraction_source=chosen_c.get("source", ""),
-                        auth_context=_auth_ctx,
-                    )
+                    if chat_ok:
+                        _dc.set_active_target(
+                            target_type="contact", exact_target_name=chosen_c["display_name"],
+                            browser=bname, tab_title=after.get("title", ""), tab_url=after.get("url", ""),
+                            result_position=chosen_c.get("position", 1), point=chosen_c["point"], rect=chosen_c.get("rect"),
+                            confidence=chosen_c.get("confidence", "high"), extraction_source=chosen_c.get("source", ""),
+                            auth_context=_auth_ctx,
+                        )
                     _dc.record_diagnostics(
                         active_application="WhatsApp (Chrome)",
-                        active_contact=chosen_c["display_name"],
+                        active_contact=(chosen_c["display_name"] if chat_ok else "—"),
                         active_chat_id=chat_id,
-                        selected_chat_verified=bool(hdr.get("verified")),
+                        selected_chat_verified=chat_ok,
                         unique_contact_count=len(wa_contacts),
+                    )
+                if not chat_ok:
+                    return outcome.unverified(
+                        "browser_control",
+                        f"I clicked {chosen_c['display_name']}, but I couldn't confirm that the chat opened.",
+                        action=action, browser=bname, task_id=_cur_task_id,
+                        control_mode="native_windows", resolved_target=chosen_c["display_name"],
+                        active_chat_id=chat_id, unique_contact_count=len(wa_contacts),
+                        selected_chat_verified=False, verification_status="unverified",
+                        cursor_moved=mv.ok, click_executed=clk.ok, verified=False, **cdiag,
                     )
                 return outcome.done(
                     "browser_control", action=action, browser=bname, task_id=_cur_task_id,
                     control_mode="native_windows", resolved_target=chosen_c["display_name"],
                     active_contact=chosen_c["display_name"], active_chat_id=chat_id,
-                    unique_contact_count=len(wa_contacts), selected_chat_verified=bool(hdr.get("verified")),
-                    verification_status=("verified" if hdr.get("verified") else "input_dispatched"),
+                    unique_contact_count=len(wa_contacts), selected_chat_verified=True,
+                    verification_status="verified",
                     cursor_moved=mv.ok, click_executed=clk.ok, verified=True, **cdiag,
                 )
         videos = sync.get("videos") or []
@@ -4303,7 +4460,7 @@ def locate_control_screen_point(description: str, app_hint: str = "") -> dict | 
 
 _ACTIONS = (
     "go_to", "search", "focus_search", "search_contact", "select_contact",
-    "compose_message", "update_draft",
+    "compose_message", "update_draft", "clear_field",
     "new_tab", "switch_tab", "close_tab", "inspect",
     "click", "left_click", "right_click", "double_click", "smart_click", "type", "smart_type", "fill_form", "press",
     "pause_video", "resume_video", "play_video", "replay_video",
@@ -4584,6 +4741,8 @@ def _browser_control_impl(
                     result = fb
         elif action == "smart_type":
             result = sess.run(sess.smart_type(params.get("description", ""), params.get("text", "")))
+        elif action == "clear_field":
+            result = sess.run(sess.clear_field(params.get("description", "")))
         elif action == "get_text":
             result = sess.run(sess.get_text())
         elif action == "get_url":
@@ -4634,7 +4793,7 @@ def _browser_control_impl(
         elif action == "reload":
             result = sess.run(sess.reload())
         elif action in ("search_contact", "select_contact", "compose_message", "update_draft"):
-            result = _native_browser_action(action, browser, params)
+            result = _native_browser_action(action, params, select_browser(browser), player=player)
         else:
             result = _unknown_action(action)
 
@@ -4817,7 +4976,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | left_click | type | scroll | fill_form | smart_click | smart_type | pause_video | resume_video | play_video | replay_video | get_text | get_url | inspect | press | new_tab | switch_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | click | left_click | type | smart_type | clear_field | scroll | fill_form | smart_click | search_contact | select_contact | compose_message | update_draft | pause_video | resume_video | play_video | replay_video | get_text | get_url | inspect | press | new_tab | switch_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
             },
             "browser": {
                 "type": "STRING",

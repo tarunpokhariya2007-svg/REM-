@@ -1,12 +1,14 @@
 """WhatsApp intelligence & UI/DOM Automation driver for Desktop and Chrome WhatsApp Web.
 
 Unified single source of truth for:
-1. Contact extraction (DOM -> UIA -> OCR) with placeholder rejection (`-0-`, `-0+`, counts)
-   and strict single-card deduplication so one visible contact never inflates into 19-21 rows.
-2. Canonical active_chat identity shared across selection, composition, messaging, and calling.
-3. Composer localization (DOM/UIA/OCR) + Hindi/English drafting, translation, replacement, and readback.
-4. Verified single-execution sending with idempotency protection (preventing duplicate sends).
-5. Voice-call vs video-call button separation and active call-UI verification.
+1. Deterministic contact extraction (DOM -> UIA chat-card containers -> OCR vertical card bands)
+   with placeholder/status/counter rejection so unchanged search results never drift (e.g. 21/19/16).
+2. Shared `verify_whatsapp_active_chat()` verifying app, tab, right conversation pane,
+   header text, active_chat_id, composer association, and observation timestamp/source.
+3. Shared `locate_whatsapp_composer()` returning structured metadata (`composer_found`,
+   `composer_type`, `application`, `active_chat_id`, `focus_verified`, `observation_id`,
+   `confidence`) and unified clear/type/replace/readback helpers.
+4. Verified single-execution sending with idempotency protection and voice-call verification.
 """
 from __future__ import annotations
 
@@ -14,7 +16,6 @@ import hashlib
 import re
 import threading
 import time
-import uuid
 from typing import Any
 
 from core.appidentity import fold
@@ -24,20 +25,34 @@ _WA_CHROME_NOISE = frozenset({
     "all", "unread", "favorites", "groups", "search", "search or start new chat",
     "search unread chats", "ask meta ai or search", "type a message", "new chat",
     "menu", "settings", "profile", "end to end encrypted", "use whatsapp on your computer",
-    "download", "log out", "mute notifications", "clear messages", "delete chat",
-    "voice call", "video call", "search...", "contacts", "messages",
+    "use whatsapp on desktop", "download", "log out", "mute notifications",
+    "clear messages", "delete chat", "voice call", "video call", "search...",
+    "contacts", "messages", "no chats, contacts or messages found", "chats, contacts and messages",
+    "lock whatsapp", "starred messages", "select chats",
+})
+
+_WA_STATUS_PREVIEW_NOISE = frozenset({
+    "photo", "video", "audio", "voice message", "gif", "sticker", "document",
+    "contact card", "location", "live location", "poll", "event",
+    "missed voice call", "missed video call", "voice call", "video call",
+    "incoming voice call", "incoming video call", "typing...", "recording audio...",
+    "this message was deleted", "you deleted this message",
+    "waiting for this message", "click here for contact info", "online",
+    "pinned", "muted", "draft", "draft:", "you", "you:", "read", "delivered",
 })
 
 _TIME_RE = re.compile(
-    r"^(?:\d{1,2}:\d{2}(?:\s*[ap]m)?|yesterday|today|just now|\d{1,2}/\d{1,2}/\d{2,4})$",
+    r"^(?:\d{1,2}[:;.]\d{2}(?:\s*[ap]m)?|yesterday|today|just now|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"\d{1,2}/\d{1,2}/\d{2,4})$",
     re.I,
 )
 _PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{6,}\d")
 _UNREAD_RE = re.compile(r"^\d{1,4}$")
 # Reject OCR/UIA glyph artifacts & empty/placeholder IDs like "-0-", "-0+", "---", "+0"
-_PLACEHOLDER_RE = re.compile(r"^[\W_0+\-|=~.*]+$")
+_PLACEHOLDER_RE = re.compile(r"^[\W_0+\-|=~.*•·]+$")
 
-_CHAT_LOCK = threading.Lock()
+_CHAT_LOCK = threading.RLock()
 _ACTIVE_CHAT: dict[str, Any] = {
     "platform": "",
     "contact_name": "",
@@ -59,10 +74,16 @@ def is_valid_contact_label(name: str) -> bool:
     cleaned = " ".join(str(name or "").split()).strip()
     if not cleaned or len(cleaned) < 2:
         return False
-    low = cleaned.casefold()
-    if low in _WA_CHROME_NOISE or _TIME_RE.match(cleaned) or _UNREAD_RE.match(cleaned):
+    low = cleaned.casefold().rstrip(":")
+    if (
+        low in _WA_CHROME_NOISE
+        or low in _WA_STATUS_PREVIEW_NOISE
+        or _TIME_RE.match(cleaned)
+        or _UNREAD_RE.match(cleaned)
+        or _PLACEHOLDER_RE.match(cleaned)
+    ):
         return False
-    if _PLACEHOLDER_RE.match(cleaned):
+    if low.startswith(("draft:", "you:", "missed voice call", "missed video call", "click here for")):
         return False
     if not any(ch.isalpha() for ch in cleaned) and not _PHONE_RE.search(cleaned):
         return False
@@ -100,6 +121,8 @@ def set_active_chat(**fields) -> dict[str, Any]:
         if snap.get("chat_id"):
             updates["active_chat_id"] = str(snap["chat_id"])[:32]
         updates["selected_chat_verified"] = bool(snap.get("verified"))
+        if snap.get("observation_id"):
+            updates["obs_id"] = str(snap["observation_id"])[:32]
         desktop_control.record_diagnostics(**updates)
     except Exception:
         pass
@@ -132,41 +155,165 @@ def _strip_composite_contact_name(raw_name: str) -> str:
     display_name = raw_name.splitlines()[0].strip()
     if " , " in display_name:
         display_name = display_name.split(" , ", 1)[0].strip()
-    ts_cut = re.split(r"\s+\d{1,2}:\d{2}(?:\s*[AP]M)?\b", display_name, maxsplit=1, flags=re.IGNORECASE)
+    ts_cut = re.split(r"\s+\d{1,2}[:;.]\d{2}(?:\s*[AP]M)?\b", display_name, maxsplit=1, flags=re.IGNORECASE)
     if ts_cut and ts_cut[0].strip():
         display_name = ts_cut[0].strip()
+    for day_word in ("yesterday", "today"):
+        m = re.split(rf"\s+\b{day_word}\b", display_name, maxsplit=1, flags=re.IGNORECASE)
+        if m and m[0].strip():
+            display_name = m[0].strip()
     return display_name.strip(" -|•·")
 
 
-def extract_whatsapp_contacts(view, query: str = "", *, source_override: str = "") -> list[dict]:
-    """Extract UNIQUE visible WhatsApp contact/chat results from DOM/UIA/OCR.
+def _window_geometry(view) -> tuple[int, int, int, int]:
+    mon = getattr(view, "monitor", None) or {}
+    win_rect = getattr(view, "window_rect", None)
+    if win_rect and len(win_rect) == 4 and win_rect[2] > 200:
+        return tuple(int(v) for v in win_rect)
+    return (
+        int(mon.get("left", 0) or 0),
+        int(mon.get("top", 0) or 0),
+        int(mon.get("width", 1920) or 1920),
+        int(mon.get("height", 1080) or 1080),
+    )
 
-    Rejects placeholders (`-0-`, `-0+`, unread counts, timestamps) and deduplicates
-    sub-elements belonging to one visual contact card so a single visible chat row
-    never expands into 19-21 duplicates.
+
+def _inside_rect(el, card_rect: tuple[int, int, int, int]) -> bool:
+    cl, ct, cw, ch = card_rect
+    et = int(getattr(el, "top", 0) or 0)
+    el_left = int(getattr(el, "left", 0) or 0)
+    ew = int(getattr(el, "width", 0) or 0)
+    eh = int(getattr(el, "height", 0) or 0)
+    cx = el_left + max(1, ew // 2)
+    cy = et + max(1, eh // 2)
+    return (cl - 6) <= cx <= (cl + cw + 6) and (ct - 4) <= cy <= (ct + ch + 4)
+
+
+def extract_whatsapp_contacts(view, query: str = "", *, source_override: str = "") -> list[dict]:
+    """Deterministically extract UNIQUE visible WhatsApp contact/chat cards.
+
+    Strategy (in priority order):
+    1. UIA chat-card container rows (`listitem`/`treeitem`/`row`/`cell` >= 34px tall)
+       absorb all child text/OCR elements inside their bounds so title + preview +
+       timestamp + badge remain ONE card.
+    2. Remaining unconsumed text/OCR nodes are grouped by vertical chat-card bands
+       (~64px height) in the left pane so the lower preview line (`+20..56px`) attaches
+       to the contact title above it instead of generating fluctuating extra contacts.
+    3. Rejects placeholders (`-0-`, `-0+`), counters, timestamps, and status words.
     """
     if view is None:
         return []
     elements = list(getattr(view, "elements", ()) or ())
-    mon = getattr(view, "monitor", None) or {}
-    mon_top = int(mon.get("top", 0) or 0)
-    mon_left = int(mon.get("left", 0) or 0)
-    mon_w = int(mon.get("width", 1920) or 1920)
-    win_rect = getattr(view, "window_rect", None)
-    if win_rect and len(win_rect) == 4 and win_rect[2] > 200:
-        w_left, w_top, w_w, _w_h = (int(v) for v in win_rect)
-    else:
-        w_left, w_top, w_w = mon_left, mon_top, mon_w
-
+    w_left, w_top, w_w, _w_h = _window_geometry(view)
     pane_top_floor = w_top + 115
     pane_right_ceil = w_left + int(w_w * 0.46)
     view_src = (source_override or str(getattr(view, "source", "") or "uia")).casefold()
     now_m = time.monotonic()
+    obs_id = str(getattr(view, "stable_digest", "") or getattr(view, "digest", "") or f"obs_{int(now_m * 1000)}")
 
-    raw_rows: list[dict] = []
-    for el in elements:
+    # Pre-filter candidate left-pane elements
+    left_els: list[tuple[int, Any]] = []
+    for idx, el in enumerate(elements):
         role = str(getattr(el, "role", "") or "").casefold()
-        if role in {"edit", "combobox", "searchbox", "button", "scrollbar", "separator", "image"}:
+        if role in {"edit", "combobox", "searchbox", "scrollbar", "separator", "image"}:
+            continue
+        top = int(getattr(el, "top", 0) or 0)
+        left = int(getattr(el, "left", 0) or 0)
+        width = int(getattr(el, "width", 0) or 0)
+        height = int(getattr(el, "height", 0) or 0)
+        if top < pane_top_floor or left > pane_right_ceil or width < 20 or height < 10:
+            continue
+        left_els.append((idx, el))
+
+    consumed_indices: set[int] = set()
+    raw_cards: list[dict] = []
+
+    # Pass 1: UIA container rows (`listitem`, `treeitem`, `row`, `cell`, `button` with card height >= 36)
+    containers = [
+        (idx, el) for idx, el in left_els
+        if str(getattr(el, "role", "") or "").casefold() in {"listitem", "treeitem", "row", "cell", "button", "group"}
+        and int(getattr(el, "height", 0) or 0) >= 34
+        and int(getattr(el, "width", 0) or 0) >= 120
+    ]
+    containers.sort(key=lambda pair: (int(getattr(pair[1], "top", 0) or 0), int(getattr(pair[1], "left", 0) or 0)))
+
+    for c_idx, card_el in containers:
+        if c_idx in consumed_indices:
+            continue
+        c_rect = (
+            int(getattr(card_el, "left", 0) or 0),
+            int(getattr(card_el, "top", 0) or 0),
+            int(getattr(card_el, "width", 0) or 0),
+            int(getattr(card_el, "height", 0) or 0),
+        )
+        children = [
+            (j, child) for j, child in left_els
+            if j != c_idx and j not in consumed_indices and _inside_rect(child, c_rect)
+        ]
+        children.sort(key=lambda pair: (int(getattr(pair[1], "top", 0) or 0), int(getattr(pair[1], "left", 0) or 0)))
+        card_texts: list[str] = []
+        raw_card_name = " ".join(str(getattr(card_el, "name", "") or getattr(card_el, "label", "") or "").split())
+        if raw_card_name:
+            card_texts.append(raw_card_name)
+        for _j, child in children:
+            t = " ".join(str(getattr(child, "name", "") or getattr(child, "label", "") or "").split())
+            if t:
+                card_texts.append(t)
+
+        # Prefer clean topmost child title when child exists (otherwise strip composite card text)
+        best_title = ""
+        preview = ""
+        phone = None
+        for txt in ([ " ".join(str(getattr(ch, "name", "") or "").split()) for _j, ch in children ] or card_texts):
+            m_ph = _PHONE_RE.search(txt)
+            if m_ph and not phone:
+                phone = m_ph.group(0).strip()
+            cand = _strip_composite_contact_name(txt)
+            if not best_title and is_valid_contact_label(cand):
+                best_title = cand
+            elif best_title and is_valid_contact_label(cand) and fold(cand) != fold(best_title) and not preview:
+                preview = cand[:140]
+        if not best_title and raw_card_name:
+            cand = _strip_composite_contact_name(raw_card_name)
+            if is_valid_contact_label(cand):
+                best_title = cand
+        if not best_title:
+            continue
+
+        consumed_indices.add(c_idx)
+        for j, _ch in children:
+            consumed_indices.add(j)
+
+        raw_auto_id = _clean_identifier(getattr(card_el, "automation_id", None) or getattr(card_el, "contact_id", None))
+        raw_chat_id = _clean_identifier(getattr(card_el, "chat_id", None))
+        dn_fold = fold(best_title)
+        cx, cy = (getattr(card_el, "center", None) or (c_rect[0] + c_rect[2] // 2, c_rect[1] + c_rect[3] // 2))
+        chat_id = raw_chat_id or raw_auto_id or (f"phone:{re.sub(r'[^0-9+]', '', phone)}" if phone else f"chat:{dn_fold}")
+        raw_cards.append({
+            "display_name": best_title[:120],
+            "contact_id": raw_auto_id,
+            "phone": phone or "",
+            "id": chat_id,
+            "dedupe_key": raw_chat_id or raw_auto_id or phone or dn_fold,
+            "last_message_preview": preview,
+            "rect": c_rect,
+            "point": (int(cx), int(cy)),
+            "top": c_rect[1],
+            "left": c_rect[0],
+            "source": ("dom" if "dom" in view_src else "uia"),
+            "confidence": ("high" if (raw_auto_id or raw_chat_id or children) else "medium"),
+            "observed_at": now_m,
+            "observation_id": obs_id,
+            "element": card_el,
+        })
+
+    # Pass 2: Unconsumed UIA/OCR labels grouped into vertical card bands
+    remaining_rows: list[dict] = []
+    for idx, el in left_els:
+        if idx in consumed_indices:
+            continue
+        role = str(getattr(el, "role", "") or "").casefold()
+        if role == "button":
             continue
         name = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or "").split())
         if not name or len(name) < 2:
@@ -175,9 +322,9 @@ def extract_whatsapp_contacts(view, query: str = "", *, source_override: str = "
         left = int(getattr(el, "left", 0) or 0)
         width = int(getattr(el, "width", 0) or 0)
         height = int(getattr(el, "height", 0) or 0)
-        if top < pane_top_floor or left > pane_right_ceil or width < 24 or height < 12:
+        # Skip far-right small timestamp column unless paired inside card container
+        if left > w_left + int(w_w * 0.36) and width < 80 and _TIME_RE.match(name):
             continue
-
         display_name = _strip_composite_contact_name(name)
         if not is_valid_contact_label(display_name):
             continue
@@ -185,35 +332,35 @@ def extract_whatsapp_contacts(view, query: str = "", *, source_override: str = "
         phone = phone_m.group(0).strip() if phone_m else None
         raw_auto_id = _clean_identifier(getattr(el, "automation_id", None) or getattr(el, "contact_id", None))
         raw_chat_id = _clean_identifier(getattr(el, "chat_id", None))
-
         dn_fold = fold(display_name)
         if not dn_fold:
             continue
-        is_ocr = ("ocr" in role) or (view_src == "ocr" and role in {"text", "ocr_text", ""})
+        is_ocr = ("ocr" in role) or (view_src == "ocr" and role in {"text", "ocr_text", ""}) or role == "text"
         cx, cy = (getattr(el, "center", None) or (left + max(1, width // 2), top + max(1, height // 2)))
-        dedupe_key = raw_chat_id or raw_auto_id or phone or dn_fold
         chat_id = raw_chat_id or raw_auto_id or (f"phone:{re.sub(r'[^0-9+]', '', phone)}" if phone else f"chat:{dn_fold}")
-        raw_rows.append({
+        remaining_rows.append({
             "display_name": display_name[:120],
             "contact_id": raw_auto_id,
             "phone": phone or "",
             "id": chat_id,
-            "dedupe_key": dedupe_key,
+            "dedupe_key": raw_chat_id or raw_auto_id or phone or dn_fold,
             "last_message_preview": (str(getattr(el, "value", "") or "").strip()[:140]),
             "rect": (left, top, width, height),
             "point": (int(cx), int(cy)),
             "top": top,
             "left": left,
             "source": ("dom" if "dom" in view_src else ("ocr" if is_ocr else "uia")),
-            "confidence": ("high" if (raw_auto_id or raw_chat_id or (not is_ocr and "list" in role)) else "medium"),
+            "confidence": ("high" if (raw_auto_id or raw_chat_id) else "medium"),
             "observed_at": now_m,
+            "observation_id": obs_id,
             "element": el,
         })
 
-    raw_rows.sort(key=lambda r: (r["top"], r["left"]))
-    deduped: list[dict] = []
+    # Attach remaining rows to existing card containers or group top-to-bottom within 56px vertical card bands
+    remaining_rows.sort(key=lambda r: (r["top"], r["left"]))
+    deduped = list(raw_cards)
     q_fold = fold(query) if query else ""
-    for row in raw_rows:
+    for row in remaining_rows:
         r_fold = fold(row["display_name"])
         merged = False
         for existing in deduped:
@@ -221,28 +368,32 @@ def extract_whatsapp_contacts(view, query: str = "", *, source_override: str = "
             same_id = bool(row["contact_id"] and existing["contact_id"] and row["contact_id"] == existing["contact_id"])
             same_phone = bool(row["phone"] and existing["phone"] and row["phone"] == existing["phone"])
             same_name = (r_fold == e_fold)
-            same_band = abs(row["top"] - existing["top"]) <= 44 and (r_fold in e_fold or e_fold in r_fold)
-            if same_id or same_phone or same_name or same_band:
+            same_name_overlap = abs(row["top"] - existing["top"]) <= 44 and (r_fold in e_fold or e_fold in r_fold)
+            # In WhatsApp's single left chat column, a lower line within 12..54px below a card title
+            # (with no card separator/query match) is usually the message preview line for THAT card.
+            dy = row["top"] - existing["top"]
+            is_lower_preview_line = (
+                12 <= dy <= 52
+                and abs(row["left"] - existing["left"]) <= 48
+                and (not q_fold or q_fold not in r_fold)
+                and (not row["contact_id"] and not row["phone"])
+            )
+            if same_id or same_phone or same_name or same_name_overlap or is_lower_preview_line:
                 if not existing["phone"] and row["phone"]:
                     existing["phone"] = row["phone"]
                 if not existing["contact_id"] and row["contact_id"]:
                     existing["contact_id"] = row["contact_id"]
                     existing["id"] = row["id"]
-                if not existing["last_message_preview"] and row["last_message_preview"] and fold(row["last_message_preview"]) != e_fold:
-                    existing["last_message_preview"] = row["last_message_preview"]
-                if len(row["display_name"]) < len(existing["display_name"]) and row["display_name"] in existing["display_name"]:
+                if not existing["last_message_preview"] and fold(row["display_name"]) != e_fold:
+                    existing["last_message_preview"] = row["display_name"][:140]
+                if same_name_overlap and len(row["display_name"]) < len(existing["display_name"]) and row["display_name"] in existing["display_name"]:
                     existing["display_name"] = row["display_name"]
-                if existing["source"] == "ocr" and row["source"] in {"uia", "dom"}:
-                    existing["source"] = row["source"]
-                    existing["confidence"] = "high"
-                    existing["point"] = row["point"]
-                    existing["rect"] = row["rect"]
-                    existing["element"] = row["element"]
                 merged = True
                 break
         if not merged:
             deduped.append(row)
 
+    deduped.sort(key=lambda r: (r["top"], r["left"]))
     if q_fold:
         exact_m = [c for c in deduped if fold(c["display_name"]) == q_fold]
         prefix_m = [c for c in deduped if fold(c["display_name"]).startswith(q_fold) and c not in exact_m]
@@ -252,8 +403,7 @@ def extract_whatsapp_contacts(view, query: str = "", *, source_override: str = "
             and c not in exact_m and c not in prefix_m
         ]
         ranked = exact_m + prefix_m + sub_m
-        if ranked:
-            deduped = ranked
+        deduped = ranked  # When a specific search query is supplied, never return unrelated non-matching items
 
     for pos, item in enumerate(deduped, 1):
         item["position"] = pos
@@ -265,17 +415,7 @@ def locate_whatsapp_search_bar(view) -> dict | None:
     if view is None:
         return None
     elements = list(getattr(view, "elements", ()) or ())
-    mon = getattr(view, "monitor", None) or {}
-    mon_top = int(mon.get("top", 0) or 0)
-    win_rect = getattr(view, "window_rect", None)
-    if win_rect and len(win_rect) == 4 and win_rect[2] > 200:
-        w_left, w_top, w_w, w_h = (int(v) for v in win_rect)
-    else:
-        w_left = int(mon.get("left", 0) or 0)
-        w_top = mon_top
-        w_w = int(mon.get("width", 1920) or 1920)
-        w_h = int(mon.get("height", 1080) or 1080)
-
+    w_left, w_top, w_w, w_h = _window_geometry(view)
     is_browser_chrome = "chrome" in fold(getattr(view, "app", "") or "")
     toolbar_floor = w_top + (85 if is_browser_chrome else 40)
     composer_floor = w_top + int(w_h * 0.65)
@@ -301,7 +441,7 @@ def locate_whatsapp_search_bar(view) -> dict | None:
 
     for el in elements:
         role = str(getattr(el, "role", "") or "").casefold()
-        is_ocr = ("ocr" in role) or (view_src == "ocr" and role in {"text", "ocr_text", ""})
+        is_ocr = ("ocr" in role) or (view_src == "ocr" and role in {"text", "ocr_text", ""}) or role == "text"
         label_cf = str(getattr(el, "name", "") or getattr(el, "label", "") or "").strip().casefold()
         top = int(getattr(el, "top", 0) or 0)
         left = int(getattr(el, "left", 0) or 0)
@@ -312,25 +452,43 @@ def locate_whatsapp_search_bar(view) -> dict | None:
     return None
 
 
-def locate_whatsapp_composer(view) -> dict | None:
-    """Identify the active conversation's bottom message input box (never the search bar)."""
-    if view is None:
-        return None
-    elements = list(getattr(view, "elements", ()) or ())
-    mon = getattr(view, "monitor", None) or {}
-    win_rect = getattr(view, "window_rect", None)
-    if win_rect and len(win_rect) == 4 and win_rect[2] > 200:
-        w_left, w_top, w_w, w_h = (int(v) for v in win_rect)
-    else:
-        w_left = int(mon.get("left", 0) or 0)
-        w_top = int(mon.get("top", 0) or 0)
-        w_w = int(mon.get("width", 1920) or 1920)
-        w_h = int(mon.get("height", 1080) or 1080)
+def locate_whatsapp_composer(view, *, active_chat: dict | None = None) -> dict:
+    """Shared WhatsApp composer locator for Web (UIA/OCR/DOM) & Desktop.
 
+    Always returns structured metadata including:
+    `composer_found`, `composer_type`, `application`, `active_chat_id`,
+    `focus_verified`, `observation_id`, `confidence`, plus `x`, `y`, `label`,
+    `source`, `element` when found. Never confuses Chrome's omnibox or search bar.
+    """
+    chat_info = active_chat or get_active_chat()
+    app_name = str(getattr(view, "app", "") or ("chrome.exe" if chat_info.get("platform") == "whatsapp_web" else "WhatsApp") or "")
+    obs_id = str(getattr(view, "stable_digest", "") or getattr(view, "digest", "") or f"obs_{int(time.monotonic() * 1000)}")
+    active_cid = str(chat_info.get("chat_id") or "")
+    base_not_found = {
+        "composer_found": False,
+        "composer_type": "none",
+        "application": app_name,
+        "active_chat_id": active_cid,
+        "focus_verified": False,
+        "observation_id": obs_id,
+        "confidence": "uncertain",
+        "x": 0,
+        "y": 0,
+        "label": "",
+        "source": "none",
+        "element": None,
+    }
+    if view is None:
+        return base_not_found
+
+    elements = list(getattr(view, "elements", ()) or ())
+    w_left, w_top, w_w, w_h = _window_geometry(view)
     composer_floor = w_top + int(w_h * 0.55)
+    bottom_band = w_top + int(w_h * 0.68)
     chat_left_floor = w_left + int(w_w * 0.27)
     view_src = str(getattr(view, "source", "") or "").casefold()
 
+    # Pass 1: Explicit semantic UIA editable controls in conversation pane
     for el in elements:
         role = str(getattr(el, "role", "") or "").casefold()
         label_cf = str(getattr(el, "name", "") or getattr(el, "label", "") or "").casefold()
@@ -340,21 +498,214 @@ def locate_whatsapp_composer(view) -> dict | None:
         left = int(getattr(el, "left", 0) or 0)
         width = int(getattr(el, "width", 0) or 0)
         no_coords = (top == 0 and left == 0 and width == 0)
-        if role in {"edit", "document", "textbox", "combobox"} and not getattr(el, "protected", False):
+        is_lexical_node = role in {"group", "custom"} and ("type a message" in label_cf or ("message" in label_cf and top >= bottom_band))
+        if (role in {"edit", "document", "textbox", "combobox"} or is_lexical_node) and not getattr(el, "protected", False):
             if top >= composer_floor or ("message" in label_cf and (left >= chat_left_floor or no_coords)):
-                cx, cy = getattr(el, "center", (left + 160, top + 18))
-                return {"x": int(cx), "y": int(cy), "label": getattr(el, "name", "") or getattr(el, "label", "") or "Message composer", "source": "uia", "element": el}
+                cx, cy = getattr(el, "center", (left + max(60, width // 2), top + 18))
+                return {
+                    "composer_found": True,
+                    "composer_type": ("dom_editable" if "dom" in view_src else f"uia_{role or 'edit'}"),
+                    "application": app_name,
+                    "active_chat_id": active_cid,
+                    "focus_verified": bool(getattr(el, "focused", False)),
+                    "observation_id": obs_id,
+                    "confidence": "high",
+                    "x": int(cx),
+                    "y": int(cy),
+                    "label": getattr(el, "name", "") or getattr(el, "label", "") or "Type a message",
+                    "source": ("dom" if "dom" in view_src else "uia"),
+                    "element": el,
+                }
 
+    # Pass 2: OCR / static-text fallback strictly inside bottom conversation composer bar
     for el in elements:
         role = str(getattr(el, "role", "") or "").casefold()
-        is_ocr = ("ocr" in role) or (view_src == "ocr" and role in {"text", "ocr_text", ""})
+        is_ocr = ("ocr" in role) or (view_src == "ocr" and role in {"text", "ocr_text", ""}) or role == "text"
         label_cf = str(getattr(el, "name", "") or getattr(el, "label", "") or "").strip().casefold()
         top = int(getattr(el, "top", 0) or 0)
         left = int(getattr(el, "left", 0) or 0)
-        if is_ocr and top >= composer_floor and left >= chat_left_floor and ("type a message" in label_cf or "message" in label_cf):
+        if any(x in label_cf for x in ("search", "filter", "address", "omnibox", "url")):
+            continue
+        if is_ocr and top >= bottom_band and left >= chat_left_floor and (
+            "type a message" in label_cf
+            or "write a message" in label_cf
+            or "type here" in label_cf
+            or ("message" in label_cf and "encrypted" not in label_cf)
+        ):
             cx, cy = getattr(el, "center", (left + 160, top + 16))
-            return {"x": int(cx), "y": int(cy), "label": "Message composer (OCR)", "source": "ocr", "element": el}
-    return None
+            return {
+                "composer_found": True,
+                "composer_type": "ocr_composer_band",
+                "application": app_name,
+                "active_chat_id": active_cid,
+                "focus_verified": bool(getattr(el, "focused", False)),
+                "observation_id": obs_id,
+                "confidence": "medium",
+                "x": int(cx),
+                "y": int(cy),
+                "label": getattr(el, "name", "") or "Type a message (OCR)",
+                "source": "ocr",
+                "element": el,
+            }
+    return base_not_found
+
+
+def composer_text_value(view) -> tuple[bool, str]:
+    """Read current text inside the active WhatsApp composer; returns `(readback_supported, value)`."""
+    comp = locate_whatsapp_composer(view)
+    if not comp.get("composer_found") or comp.get("element") is None:
+        return False, ""
+    el = comp["element"]
+    val = str(getattr(el, "value", "") or "")
+    label = str(getattr(el, "name", "") or getattr(el, "label", "") or "")
+    # Placeholder label ("Type a message") does not count as typed user text
+    if val:
+        if val.strip().casefold() == "type a message":
+            return True, ""
+        return True, val
+    if comp.get("source") == "uia":
+        return True, ""
+    if label and label.strip().casefold() not in {"type a message", "type a message (ocr)", "message composer"}:
+        return False, label
+    return True, ""
+
+
+def verify_whatsapp_active_chat(
+    view=None,
+    expected_contact: str = "",
+    *,
+    tab_title: str = "",
+    tab_url: str = "",
+) -> dict:
+    """Shared verifier for an actually open WhatsApp conversation.
+
+    Verifies WhatsApp app/tab, right-hand conversation pane, conversation header text,
+    resolved contact identity (NEVER treating Chrome's tab title 'WhatsApp - Google Chrome'
+    as a contact name), chat identifier, composer association, and observation timestamp.
+    """
+    now_m = time.monotonic()
+    base = {
+        "verified": False,
+        "active_contact": "",
+        "chat_id": "",
+        "chat_header": "",
+        "chat_url": str(tab_url or ""),
+        "platform": "",
+        "application": "",
+        "has_composer": False,
+        "source": "none",
+        "confidence": 0.0,
+        "observation_id": f"obs_{int(now_m * 1000)}",
+        "observed_at": now_m,
+        "reason": "",
+    }
+    if view is None:
+        base["reason"] = "no screen observation was available"
+        return base
+
+    app_s = str(getattr(view, "app", "") or "")
+    title_s = str(tab_title or getattr(view, "title", "") or "")
+    if "whatsapp" not in fold(f"{app_s} {title_s} {tab_url}"):
+        base["reason"] = "WhatsApp is not the active application or browser tab"
+        return base
+
+    is_web = any(b in fold(app_s) for b in ("chrome", "msedge", "edge", "firefox", "brave")) or ("web.whatsapp.com" in str(tab_url or "").casefold())
+    platform_name = "whatsapp_web" if is_web else "whatsapp_desktop"
+    obs_id = str(getattr(view, "stable_digest", "") or getattr(view, "digest", "") or base["observation_id"])
+
+    elements = list(getattr(view, "elements", ()) or ())
+    w_left, w_top, w_w, _w_h = _window_geometry(view)
+    chat_left = w_left + int(w_w * 0.27)
+    hdr_top = w_top + 40
+    hdr_bottom = w_top + 205
+    exp_fold = fold(expected_contact) if expected_contact else ""
+
+    header_candidates: list[str] = []
+    for el in elements:
+        top = int(getattr(el, "top", 0) or 0)
+        left = int(getattr(el, "left", 0) or 0)
+        if not (hdr_top <= top <= hdr_bottom and left >= chat_left):
+            continue
+        role = str(getattr(el, "role", "") or "").casefold()
+        if role in {"edit", "combobox", "searchbox"}:
+            continue
+        name = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or "").split())
+        if not is_valid_contact_label(name):
+            continue
+        header_candidates.append(name)
+
+    matched = ""
+    if exp_fold:
+        for cand in header_candidates:
+            if exp_fold in fold(cand) or fold(cand) in exp_fold:
+                matched = cand
+                break
+        if not matched and not is_web and exp_fold in fold(title_s) and fold(title_s) != "whatsapp":
+            matched = expected_contact
+    elif header_candidates:
+        matched = header_candidates[0]
+
+    comp = locate_whatsapp_composer(view, active_chat={"platform": platform_name, "chat_id": (f"chat:{fold(matched)}" if matched else "")})
+    has_composer = bool(comp.get("composer_found"))
+    verified = bool(matched and (has_composer or (bool(exp_fold) and header_candidates)))
+    chat_id = ("chat:" + fold(matched)) if matched else ""
+    src = str(getattr(view, "source", "uia") or "uia")
+    conf = 0.92 if (verified and has_composer) else (0.72 if verified else 0.2)
+
+    reason = ""
+    if not verified:
+        if expected_contact and header_candidates:
+            reason = f"active chat header is {header_candidates[0]!r}, not {expected_contact!r}"
+        elif expected_contact:
+            reason = f"conversation header for {expected_contact!r} was not visible in the right pane"
+        else:
+            reason = "no active conversation header was found in the right pane"
+
+    res = {
+        "verified": verified,
+        "active_contact": matched,
+        "chat_id": chat_id,
+        "chat_header": matched,
+        "chat_url": str(tab_url or ""),
+        "platform": platform_name,
+        "application": app_s or ("WhatsApp (Chrome)" if is_web else "WhatsApp Desktop"),
+        "has_composer": has_composer,
+        "source": src,
+        "confidence": conf,
+        "observation_id": obs_id,
+        "observed_at": now_m,
+        "reason": reason,
+    }
+    if verified:
+        set_active_chat(
+            platform=platform_name,
+            contact_name=matched,
+            chat_id=chat_id,
+            chat_url=str(tab_url or ""),
+            chat_header=matched,
+            source=src,
+            verified=True,
+            confidence=conf,
+            observation_id=obs_id,
+        )
+    elif expected_contact and header_candidates and fold(header_candidates[0]) != exp_fold:
+        # User switched to a different open conversation — do not keep stale contact identity!
+        set_active_chat(
+            platform=platform_name,
+            contact_name=header_candidates[0],
+            chat_id=f"chat:{fold(header_candidates[0])}",
+            chat_header=header_candidates[0],
+            source=src,
+            verified=bool(has_composer),
+            confidence=0.6,
+            observation_id=obs_id,
+        )
+    return res
+
+
+def verify_selected_chat(view, expected_contact: str = "") -> dict:
+    """Backward-compatible wrapper around `verify_whatsapp_active_chat()`."""
+    return verify_whatsapp_active_chat(view, expected_contact=expected_contact)
 
 
 def locate_whatsapp_call_button(view, *, video: bool = False) -> dict | None:
@@ -362,15 +713,7 @@ def locate_whatsapp_call_button(view, *, video: bool = False) -> dict | None:
     if view is None:
         return None
     elements = list(getattr(view, "elements", ()) or ())
-    mon = getattr(view, "monitor", None) or {}
-    win_rect = getattr(view, "window_rect", None)
-    if win_rect and len(win_rect) == 4 and win_rect[2] > 200:
-        w_left, w_top, w_w, _w_h = (int(v) for v in win_rect)
-    else:
-        w_left = int(mon.get("left", 0) or 0)
-        w_top = int(mon.get("top", 0) or 0)
-        w_w = int(mon.get("width", 1920) or 1920)
-
+    w_left, w_top, w_w, _w_h = _window_geometry(view)
     hdr_left = w_left + int(w_w * 0.40)
     hdr_bottom = w_top + 220
 
@@ -420,77 +763,9 @@ def verify_call_started(view, *, contact: str = "") -> dict:
     joined = " | ".join(texts) + " | " + str(getattr(view, "title", "") or "").casefold()
     markers = ("calling", "ringing", "end call", "hang up", "voice call", "encrypted voice", "connecting", "mute")
     started = any(m in joined for m in markers)
-    contact_matched = True
-    if contact:
-        contact_matched = fold(contact) in fold(joined)
+    contact_matched = fold(contact) in fold(joined) if contact else True
     state = "active_or_ringing" if started else "not_detected"
     return {"started": bool(started and (contact_matched or not contact)), "state": state, "contact_matched": contact_matched}
-
-
-def verify_selected_chat(view, expected_contact: str = "") -> dict:
-    """Inspect the active WhatsApp conversation header cleanly from UIA/OCR/window title."""
-    if view is None:
-        return {"verified": False, "active_contact": "", "chat_id": "", "has_composer": False, "source": "none"}
-    elements = list(getattr(view, "elements", ()) or ())
-    mon = getattr(view, "monitor", None) or {}
-    win_rect = getattr(view, "window_rect", None)
-    if win_rect and len(win_rect) == 4 and win_rect[2] > 200:
-        w_left, w_top, w_w, _w_h = (int(v) for v in win_rect)
-    else:
-        w_left = int(mon.get("left", 0) or 0)
-        w_top = int(mon.get("top", 0) or 0)
-        w_w = int(mon.get("width", 1920) or 1920)
-
-    chat_left = w_left + int(w_w * 0.27)
-    hdr_top = w_top + 45
-    hdr_bottom = w_top + 195
-    exp_fold = fold(expected_contact) if expected_contact else ""
-
-    header_candidates: list[str] = []
-    for el in elements:
-        top = int(getattr(el, "top", 0) or 0)
-        left = int(getattr(el, "left", 0) or 0)
-        if not (hdr_top <= top <= hdr_bottom and left >= chat_left):
-            continue
-        name = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or "").split())
-        low = name.casefold()
-        if not is_valid_contact_label(name):
-            continue
-        if any(s in low for s in ("click here for contact info", "last seen", "online", "typing...")):
-            continue
-        header_candidates.append(name)
-
-    matched = ""
-    if exp_fold:
-        for cand in header_candidates:
-            if exp_fold in fold(cand) or fold(cand) in exp_fold:
-                matched = cand
-                break
-        if not matched and exp_fold in fold(getattr(view, "title", "") or ""):
-            matched = expected_contact
-    elif header_candidates:
-        matched = header_candidates[0]
-
-    has_composer = locate_whatsapp_composer(view) is not None
-    verified = bool(matched and (has_composer or bool(exp_fold)))
-    chat_id = ("chat:" + fold(matched)) if matched else ""
-    if verified:
-        set_active_chat(
-            platform=("whatsapp_web" if "chrome" in fold(getattr(view, "app", "") or "") else "whatsapp_desktop"),
-            contact_name=matched,
-            chat_id=chat_id,
-            chat_header=matched,
-            source=str(getattr(view, "source", "uia") or "uia"),
-            verified=True,
-            confidence=(0.9 if has_composer else 0.7),
-        )
-    return {
-        "verified": verified,
-        "active_contact": matched,
-        "chat_id": chat_id,
-        "has_composer": has_composer,
-        "source": str(getattr(view, "source", "none") or "none"),
-    }
 
 
 def verify_outgoing_message(after_view, draft: str) -> bool:
@@ -501,16 +776,12 @@ def verify_outgoing_message(after_view, draft: str) -> bool:
     comp = locate_whatsapp_composer(after_view)
     draft_cf = str(draft or "").strip().casefold()
     snippet = draft_cf[:24] if draft_cf else ""
-    bubble_found = False
     for el in elements:
         role = str(getattr(el, "role", "") or "").casefold()
         txt = str(getattr(el, "value", "") or getattr(el, "name", "") or "").strip().casefold()
         if snippet and snippet in txt and role not in {"edit", "combobox", "searchbox"}:
-            bubble_found = True
-            break
-    if bubble_found:
-        return True
-    if comp is not None and comp.get("element") is not None:
+            return True
+    if comp.get("composer_found") and comp.get("element") is not None:
         comp_val = str(getattr(comp["element"], "value", "") or "").strip().casefold()
         if snippet and snippet not in comp_val and len(comp_val) == 0:
             return True
@@ -540,7 +811,7 @@ def generate_autonomous_draft(
         else:
             target_lang = "English"
 
-    is_translate = bool(previous_draft and any(w in inst_cf for w in ("translate", "into english", "in english", "into hindi", "in hindi")))
+    is_translate = bool(previous_draft and any(w in inst_cf for w in ("translate", "into english", "in english", "into hindi", "in hindi", "replace it with english", "with english")))
     if is_translate:
         prompt = (
             f"Translate this message draft accurately into natural conversational {target_lang}, "
@@ -573,7 +844,6 @@ def generate_autonomous_draft(
     except Exception:
         pass
 
-    # Deterministic friendly fallback if cloud model call returns None
     greet = f"Hey {rec}," if rec else "Hey!"
     if target_lang == "Hindi":
         name_hi = f"{rec}, " if rec else ""
@@ -666,6 +936,100 @@ async def dom_extract_whatsapp_contacts(page, query: str = "") -> list[dict]:
     return cleaned
 
 
+async def dom_verify_active_chat(page, expected_contact: str = "") -> dict:
+    """Verify active WhatsApp Web conversation header & composer directly from live DOM."""
+    try:
+        info = await page.evaluate(
+            """() => {
+                const main = document.querySelector('#main');
+                if (!main) return {found: false, header: '', composer: false, url: location.href};
+                const hdr = main.querySelector('header span[title], header [data-testid="conversation-info-header-chat-title"], header span[dir="auto"]');
+                const htxt = hdr ? (hdr.getAttribute('title') || hdr.innerText || '').trim() : '';
+                const comp = main.querySelector('footer div[contenteditable="true"], div[contenteditable="true"][data-tab="10"], [role="textbox"][data-tab="10"]');
+                return {
+                    found: true,
+                    header: htxt,
+                    composer: !!comp,
+                    focused: !!(comp && (document.activeElement === comp || comp.contains(document.activeElement))),
+                    text: comp ? (comp.innerText || comp.textContent || '') : '',
+                    url: location.href,
+                };
+            }"""
+        )
+    except Exception:
+        info = {}
+    header = str((info or {}).get("header") or "").strip()
+    has_comp = bool((info or {}).get("composer"))
+    exp_fold = fold(expected_contact) if expected_contact else ""
+    matched = header if (header and is_valid_contact_label(header) and (not exp_fold or exp_fold in fold(header) or fold(header) in exp_fold)) else ""
+    verified = bool(matched and has_comp)
+    chat_id = f"chat:{fold(matched)}" if matched else ""
+    if verified:
+        set_active_chat(
+            platform="whatsapp_web", contact_name=matched, chat_id=chat_id,
+            chat_url=str((info or {}).get("url") or ""), chat_header=matched,
+            source="dom", verified=True, confidence=0.98,
+        )
+    return {
+        "verified": verified,
+        "active_contact": matched,
+        "chat_id": chat_id,
+        "chat_header": matched,
+        "chat_url": str((info or {}).get("url") or ""),
+        "platform": "whatsapp_web",
+        "application": "chrome",
+        "has_composer": has_composer if False else has_comp,
+        "composer_text": str((info or {}).get("text") or ""),
+        "source": "dom",
+        "confidence": (0.98 if verified else 0.15),
+    }
+
+
+async def dom_locate_whatsapp_composer(page) -> dict:
+    """Locate & verify WhatsApp Web composer element strictly inside `#main footer` via Playwright DOM."""
+    try:
+        meta = await page.evaluate(
+            """() => {
+                const main = document.querySelector('#main');
+                if (!main) return {found: false};
+                const comp = main.querySelector('footer div[contenteditable="true"], div[contenteditable="true"][data-tab="10"], footer [role="textbox"]');
+                if (!comp) return {found: false};
+                const hdr = main.querySelector('header span[title], header span[dir="auto"]');
+                const htxt = hdr ? (hdr.getAttribute('title') || hdr.innerText || '').trim() : '';
+                const r = comp.getBoundingClientRect();
+                return {
+                    found: true,
+                    header: htxt,
+                    text: (comp.innerText || comp.textContent || ''),
+                    focused: document.activeElement === comp || comp.contains(document.activeElement),
+                    rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+                };
+            }"""
+        )
+    except Exception:
+        meta = {}
+    if not (meta or {}).get("found"):
+        return {
+            "composer_found": False, "composer_type": "none", "application": "chrome",
+            "active_chat_id": get_active_chat().get("chat_id") or "",
+            "focus_verified": False, "observation_id": "dom", "confidence": "uncertain",
+        }
+    hdr = str(meta.get("header") or "").strip()
+    cid = f"chat:{fold(hdr)}" if hdr else str(get_active_chat().get("chat_id") or "")
+    return {
+        "composer_found": True,
+        "composer_type": "dom_contenteditable",
+        "application": "chrome",
+        "active_chat_id": cid,
+        "focus_verified": bool(meta.get("focused")),
+        "observation_id": "dom",
+        "confidence": "high",
+        "composer_text": str(meta.get("text") or ""),
+        "rect": tuple(meta.get("rect") or (0, 0, 0, 0)),
+        "source": "dom",
+    }
+
+
 class WhatsAppDriver:
     def _view(self):
         from core import screenview
@@ -705,7 +1069,7 @@ class WhatsAppDriver:
         if "whatsapp" not in fold((getattr(view, "app", "") or "") + " " + (getattr(view, "title", "") or "")):
             return False, "WhatsApp is not exposing an accessible active window"
 
-        hdr = verify_selected_chat(view, expected_contact=receiver)
+        hdr = verify_whatsapp_active_chat(view, expected_contact=receiver)
         if not hdr.get("verified"):
             sb = locate_whatsapp_search_bar(view)
             if not sb:
@@ -733,12 +1097,12 @@ class WhatsAppDriver:
                 return False, f"could not open the matching chat: {clicked.error}"
             time.sleep(0.25)
             view = self._view()
-            hdr = verify_selected_chat(view, expected_contact=receiver)
+            hdr = verify_whatsapp_active_chat(view, expected_contact=receiver)
             if not hdr.get("verified"):
                 return False, "active chat title does not match the requested contact; nothing was typed"
 
         comp = locate_whatsapp_composer(view)
-        if not comp:
+        if not comp.get("composer_found"):
             return False, "No unique message field was found."
         pt_comp = screenact.Point(comp["x"], comp["y"], origin="element", label=comp["label"])
         entered = screenact.type_text(message, target=pt_comp, clear_first=True)

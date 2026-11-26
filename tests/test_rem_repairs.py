@@ -2882,5 +2882,217 @@ class VoiceFirstWhatsAppMessagingAndCallTests(unittest.TestCase):
         self.assertEqual(_normalize_rem_address("My laptop has 16 GB RAM"), "My laptop has 16 GB RAM")
 
 
+class LiveWhatsAppRegressionSuiteTests(unittest.TestCase):
+    def test_stable_contact_extraction_across_repeated_observations_with_cards_and_previews(self):
+        from core import screenview
+        from plugins import _whatsapp_core
+
+        def _make_noisy_frame(preview_txt):
+            return SimpleNamespace(
+                app="chrome.exe",
+                title="WhatsApp - Google Chrome",
+                source="uia+ocr",
+                monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+                windows=[],
+                elements=[
+                    screenview.Element(eid="sb", role="edit", name="Search or start new chat", value="", left=120, top=145, width=280, height=34),
+                    screenview.Element(eid="card1", role="listitem", name=f"Rio 12:15 PM {preview_txt}", value="", left=60, top=220, width=320, height=64),
+                    screenview.Element(eid="c1_t", role="text", name="Rio", value="", left=110, top=226, width=90, height=22),
+                    screenview.Element(eid="c1_p", role="ocr_text", name=preview_txt, value="", left=110, top=254, width=190, height=18),
+                    screenview.Element(eid="c1_tm", role="ocr_text", name="12:15 PM", value="", left=330, top=226, width=50, height=18),
+                    screenview.Element(eid="st1", role="ocr_text", name="Photo", value="", left=110, top=272, width=50, height=16),
+                    screenview.Element(eid="ocr_n", role="ocr_text", name="Rio 2", value="", left=110, top=310, width=90, height=22),
+                    screenview.Element(eid="ocr_p", role="ocr_text", name="Hey how was your day today", value="", left=110, top=336, width=210, height=18),
+                    screenview.Element(eid="bad1", role="ocr_text", name="-0-", value="", left=90, top=390, width=40, height=18),
+                    screenview.Element(eid="bad2", role="ocr_text", name="-0+", value="", left=90, top=420, width=40, height=18),
+                ],
+            )
+
+        r1 = _whatsapp_core.extract_whatsapp_contacts(_make_noisy_frame("Hey see you at 5"), query="")
+        r2 = _whatsapp_core.extract_whatsapp_contacts(_make_noisy_frame("Okay sounds good!"), query="")
+        r3 = _whatsapp_core.extract_whatsapp_contacts(_make_noisy_frame("Voice message"), query="")
+        self.assertEqual([c["display_name"] for c in r1], ["Rio", "Rio 2"])
+        self.assertEqual([c["display_name"] for c in r2], ["Rio", "Rio 2"])
+        self.assertEqual([c["display_name"] for c in r3], ["Rio", "Rio 2"])
+
+    def test_failed_chat_open_and_wrong_active_chat_never_report_done(self):
+        from actions import browser_control
+        from core import desktop_control, screenact, screenview
+        from core.conversation import tool_result_guidance
+        from plugins import _whatsapp_core
+
+        list_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, windows=[],
+            elements=[
+                screenview.Element(eid="c1", role="listitem", name="Rio", value="", left=60, top=220, width=300, height=56),
+            ],
+        )
+        wrong_open = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, windows=[],
+            elements=[
+                screenview.Element(eid="hdr", role="text", name="Bob", value="", left=580, top=105, width=100, height=24),
+                screenview.Element(eid="comp", role="edit", name="Type a message", value="", left=580, top=940, width=680, height=40),
+            ],
+        )
+        with patch.object(screenview, "_foreground", return_value=("chrome.exe", "WhatsApp - Google Chrome", 512, 8888)), \
+             patch.object(screenview, "all_windows", return_value=[("chrome.exe", "WhatsApp - Google Chrome")]), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=[list_view, wrong_open, wrong_open]), \
+             patch.object(screenact, "get_cursor_pos", return_value=(210, 248)), \
+             patch.object(screenact, "move_cursor", side_effect=lambda pt: screenact.Act(True, "move", point=(pt.x, pt.y))), \
+             patch.object(screenact, "click", side_effect=lambda pt: screenact.Act(True, "click", point=(pt.x, pt.y))):
+            res = browser_control._native_browser_action("select_contact", {"description": "Rio"}, "chrome")
+        self.assertIn("status=unverified", res)
+        self.assertIn("couldn't confirm that the chat opened", res)
+        self.assertIn("selected_chat_verified=false", res)
+        self.assertNotIn("status=done", res)
+        self.assertIn("could not confirm", tool_result_guidance(res).casefold())
+        # Wrong chat header verification also explicitly rejects expected contact
+        chk = _whatsapp_core.verify_whatsapp_active_chat(wrong_open, expected_contact="Rio")
+        self.assertFalse(chk["verified"])
+        self.assertIn("Bob", chk["reason"])
+
+    def test_shared_composer_dom_uia_and_ocr_fallback_plus_clear_field(self):
+        from actions import browser_control
+        from core import desktop_control, screenact, screenview
+        from core.request_context import RequestContext
+        from memory import config_manager
+        from plugins import _whatsapp_core
+
+        # 1. DOM composer helper
+        fake_page = SimpleNamespace(
+            evaluate=AsyncMock(return_value={
+                "found": True, "header": "Rio", "text": "old hindi", "focused": True, "rect": [580, 940, 680, 42],
+            })
+        )
+        dom_comp = asyncio.run(_whatsapp_core.dom_locate_whatsapp_composer(fake_page))
+        self.assertTrue(dom_comp["composer_found"])
+        self.assertEqual(dom_comp["composer_type"], "dom_contenteditable")
+        self.assertEqual(dom_comp["active_chat_id"], "chat:rio")
+        self.assertTrue(dom_comp["focus_verified"])
+
+        # 2. UIA composer helper
+        uia_view = SimpleNamespace(
+            app="WhatsApp.exe", title="WhatsApp", source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+            elements=[screenview.Element(eid="c", role="edit", name="Type a message", value="some draft", left=580, top=940, width=680, height=40, focused=True)],
+        )
+        uia_comp = _whatsapp_core.locate_whatsapp_composer(uia_view, active_chat={"chat_id": "chat:rio"})
+        self.assertTrue(uia_comp["composer_found"])
+        self.assertEqual(uia_comp["source"], "uia")
+        self.assertTrue(uia_comp["focus_verified"])
+
+        # 3. OCR fallback composer inside bottom-right band (never omnibox/search bar)
+        ocr_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="ocr",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+            elements=[
+                screenview.Element(eid="sb", role="ocr_text", name="Search or start new chat", value="", left=120, top=140, width=220, height=24),
+                screenview.Element(eid="msg", role="ocr_text", name="Type a message", value="", left=600, top=950, width=200, height=28),
+            ],
+        )
+        ocr_comp = _whatsapp_core.locate_whatsapp_composer(ocr_view, active_chat={"chat_id": "chat:rio"})
+        self.assertTrue(ocr_comp["composer_found"])
+        self.assertEqual(ocr_comp["composer_type"], "ocr_composer_band")
+        self.assertEqual(ocr_comp["y"], 964)
+
+        # 4. clear_field authorization & verified empty readback
+        ctx_open = RequestContext.create("Search for Rio", "voice", browser="chrome", browser_task_id="bt_clr")
+        ctx_clear = RequestContext.create(
+            "Remove all the text from the message bar", "voice",
+            parent_instruction=ctx_open.instruction, root_task_id=ctx_open.root_task_id,
+            spoken_inputs=(ctx_open.instruction, "Remove all the text from the message bar"),
+            browser="chrome", browser_task_id=ctx_open.browser_task_id,
+        )
+        with patch.object(config_manager, "get_local_autonomy_mode", return_value="trusted"):
+            ok_clr, reason_clr = desktop_control.authorize_user_request(
+                ctx_clear.instruction, "browser_control",
+                {"action": "clear_field", "description": "message bar", "browser": "chrome"},
+                source="voice", auth_context=ctx_clear,
+            )
+            self.assertTrue(ok_clr, reason_clr)
+
+            # Follow-up "Type it again" also allowed with existing draft
+            desktop_control.set_active_composition_state(
+                composition_requested=True, selected_contact="Rio",
+                generated_content="Hey Rio!", typing_authorized=True, auth_context=ctx_clear,
+            )
+            ctx_again = RequestContext.create(
+                "Type it again", "voice",
+                parent_instruction=ctx_clear.instruction, root_task_id=ctx_clear.root_task_id,
+                spoken_inputs=(ctx_open.instruction, "Remove all the text from the message bar", "Type it again"),
+                browser="chrome", browser_task_id=ctx_clear.browser_task_id,
+            )
+            ok_type, reason_type = desktop_control.authorize_user_request(
+                ctx_again.instruction, "browser_control",
+                {"action": "smart_type", "description": "message box", "text": "Hey Rio!", "browser": "chrome"},
+                source="voice", auth_context=ctx_again,
+            )
+            self.assertTrue(ok_type, reason_type)
+
+        empty_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, windows=[],
+            elements=[
+                screenview.Element(eid="hdr", role="text", name="Rio", value="", left=580, top=105, width=100, height=24),
+                screenview.Element(eid="c", role="edit", name="Type a message", value="", left=580, top=940, width=680, height=40, focused=True),
+            ],
+        )
+        pressed_clr = []
+        with patch.object(screenview, "_foreground", return_value=("chrome.exe", "WhatsApp - Google Chrome", 512, 8888)), \
+             patch.object(screenview, "all_windows", return_value=[("chrome.exe", "WhatsApp - Google Chrome")]), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=[uia_view, empty_view]), \
+             patch.object(screenact, "get_cursor_pos", return_value=(700, 958)), \
+             patch.object(screenact, "move_cursor", side_effect=lambda pt: screenact.Act(True, "move", point=(pt.x, pt.y))), \
+             patch.object(screenact, "click", side_effect=lambda pt: screenact.Act(True, "click", point=(pt.x, pt.y))), \
+             patch.object(screenact, "press", side_effect=lambda k, **kw: (pressed_clr.append(k), screenact.Act(True, "press"))[1]):
+            clr_out = browser_control._native_browser_action("clear_field", {"description": "message bar"}, "chrome")
+        self.assertEqual(pressed_clr, ["ctrl+a", "backspace", "delete"])
+        self.assertIn("status=done", clr_out)
+        self.assertIn("composer_empty=true", clr_out)
+        self.assertIn("The message box is empty now", clr_out)
+
+    def test_uncertain_asr_and_background_speech_preserve_task_without_authorizing_noise(self):
+        from core import desktop_control
+        from main import RemLive, _is_uncertain_asr
+
+        self.assertTrue(_is_uncertain_asr(""))
+        self.assertTrue(_is_uncertain_asr("hmm..."))
+        self.assertTrue(_is_uncertain_asr("uh"))
+        self.assertFalse(_is_uncertain_asr("Clear it"))
+        self.assertFalse(_is_uncertain_asr("Send it"))
+
+        rem = RemLive.__new__(RemLive)
+        rem._request_context_lock = threading.Lock()
+        rem._request_context = None
+        rem._last_user_command = ""
+        rem._last_user_command_source = "untrusted"
+        rem._active_browser_task = None
+        rem._last_assistant_question = ""
+        rem._current_voice_turn_task_id = ""
+        rem._record_user_request("Open WhatsApp in Chrome and search for Rio", "voice")
+        root_tid = rem._current_request_context().browser_task_id
+        self.assertTrue(root_tid)
+
+        # Uncertain fragment does NOT authorize click AND does NOT wipe active browser_task_id
+        rem._record_user_request("um", "voice")
+        self.assertIsNotNone(rem._active_browser_task)
+        self.assertEqual(rem._active_browser_task["task_id"], root_tid)
+        ok_noise, _ = desktop_control.authorize_user_request(
+            rem._current_request_context().instruction, "browser_control",
+            {"action": "smart_click", "description": "Rio"}, source="voice", auth_context=rem._current_request_context(),
+        )
+        self.assertFalse(ok_noise)
+
+        # Real follow-up immediately inherits the same browser_task_id
+        rem._record_user_request("Open it again", "voice")
+        self.assertEqual(rem._current_request_context().browser_task_id, root_tid)
+        rem._record_user_request("Remove all the text from the message bar", "voice")
+        self.assertEqual(rem._current_request_context().browser_task_id, root_tid)
+
+
 if __name__ == "__main__":
     unittest.main()

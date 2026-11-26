@@ -662,6 +662,27 @@ def _normalize_rem_address(text: str) -> str:
     return _REM_LEADING_ASR_RE.sub("REM ", str(text or "")).strip()
 
 
+def _is_uncertain_asr(text: str) -> bool:
+    """Identify fragmented or unintelligible ASR noise that must not fire tools or destroy task continuity."""
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return True
+    tokens = re.findall(r"[0-9A-Za-z\u00C0-\u024F\u0900-\u097F]+", cleaned.casefold())
+    if not tokens:
+        return True
+    allowed_short = {
+        "yes", "yeah", "yep", "no", "ok", "okay", "sure", "stop", "pause", "play",
+        "it", "that", "one", "clear", "send", "call", "undo", "back", "hi", "hey",
+        "haan", "nahi", "ruko", "karo", "kholo",
+    }
+    fillers = {"uh", "um", "hmm", "hm", "ah", "oh", "er", "mhm", "uhh", "umm"}
+    if all(t in fillers for t in tokens):
+        return True
+    if len(tokens) == 1 and len(tokens[0]) <= 2 and tokens[0] not in allowed_short:
+        return True
+    return False
+
+
 def _next_live_backoff(previous_s: float, *, attempt: int = 1) -> float:
     """Bounded exponential backoff with deterministic jitter (prevents zero-second reconnect storms)."""
     import random
@@ -1149,8 +1170,9 @@ class RemLive:
                         "shortcut", "hotkey", "play", "watch", "open", "close",
                         "back", "forward", "backward", "seek", "rewind", "skip",
                         "reload", "refresh", "screenshot", "capture",
-                        "chat", "contact", "message", "compose", "draft", "write",
-                        "translate", "hindi", "english", "replace", "remove", "clear", "previous",
+                        "chat", "contact", "message", "compose", "draft", "write", "text",
+                        "clear", "empty", "erase", "field", "bar", "box", "is there",
+                        "translate", "hindi", "english", "replace", "remove", "previous",
                         "send", "deliver", "call", "ring", "dial", "try again", "continue",
                         "shorter", "shorten", "natural", "rewrite", "rio",
                         "first", "second", "third", "fourth", "fifth", "sixth", "last", "titled",
@@ -1190,6 +1212,7 @@ class RemLive:
                         has_live_bt
                         and not unrelated_non_browser
                         and not is_hindi_chatter
+                        and not _is_uncertain_asr(cleaned)
                         and (word_count <= 5 or bool(last_q) or bool(req_tokens & {"it", "that", "this", "one"}))
                     )
                     now_m = time.monotonic()
@@ -1234,9 +1257,9 @@ class RemLive:
                             "last_instruction": recorded_parent,
                             "spoken_inputs": tuple(prev_history),
                         }
-                    elif is_hindi_chatter and has_live_bt:
-                        # An unrelated Hindi conversational remark must NOT authorize browser clicks on its
-                        # own turn, AND must NOT destroy the valid active browser task waiting underneath.
+                    elif (is_hindi_chatter or _is_uncertain_asr(cleaned)) and has_live_bt and not unrelated_non_browser:
+                        # Uncertain ASR fragments or incidental side remarks must NOT authorize clicks on
+                        # their own turn, AND must NOT destroy the valid active browser task waiting underneath.
                         self._active_browser_task["expires_at"] = now_m + 600.0
                     else:
                         # Explicitly unrelated request must not inherit browser task authorization
@@ -2994,9 +3017,9 @@ class RemLive:
                                     self._current_voice_turn_task_id = _uuid.uuid4().hex
                                     self._record_user_request("", "voice")
                                 in_buf.append(txt)
-                                # Bind partial direct speech before a tool-call
-                                # event can arrive ahead of turn_complete.
-                                self._record_user_request(" ".join(in_buf), "voice")
+                                partial_joined = " ".join(in_buf).strip()
+                                if not _is_uncertain_asr(partial_joined):
+                                    self._record_user_request(partial_joined, "voice")
                                 self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
@@ -4099,6 +4122,16 @@ class RemLive:
                     if self._awake and not self._startup_greeting_sent:
                         tg.create_task(self._send_startup_greeting())
                     self._live_fast_failures = 0
+                    if not getattr(self, "_ocr_prewarmed", False):
+                        self._ocr_prewarmed = True
+                        def _prewarm_ocr():
+                            try:
+                                from core import screenview
+                                if getattr(screenview, "_HAS_OCR", False):
+                                    screenview._ocr_reader()
+                            except Exception:
+                                pass
+                        threading.Thread(target=_prewarm_ocr, daemon=True, name="rem-ocr-prewarm").start()
                     self._live_session_count = int(getattr(self, "_live_session_count", 0) or 0) + 1
                     try:
                         from core import desktop_control as _dc_live
