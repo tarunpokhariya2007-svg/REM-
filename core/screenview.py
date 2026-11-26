@@ -1627,6 +1627,10 @@ def _ocr_reader() -> Optional[Callable[[Any], Any]]:
 
 
 def _scan_ocr(monitor: dict, deadline: float) -> list[Element]:
+    if time.monotonic() > deadline:
+        raise TimeoutError("OCR exceeded its budget before it started")
+
+    was_unloaded = _ocr_engine is None
     engine = _ocr_reader()
     if engine is None:
         raise RuntimeError(
@@ -1640,6 +1644,10 @@ def _scan_ocr(monitor: dict, deadline: float) -> list[Element]:
 
     image, monitor, px = capture(monitor)
 
+    # First-time RapidOCR ONNX model load can take ~2-3s on Windows; grant a bounded
+    # post-load inference window instead of aborting right before inference starts.
+    if was_unloaded:
+        deadline = max(deadline, time.monotonic() + 4.0)
     if time.monotonic() > deadline:
         raise TimeoutError("OCR exceeded its budget before it started")
 
@@ -2126,11 +2134,17 @@ def window_pid_at(x: int, y: int) -> int:
             user32 = ctypes.WinDLL("user32")
             user32.WindowFromPoint.argtypes = [wintypes.POINT]
             user32.WindowFromPoint.restype = wintypes.HWND
-            hwnd = user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetAncestor.restype = wintypes.HWND
+            scale = _physical_to_logical() or 1.0
+            px = int(round(x / scale)) if abs(scale - 1.0) > 1e-3 else int(x)
+            py = int(round(y / scale)) if abs(scale - 1.0) > 1e-3 else int(y)
+            hwnd = user32.WindowFromPoint(wintypes.POINT(px, py))
             if not hwnd:
                 return 0
+            root_hwnd = user32.GetAncestor(hwnd, 2) or hwnd  # GA_ROOT = 2
             pid = wintypes.DWORD(0)
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            user32.GetWindowThreadProcessId(root_hwnd, ctypes.byref(pid))
             return int(pid.value)
         if _OS == "mac":
             for pid, (left, top, width, height) in _quartz_windows(False):
@@ -2440,8 +2454,8 @@ def look(*, budget_s: float = SCAN_BUDGET_S, allow_ocr: bool = True,
     # -- fall back to OCR ---------------------------------------------------
     if allow_ocr and _HAS_OCR:
         try:
-            ocr_elements = _scan_ocr(monitor_rect(view),
-                                     started + max(0.2, budget_s) * 2)
+            ocr_budget = max(2.5, max(0.2, budget_s) * 2.0)
+            ocr_elements = _scan_ocr(monitor_rect(view), time.monotonic() + ocr_budget)
             if ocr_elements:
                 view.source = "ocr"
                 view.elements = ocr_elements

@@ -232,13 +232,12 @@ def _send_whatsapp(receiver: str, message: str) -> str:
     if desktop_control.should_stop():
         return outcome.failed("send_message", "computer control was stopped; no message was sent",
                               platform="WhatsApp", to=receiver)
-    sent, failure = transport.send_message_to(receiver, message)
+    sent, failure = transport.send_message_to(receiver, message, task_id="")
     if sent:
-        # The one platform that can say `done`: the driver opened the
-        # conversation, proved it was the right person's, typed, and confirmed
-        # the box emptied.
         return outcome.done("send_message", platform="WhatsApp",
-                            to=receiver, verified=True)
+                            to=receiver, verified=True, sending_status="sent")
+    if "unverified" in str(failure or "").casefold():
+        return outcome.unverified("send_message", failure, platform="WhatsApp", to=receiver)
     return outcome.failed("send_message", failure,
                           platform="WhatsApp", to=receiver)
 
@@ -332,6 +331,36 @@ def _resolve_platform(platform_str: str):
     return lambda r, m: _desktop_send(platform_str.strip().title(), r, m)
 
 
+def _is_voice_authorized_send(receiver: str, platform: str) -> tuple[bool, str]:
+    """Return True when an active, explicit voice/typed task clearly authorized sending without GUI confirm."""
+    try:
+        from core import autonomous_mode, desktop_control
+        if autonomous_mode.active_session() is not None:
+            return False, ""
+        ctx = desktop_control.current_bound_auth_context()
+        if ctx is None or ctx.is_expired() or desktop_control.should_stop():
+            return False, ""
+        src = str(getattr(ctx, "source", "") or "").casefold()
+        if src not in {"voice", "typed"}:
+            return False, ""
+        ok, _reason = desktop_control.authorize_user_request(
+            ctx.instruction, "send_message",
+            {"receiver": receiver, "platform": platform},
+            source=src, auth_context=ctx,
+        )
+        if not ok:
+            return False, ""
+        combined = " ".join([
+            str(getattr(ctx, "instruction", "") or ""),
+            str(getattr(ctx, "parent_instruction", "") or ""),
+        ]).casefold()
+        if not any(w in combined for w in ("send", "deliver", "bhejo", "bhej")):
+            return False, ""
+        return True, str(getattr(ctx, "task_id", "") or "")
+    except Exception:
+        return False, ""
+
+
 def send_message(
     parameters: dict,
     response=None,
@@ -344,7 +373,23 @@ def send_message(
     platform     = params.get("platform", "whatsapp").strip()
 
     if not receiver:
+        try:
+            from core import desktop_control
+            snap = desktop_control.snapshot()
+            candidate = str(snap.get("active_contact") or "").strip()
+            if candidate and candidate != "—":
+                receiver = candidate
+        except Exception:
+            pass
+    if not receiver:
         return outcome.failed("send_message", "no recipient was given")
+    if not message_text:
+        try:
+            from core import desktop_control
+            comp = desktop_control.get_active_composition_state() or {}
+            message_text = str(comp.get("generated_content") or "").strip()
+        except Exception:
+            pass
     if not message_text:
         return outcome.failed("send_message", "no message text was given",
                               to=receiver)
@@ -356,10 +401,38 @@ def send_message(
             to=receiver, platform=platform,
         )
 
-    # The requested message is only sent after a person confirms it in REM's
-    # trusted HUD. A model-supplied `confirmed` field is never accepted.
+    voice_direct, task_id = _is_voice_authorized_send(receiver, platform)
+    if voice_direct:
+        try:
+            from core import desktop_control
+            desktop_control.record_diagnostics(
+                gui_confirm_required=False,
+                gui_confirm_reason="explicit_voice_send",
+                tool_name="send_message",
+            )
+        except Exception:
+            pass
+        if platform.casefold() in {"whatsapp", "wp", "wapp"}:
+            try:
+                from core import desktop_control
+                with desktop_control.action(f"send_message:{platform} to {receiver}"):
+                    res = _send_whatsapp(receiver, message_text)
+                    desktop_control.report(f"send_message:{platform}", str(res)[:140])
+                    if player:
+                        player.set_desktop_control_status(desktop_control.snapshot())
+                    return res
+            except Exception as exc:
+                return outcome.failed("send_message", f"voice-authorized send failed: {exc}", platform=platform, to=receiver)
+        return _start_confirmed_send(player, platform, receiver, message_text)
+
+    # Fallback HUD gate when invoked without an unambiguous direct voice authorization
     try:
-        from core import confirm
+        from core import confirm, desktop_control
+        desktop_control.record_diagnostics(
+            gui_confirm_required=True,
+            gui_confirm_reason="no_direct_voice_send_context",
+            tool_name="send_message",
+        )
         if confirm.pending_title():
             return outcome.failed("send_message",
                                   "another confirmation is already waiting; no message was sent",
@@ -451,15 +524,13 @@ TOOL = {
     "name": "send_message",
     "description": (
         "Sends a text message via WhatsApp, Telegram, or another messaging "
-        "platform. Write 'message_text' in the USER'S OWN LANGUAGE, exactly "
-        "what they asked to be said. "
-        "This tool answers immediately and sends in the background. On "
-        "status=started say only that you are sending it, never that it is "
-        "sent. The result follows separately: status=done means it was "
-        "confirmed delivered to the conversation, status=unverified means the "
-        "keystrokes went out and NOBODY can confirm it arrived - say exactly "
-        "that - and status=failed means it did not go. Never tell the user a "
-        "message was sent unless the result said status=done."
+        "platform. Write 'message_text' in the USER'S OWN LANGUAGE, or pass the "
+        "verified active draft when the user says 'Send it'. "
+        "When explicitly authorized by the user's direct voice command on WhatsApp, "
+        "this executes directly without forcing an extra HUD click prompt. "
+        "On status=done report that the message was verified sent; on "
+        "status=unverified say you submitted it but could not confirm delivery; "
+        "on status=failed explain why it did not send."
     ),
     "tier": "core",
     "parameters": {

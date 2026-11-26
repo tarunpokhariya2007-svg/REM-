@@ -136,8 +136,18 @@ def _normalize_key_request(value: str) -> str:
     aliases = {"return": "enter", "escape": "esc", "control": "ctrl",
                "windows": "winleft", "win": "winleft", "start": "winleft",
                "pgup": "pageup", "pgdn": "pagedown", "del": "delete",
-               "ins": "insert", "spacebar": "space"}
+               "ins": "insert", "spacebar": "space", "bksp": "backspace"}
     text = str(value or "").strip().casefold()
+    phrase_map = {
+        "select all": "ctrl+a",
+        "copy": "ctrl+c",
+        "paste": "ctrl+v",
+        "cut": "ctrl+x",
+        "undo": "ctrl+z",
+        "redo": "ctrl+y",
+    }
+    if text in phrase_map:
+        return phrase_map[text]
     text = re.sub(r"\bpage\s+(up|down)\b", r"page\1", text)
     parts = [part for part in re.split(r"[+\s]+", text)
              if part]
@@ -249,20 +259,42 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
         _publish(player)
         return f"Computer-use mode is now {desktop_control.snapshot()['mode']}."
 
-    if action not in {"observe", "find", "click", "right_click", "double_click", "select", "toggle", "expand", "collapse", "hover", "move", "move_relative", "type", "press", "scroll", "focus_window"}:
-        return "Supported actions: observe, find, click, right_click, double_click, select, toggle, expand, collapse, hover, move, move_relative, type, press, scroll, focus_window, pause, resume, stop, set_mode."
+    if action not in {"observe", "find", "click", "left_click", "right_click", "double_click", "mouse_down", "mouse_up", "select", "toggle", "expand", "collapse", "hover", "move", "move_relative", "type", "press", "scroll", "focus_window"}:
+        return "Supported actions: observe, find, click, left_click, right_click, double_click, mouse_down, mouse_up, select, toggle, expand, collapse, hover, move, move_relative, type, press, scroll, focus_window, pause, resume, stop, set_mode."
 
     try:
         if action in ("observe", "find"):
-            from memory.config_manager import get_local_screen_observation_enabled
+            from memory.config_manager import (
+                get_local_screen_observation_enabled,
+                is_screen_access_revoked,
+            )
             if not get_local_screen_observation_enabled():
-                desktop_control.report(action, "refused: local screen observation disabled")
+                revoked = is_screen_access_revoked()
+                desktop_control.report(
+                    action,
+                    "refused: screen access revoked" if revoked else "refused: local screen observation disabled",
+                )
                 _publish(player)
+                if revoked:
+                    return ("status=failed action=desktop_ui reason=\"Local screen observation was "
+                            "explicitly revoked by the user. Enable LOCAL SCREEN OBSERVATION in the "
+                            "COMPUTER USE panel.\"")
                 return ("status=failed action=desktop_ui reason=\"Local screen observation is "
-                        "currently disabled or revoked. Enable LOCAL SCREEN OBSERVATION in the "
+                        "currently disabled. Enable LOCAL SCREEN OBSERVATION in the "
                         "COMPUTER USE panel.\"")
         with desktop_control.action(action):
             _publish(player)
+            if action == "mouse_down":
+                outcome = screenact.mouse_down(button=str(params.get("button") or "left"))
+                desktop_control.report(action, str(outcome))
+                _publish(player)
+                return str(outcome)
+            if action == "mouse_up":
+                outcome = screenact.mouse_up(button=str(params.get("button") or "left"))
+                desktop_control.report(action, str(outcome))
+                _publish(player)
+                return str(outcome)
+
             before = _view()
             desktop_control.report(action, "observed current screen", before.app)
             _publish(player)
@@ -313,21 +345,219 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                 return str(outcome)
 
             if action == "move" and not str(params.get("target", "")).strip():
-                outcome = screenact.move_to_screen_position(params.get("position", ""))
+                if params.get("x") is not None and params.get("y") is not None:
+                    pt = screenact.Point(int(params["x"]), int(params["y"]), origin="user", label="coordinates")
+                    outcome = screenact.move_cursor(pt)
+                else:
+                    outcome = screenact.move_to_screen_position(params.get("position", ""))
                 desktop_control.report(action, "cursor moved" if outcome.ok else
                                        f"failed: {outcome.error}", before.app)
                 _publish(player)
                 return str(outcome)
 
-            if action in {"click", "right_click", "double_click", "select", "toggle", "expand", "collapse", "hover", "move", "type"}:
+            if action in {"click", "left_click", "right_click", "double_click", "select", "toggle", "expand", "collapse", "hover", "move", "type"}:
+                click_kind = "click" if action == "left_click" else action
                 target_text = str(params.get("target", "")).strip()
-                if action in {"hover", "move"} and not target_text:
+                target_cf = target_text.casefold()
+                named_pos = target_cf.replace(" ", "_")
+                if click_kind in {"move", "hover"} and (
+                    params.get("position")
+                    or named_pos in {"center", "middle", "top_left", "top_right", "bottom_left", "bottom_right"}
+                ):
+                    outcome = screenact.move_to_screen_position(params.get("position") or named_pos)
+                    desktop_control.report(action, "cursor moved" if outcome.ok else f"failed: {outcome.error}", before.app)
+                    _publish(player)
+                    return str(outcome)
+                coord_match = re.fullmatch(r"\(?\s*(-?\d+)\s*[, ]\s*(-?\d+)\s*\)?", target_text)
+                coord_x = params.get("x") if params.get("x") is not None else (int(coord_match.group(1)) if coord_match else None)
+                coord_y = params.get("y") if params.get("y") is not None else (int(coord_match.group(2)) if coord_match else None)
+                if coord_x is not None and coord_y is not None and click_kind in {"move", "hover", "click", "right_click", "double_click"}:
+                    pt = screenact.Point(int(coord_x), int(coord_y), origin="user", label=target_text or "coordinates")
+                    if click_kind in {"move", "hover"}:
+                        outcome = screenact.move_cursor(pt)
+                    elif click_kind == "right_click":
+                        outcome = screenact.right_click(pt)
+                    elif click_kind == "double_click":
+                        outcome = screenact.double_click(pt)
+                    else:
+                        outcome = screenact.click(pt)
+                    desktop_control.report(action, str(outcome), before.app)
+                    _publish(player)
+                    return str(outcome)
+                # Level 3 direct click at current cursor position
+                if click_kind in {"click", "right_click", "double_click"}:
+                    if target_cf in {"", "here", "there", "current position", "current location", "cursor", "mouse"}:
+                        outcome = screenact.click_current(
+                            button=("right" if click_kind == "right_click" else "left"),
+                            clicks=(2 if click_kind == "double_click" else 1),
+                        )
+                        desktop_control.report(action, str(outcome), before.app)
+                        _publish(player)
+                        return str(outcome)
+
+                if click_kind in {"hover", "move"} and not target_text:
                     return "Name a visible control to move the cursor to."
+                if click_kind == "type" and target_cf in {"", "here", "focused", "current", "active"}:
+                    text = str(params.get("text", ""))
+                    if not text:
+                        return "Tell me what text to enter."
+                    focused = next((e for e in before.elements if e.focused), None)
+                    if focused and focused.protected:
+                        return "That field is protected; enter the secret yourself."
+                    outcome = screenact.type_text(
+                        text,
+                        clear_first=bool(params.get("clear_first", False)),
+                    )
+                    if not outcome.ok:
+                        desktop_control.report(action, f"failed: {outcome.error}", before.app)
+                        _publish(player)
+                        return str(outcome)
+                    after, verification = _verified_after(before, target=focused, typed_text=text)
+                    desktop_control.report(action, verification, after.app)
+                    _publish(player)
+                    return f"{outcome}; {verification}. Current window: {after.title or after.app}."
+                is_whatsapp_app = "whatsapp" in fold(f"{before.app} {before.title}")
+                if is_whatsapp_app and click_kind in {"click", "left_click", "select", "type"}:
+                    try:
+                        from plugins import _whatsapp_core as _wa
+                        is_search_hint = target_cf in {
+                            "search", "search bar", "search box", "search field",
+                            "contact search", "whatsapp search",
+                        }
+                        is_composer_hint = (
+                            click_kind == "type"
+                            and not is_search_hint
+                            and target_cf in {"", "here", "focused", "current", "active", "message", "message box", "chat", "chat box", "composer", "input", "reply"}
+                        )
+                        if click_kind == "type" and is_search_hint:
+                            sb = _wa.locate_whatsapp_search_bar(before)
+                            text = str(params.get("text", ""))
+                            if sb is not None and text:
+                                pt = screenact.Point(sb["x"], sb["y"], origin="element", label=sb["label"])
+                                screenact.move_cursor(pt)
+                                clk = screenact.click(pt, expect_process=before.app)
+                                if clk.ok:
+                                    t_res = screenact.type_text(text, clear_first=True)
+                                    after, verification = _verified_after(before, typed_text=text)
+                                    contacts = _wa.extract_whatsapp_contacts(after, query=text)
+                                    desktop_control.record_diagnostics(
+                                        active_application="WhatsApp Desktop",
+                                        unique_contact_count=len(contacts),
+                                        last_keyboard_status=("ok" if t_res.ok else "failed"),
+                                    )
+                                    desktop_control.report(action, verification, after.app)
+                                    _publish(player)
+                                    return f"Searched WhatsApp for {text!r} ({len(contacts)} unique result(s)); {verification}."
+                        elif is_composer_hint:
+                            comp_box = _wa.locate_whatsapp_composer(before)
+                            text = str(params.get("text", ""))
+                            if not text:
+                                return "Tell me what text to enter."
+                            if comp_box is not None:
+                                pt = screenact.Point(comp_box["x"], comp_box["y"], origin="element", label=comp_box["label"])
+                                mv = screenact.move_cursor(pt)
+                                clk = screenact.click(pt, expect_process=before.app)
+                                if not clk.ok:
+                                    return str(clk)
+                                t_res = screenact.type_text(text, clear_first=bool(params.get("clear_first", True)))
+                                if not t_res.ok:
+                                    return str(t_res)
+                                after, verification = _verified_after(before, typed_text=text)
+                                hdr = _wa.verify_selected_chat(after)
+                                active_c = str(hdr.get("active_contact") or desktop_control.snapshot().get("active_contact") or "")
+                                desktop_control.set_active_composition_state(
+                                    composition_requested=True,
+                                    selected_contact=active_c,
+                                    generated_content=text,
+                                    typing_authorized=True,
+                                    message_sent=False,
+                                )
+                                desktop_control.record_diagnostics(
+                                    active_application="WhatsApp Desktop",
+                                    typing_status="verified",
+                                    sending_status="not_sent",
+                                    last_keyboard_status="ok",
+                                )
+                                desktop_control.report(action, verification, after.app)
+                                _publish(player)
+                                return f"Typed draft into WhatsApp composer ({'cursor moved, ' if mv.ok else ''}not sent); {verification}."
+                        elif click_kind in {"click", "left_click", "select"} and target_text and not is_search_hint:
+                            contacts = _wa.extract_whatsapp_contacts(before, query=target_text)
+                            if contacts:
+                                desktop_control.record_diagnostics(
+                                    active_application="WhatsApp Desktop",
+                                    unique_contact_count=len(contacts),
+                                )
+                                exact = [c for c in contacts if fold(c["display_name"]) == fold(target_text)]
+                                chosen = exact[0] if len(exact) == 1 else (contacts[0] if len(contacts) == 1 else None)
+                                if chosen is None:
+                                    names = ", ".join(c["display_name"] for c in contacts[:4])
+                                    return f"I see {len(contacts)} distinct WhatsApp contacts matching {target_text!r}: {names}. Which one should I open?"
+                                pt = screenact.Point(chosen["point"][0], chosen["point"][1], origin="element", label=chosen["display_name"])
+                                screenact.move_cursor(pt)
+                                clk = screenact.click(pt, expect_process=before.app)
+                                if not clk.ok:
+                                    return str(clk)
+                                after, verification = _verified_after(before)
+                                hdr = _wa.verify_selected_chat(after, expected_contact=chosen["display_name"])
+                                desktop_control.set_active_target(
+                                    target_type="contact", exact_target_name=chosen["display_name"],
+                                    browser="whatsapp", tab_title=after.title,
+                                    point=chosen["point"], rect=chosen.get("rect"),
+                                    confidence=chosen.get("confidence", "high"),
+                                    extraction_source=chosen.get("source", "uia"),
+                                )
+                                desktop_control.record_diagnostics(
+                                    active_application="WhatsApp Desktop",
+                                    active_contact=chosen["display_name"],
+                                    active_chat_id=chosen.get("id") or _wa.draft_hash(chosen["display_name"]),
+                                    selected_chat_verified=bool(hdr.get("verified")),
+                                    unique_contact_count=len(contacts),
+                                )
+                                desktop_control.report(action, verification, after.app)
+                                _publish(player)
+                                return f"Opened WhatsApp chat for {chosen['display_name']} ({'verified' if hdr.get('verified') else 'clicked'}); {verification}."
+                    except Exception:
+                        pass
+
+                is_page_search = target_cf in {
+                    "search", "search bar", "search box", "search field",
+                    "youtube search", "youtube search bar", "youtube search box", "youtube search field",
+                }
+                is_browser_app = any(b in fold(before.app) for b in ("chrome", "msedge", "edge", "firefox", "brave", "opera", "vivaldi"))
+                if is_page_search and is_browser_app and click_kind in {"hover", "move", "click", "right_click", "double_click", "type"}:
+                    dom_point = _try_browser_dom_point(before, target_text)
+                    if dom_point is not None:
+                        if click_kind == "hover":
+                            outcome = screenact.hover(dom_point)
+                        elif click_kind == "move":
+                            outcome = screenact.move_cursor(dom_point)
+                        elif click_kind == "right_click":
+                            outcome = screenact.right_click(dom_point, expect_process=before.app)
+                        elif click_kind == "double_click":
+                            outcome = screenact.double_click(dom_point, expect_process=before.app)
+                        elif click_kind == "click":
+                            outcome = screenact.click(dom_point, expect_process=before.app)
+                        else:
+                            text = str(params.get("text", ""))
+                            if not text:
+                                return "Tell me what text to enter."
+                            outcome = screenact.type_text(
+                                text, target=dom_point,
+                                clear_first=bool(params.get("clear_first", True)),
+                            )
+                        desktop_control.report(action, str(outcome), before.app)
+                        _publish(player)
+                        return str(outcome)
                 roles = ((screenview.ROLE_EDIT, screenview.ROLE_COMBOBOX)
-                         if action == "type" else ())
+                         if (click_kind == "type" or is_page_search) else ())
                 target, why = _resolve(before, target_text, roles=roles,
-                                       generic_search=(action == "type"))
-                if (action == "type" and why and fold(target_text) in
+                                       generic_search=(click_kind == "type" or is_page_search))
+                # Never confuse Chrome's browser address bar for a YouTube/page search bar
+                if target is not None and is_page_search and "address" in fold(getattr(target, "label", "") or ""):
+                    target = None
+                    why = f"Only the browser address bar was visible; could not locate {target_text!r}."
+                if (click_kind == "type" and why and fold(target_text) in
                         {"editor", "document", "text editor", "writing area"}):
                     surfaces = [e for e in before.elements
                                 if e.role == screenview.ROLE_TEXT and e.enabled
@@ -338,17 +568,28 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                     elif len(surfaces) > 1:
                         why = "I found multiple editable-looking text surfaces; name the intended editor."
                 if why:
+                    # Level 1 -> Level 2 fallback: Browser DOM screen coordinates, then local OCR visual bounds
                     dom_point = _try_browser_dom_point(before, target_text)
-                    if dom_point is not None and action in {"hover", "move", "click", "right_click", "double_click", "type"}:
-                        if action == "hover":
+                    if dom_point is None and click_kind in {"hover", "move", "click", "right_click", "double_click"}:
+                        try:
+                            if getattr(screenview, "_HAS_OCR", False):
+                                ocr_els = screenview._scan_ocr(screenview.monitor_rect(before), time.monotonic() + 2.0)
+                                fold_t = fold(target_text)
+                                matches = [e for e in ocr_els if fold_t and fold_t in fold(getattr(e, "name", "") or "")]
+                                if len(matches) >= 1:
+                                    dom_point = screenact.Point.from_element(matches[0])
+                        except Exception:
+                            pass
+                    if dom_point is not None and click_kind in {"hover", "move", "click", "right_click", "double_click", "type"}:
+                        if click_kind == "hover":
                             outcome = screenact.hover(dom_point)
-                        elif action == "move":
+                        elif click_kind == "move":
                             outcome = screenact.move_cursor(dom_point)
-                        elif action == "right_click":
+                        elif click_kind == "right_click":
                             outcome = screenact.right_click(dom_point, expect_process=before.app)
-                        elif action == "double_click":
+                        elif click_kind == "double_click":
                             outcome = screenact.double_click(dom_point, expect_process=before.app)
-                        elif action == "click":
+                        elif click_kind == "click":
                             outcome = screenact.click(dom_point, expect_process=before.app)
                         else:
                             text = str(params.get("text", ""))
@@ -364,6 +605,7 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                     desktop_control.report(action, "not executed: target ambiguous or missing", before.app)
                     _publish(player)
                     return why
+                action = click_kind
                 if action in {"select", "toggle", "expand", "collapse"}:
                     patterns = {"select": ("selection_item", None),
                                 "toggle": ("toggle", None),
@@ -482,7 +724,13 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                     label = fold(focused.label if focused else "")
                     if any(word in label for word in ("message", "reply", "chat")):
                         return "I will not submit a message through a generic Enter key. Use the message action with its confirmation step."
-                    is_search = any(word in label for word in ("search", "query", "address", "url"))
+                    is_search = (
+                        any(word in label for word in ("search", "query", "address", "url"))
+                        or (focused is not None and focused.role == screenview.ROLE_COMBOBOX)
+                        or ("youtube" in fold(before.title) and not any(
+                            word in label for word in ("comment", "post", "email", "pay", "checkout", "transfer", "password")
+                        ))
+                    )
                     if focused and focused.role == screenview.ROLE_EDIT and not is_search:
                         from core import confirm
                         if confirm.pending_title():
@@ -573,13 +821,15 @@ TOOL = {
         "always stop/pause control from the visible REM desktop panel."
     ),
     "parameters": {"type": "OBJECT", "properties": {
-        "action": {"type": "STRING", "description": "observe | find | click | right_click | double_click | select | toggle | expand | collapse | hover | move | move_relative | type | press | scroll | focus_window | set_mode | pause | resume | stop"},
-        "target": {"type": "STRING", "description": "Visible control name or app/window title. For search fields say search bar."},
+        "action": {"type": "STRING", "description": "observe | find | click | left_click | right_click | double_click | mouse_down | mouse_up | select | toggle | expand | collapse | hover | move | move_relative | type | press | scroll | focus_window | set_mode | pause | resume | stop"},
+        "target": {"type": "STRING", "description": "Visible control name or app/window title (or 'here' for current cursor position). For search fields say search bar."},
         "text": {"type": "STRING", "description": "Text to type into the named, non-protected field."},
         "key": {"type": "STRING", "description": "Allowlisted key or shortcut (Enter, Escape, Tab, Ctrl+F, Alt+Tab, etc.)."},
         "presses": {"type": "INTEGER", "description": "Repeat a key press 1–10 times; useful for commands such as 'Tab twice'."},
         "direction": {"type": "STRING", "description": "up | down | left | right"},
         "amount": {"type": "INTEGER", "description": "Scroll notches, 1–20."},
+        "x": {"type": "INTEGER", "description": "Optional virtual-screen X coordinate for move/click."},
+        "y": {"type": "INTEGER", "description": "Optional virtual-screen Y coordinate for move/click."},
         "dx": {"type": "INTEGER", "description": "Bounded relative cursor offset, up to 200 pixels."},
         "dy": {"type": "INTEGER", "description": "Bounded relative cursor offset, up to 200 pixels."},
         "position": {"type": "STRING", "description": "Named position: center, top_left, top_right, bottom_left, bottom_right."},

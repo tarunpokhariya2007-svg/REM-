@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from urllib.parse import parse_qsl, urlsplit
 import webbrowser
 from pathlib import Path
@@ -147,6 +148,47 @@ def _configured_browser_cdp_endpoint(browser: str,
 def _configured_chrome_cdp_endpoint(value: str | None = None) -> str | None:
     """Backward-compatible helper for the opt-in Chrome CDP endpoint."""
     return _configured_browser_cdp_endpoint("chrome", value)
+
+
+_ORDINAL_WORDS: dict[str, int] = {
+    "first": 0, "1st": 0,
+    "second": 1, "2nd": 1,
+    "third": 2, "3rd": 2,
+    "fourth": 3, "4th": 3,
+    "fifth": 4, "5th": 4,
+    "sixth": 5, "6th": 5,
+    "seventh": 6, "7th": 6,
+    "eighth": 7, "8th": 7,
+    "ninth": 8, "9th": 8,
+    "tenth": 9, "10th": 9,
+    "last": -1,
+}
+_INDEX_TO_ORDINAL: dict[int, str] = {
+    0: "first", 1: "second", 2: "third", 3: "fourth", 4: "fifth",
+    5: "sixth", 6: "seventh", 7: "eighth", 8: "ninth", 9: "tenth", -1: "last",
+}
+
+
+def _parse_ordinal_index(text: str) -> int | None:
+    """Extract 0-based video/result index (or -1 for last) from natural-language description."""
+    m = re.search(
+        r"\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|"
+        r"sixth|6th|seventh|7th|eighth|8th|ninth|9th|tenth|10th|last)"
+        r"\b(?:\s+\w+){0,2}\s+(?:videos?|results?|thumbnails?|cards?|links?|items?|one)\b",
+        str(text or ""),
+        re.IGNORECASE,
+    )
+    if not m:
+        m = re.fullmatch(
+            r"\s*(?:the\s+)?(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|"
+            r"sixth|6th|seventh|7th|eighth|8th|ninth|9th|tenth|10th|last)\s*",
+            str(text or ""),
+            re.IGNORECASE,
+        )
+    if not m:
+        return None
+    return _ORDINAL_WORDS.get(m.group(1).lower())
+
 
 _CANONICAL_URLS = {
     "www.youtube": "https://www.youtube.com/",
@@ -500,8 +542,8 @@ def _resolve_browser(name: str) -> dict | None:
                     exe = str(found_bins[0])
                     break
 
-    if not exe and _OS == "Windows" and not channel:
-        exe = _find_exe_windows(name)
+    if not exe and _OS == "Windows":
+        exe = _find_exe_windows(_WIN_EXE_HINTS.get(name, name))
 
     return {"engine": engine, "exe": exe, "channel": channel}
 
@@ -544,7 +586,7 @@ def _detect_default_browser() -> str:
 
 
 def _detect_running_browser() -> str:
-    """Return an already-running browser, preferring foreground then Chrome first."""
+    """Return an already-running browser, preferring foreground then visible Chrome windows."""
     try:
         from core import screenview
         fg_app, _fg_title, _pid, _hwnd = screenview._foreground()
@@ -552,15 +594,63 @@ def _detect_running_browser() -> str:
         for b in ("chrome", "firefox", "brave", "opera", "vivaldi", "edge"):
             if b in fg_cf or (b == "edge" and "msedge" in fg_cf):
                 return b
+        # Prefer browsers that actually have visible windows over background Windows Edge processes.
+        wins = [(str(a or "").casefold(), str(t or "").casefold()) for a, t in screenview.all_windows()]
+        for b in ("chrome", "firefox", "brave", "opera", "vivaldi", "edge"):
+            if any(b in a or (b == "edge" and "msedge" in a) or (b == "chrome" and "google chrome" in t) for a, t in wins):
+                return b
     except Exception:
         pass
-    for b in ("chrome", "firefox", "brave", "opera", "vivaldi", "edge"):
+    for b in ("chrome", "firefox", "brave", "opera", "vivaldi"):
         try:
             if appidentity.running(b):
                 return b
         except Exception:
             continue
     return ""
+
+
+def select_browser(explicit_browser: str | None = None, *,
+                   task_browser: str | None = None,
+                   user_request: str = "") -> str:
+    """Centralized browser-selection mechanism.
+
+    Priority:
+      1. Explicit browser parameter or browser explicitly named in user_request.
+      2. Previously selected browser bound to the current task.
+      3. Currently active browser session / visible running browser.
+      4. OS default browser (only when 1-3 provide no selection).
+    """
+    explicit = str(explicit_browser or "").strip().lower()
+    if explicit:
+        return _ALIASES.get(explicit, explicit)
+    if user_request:
+        try:
+            from core import desktop_control
+            from_text = desktop_control.extract_browser_name(user_request)
+            if from_text:
+                return _ALIASES.get(from_text, from_text)
+        except Exception:
+            pass
+    tb = str(task_browser or "").strip().lower()
+    if tb:
+        return _ALIASES.get(tb, tb)
+    if _registry._active_browser:
+        return _registry._active_browser
+    if _registry._task_browser:
+        return _registry._task_browser
+    running = _detect_running_browser()
+    if running:
+        return running
+    return _detect_default_browser()
+
+
+def open_in_selected_browser(url: str, browser: str | None = None) -> str:
+    """Open URL through the centralized browser selector (used by sibling helpers)."""
+    chosen = select_browser(browser)
+    if _registry.has(chosen):
+        return _registry.get(chosen).run(_registry.get(chosen).go_to(url))
+    return _open_native(url, chosen)
 
 
 def _discover_running_cdp_endpoint(browser_name: str) -> str | None:
@@ -599,6 +689,7 @@ def _discover_running_cdp_endpoint(browser_name: str) -> str | None:
 
 _SEARCH_ENGINES: dict[str, str] = {
     "google":     "https://www.google.com/search?q=",
+    "youtube":    "https://www.youtube.com/results?search_query=",
     "bing":       "https://www.bing.com/search?q=",
     "duckduckgo": "https://duckduckgo.com/?q=",
     "yandex":     "https://yandex.com/search/?text=",
@@ -920,6 +1011,10 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
             "no browser on this system could be opened", url=url)
 
 
+class _SeparateProfileBlockedError(RuntimeError):
+    """Raised when CDP is unavailable on an already-running browser so we never open a separate profile silently."""
+
+
 class _BrowserSession:
     """
     A full session for one browser instance.
@@ -938,10 +1033,7 @@ class _BrowserSession:
         self._context: BrowserContext | None = None
         self._page:    Page           | None = None
         self._browser = None
-        # "real" when the user's own browser profile was opened, "separate"
-        # when their browser was already running and a private automation
-        # profile had to be used instead. The difference is every sign-in they
-        # have, so it is reported rather than only printed.
+        self._op_lock = threading.RLock()
         self.profile_kind: str = ""
 
     def start(self):
@@ -972,14 +1064,18 @@ class _BrowserSession:
     def run(self, coro, timeout: int = 60) -> str:
         if not self._loop:
             raise RuntimeError(f"Session for '{self.browser_name}' not started.")
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        from core import desktop_control
-        cancel = future.cancel
-        desktop_control.register_cancel(cancel)
-        try:
-            return future.result(timeout=timeout)
-        finally:
-            desktop_control.unregister_cancel(cancel)
+        lock = getattr(self, "_op_lock", None)
+        if lock is None:
+            lock = self._op_lock = threading.RLock()
+        with lock:
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            from core import desktop_control
+            cancel = future.cancel
+            desktop_control.register_cancel(cancel)
+            try:
+                return future.result(timeout=timeout)
+            finally:
+                desktop_control.unregister_cancel(cancel)
 
     def close(self):
         if self._loop:
@@ -1024,6 +1120,9 @@ class _BrowserSession:
         """
         if self._context is not None:
             try:
+                if (callable(getattr(self._context, "is_closed", None))
+                        and self._context.is_closed()):
+                    raise RuntimeError("browser context is closed")
                 if (self._browser is not None
                         and callable(getattr(self._browser, "is_connected", None))
                         and not self._browser.is_connected()):
@@ -1168,6 +1267,16 @@ class _BrowserSession:
         # explainable outcome.
         already = appidentity.running(self.browser_name)
         if already:
+            if os.environ.get("REM_ALLOW_SEPARATE_BROWSER_PROFILE", "").strip() != "1":
+                print(
+                    f"[Browser] {self.browser_name} is already running "
+                    f"({len(already)} processes) without CDP — keeping user's "
+                    "visible browser window instead of opening a separate REM profile."
+                )
+                raise _SeparateProfileBlockedError(
+                    f"{self.browser_name} is already running without an exposed CDP debugging port; "
+                    "not launching a separate automation profile."
+                )
             print(f"[Browser] {self.browser_name} is already running "
                   f"({len(already)} processes) — its profile is locked, so the "
                   f"separate automation profile will be used.")
@@ -1201,10 +1310,19 @@ class _BrowserSession:
 
     async def _get_page(self) -> Page:
         await self._launch()
-        # If somehow page got closed, open a fresh one
         if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
-            await asyncio.sleep(0.2)
+            try:
+                live = [p for p in (getattr(self._context, "pages", ()) or ()) if not p.is_closed()]
+                self._page = live[-1] if live else await self._context.new_page()
+            except Exception as exc:
+                # Stale/closed BrowserContext (e.g. browser closed manually or CDP restarted):
+                # drop handles cleanly and recover the session once instead of failing new_page.
+                print(f"[Browser] Recovering closed {self.browser_name} context ({type(exc).__name__})")
+                self._browser = self._context = self._page = None
+                await self._launch()
+                if self._page is None or self._page.is_closed():
+                    self._page = await self._context.new_page()
+            await asyncio.sleep(0.15)
         return self._page
 
     async def _page_visible_for_action(self, page) -> bool:
@@ -1316,7 +1434,15 @@ class _BrowserSession:
             "not have answered", url=url)
 
     async def search(self, query: str, engine: str = "google") -> str:
-        base = _SEARCH_ENGINES.get(engine.lower(), _SEARCH_ENGINES["google"])
+        chosen = str(engine or "").lower().strip()
+        if not chosen or chosen == "google":
+            try:
+                cur_host = (urlsplit(self._page.url).hostname or "").casefold() if self._page else ""
+                if "youtube.com" in cur_host and engine in ("", None, "youtube"):
+                    chosen = "youtube"
+            except Exception:
+                pass
+        base = _SEARCH_ENGINES.get(chosen or "google", _SEARCH_ENGINES["google"])
         return await self.go_to(base + query.replace(" ", "+"))
 
     async def click(self, selector: str = None, text: str = None) -> str:
@@ -1386,9 +1512,12 @@ class _BrowserSession:
                 if await focused.count() == 1:
                     meta = await focused.evaluate("el => ({tag:el.tagName, type:el.type||'', role:el.getAttribute('role')||'', label:el.getAttribute('aria-label')||'', placeholder:el.getAttribute('placeholder')||'', name:el.getAttribute('name')||'', editable:el.isContentEditable})")
                     text = " ".join(str(v) for v in meta.values()).casefold()
-                    search = (meta.get("type") == "search" or meta.get("role") == "searchbox"
+                    search = (meta.get("type") == "search" or meta.get("role") in ("searchbox", "combobox")
                               or any(x in text for x in ("search", "query", "address")))
-                    search_submit = search and meta.get("tag") in ("INPUT", "TEXTAREA")
+                    search_submit = search and (
+                        meta.get("tag") in ("INPUT", "TEXTAREA")
+                        or meta.get("role") in ("searchbox", "combobox")
+                    )
                     chat = any(x in text for x in ("message", "reply", "chat", "comment"))
                     if chat:
                         return "I will not submit a message or comment through a generic Enter key. Use the explicit send action and confirm it."
@@ -1465,26 +1594,36 @@ class _BrowserSession:
             return outcome.unverified(
                 "browser_control", "browser page is hidden; no click was attempted")
         before = await self._page_state(page)
-        ordinal_result = re.search(r"\b(first|second|third|last)\s+results?\b",
-                                   str(description or ""), re.IGNORECASE)
-        if ordinal_result:
-            try:
-                host = (urlsplit(page.url).hostname or "").casefold().rstrip(".")
-            except Exception:
-                host = ""
-            if host == "youtube.com" or host.endswith(".youtube.com"):
-                return await self._click_youtube_video_ordinal(
-                    page, ordinal_result.group(1).lower(), before)
-            return await self._click_ordinal_result(
-                page, ordinal_result.group(1).lower(), before)
-        ordinal = re.search(r"\b(first|second|third|last)\s+videos?\b",
-                            str(description or ""), re.IGNORECASE)
+        desc_str = str(description or "").strip()
+        desc_cf = desc_str.casefold()
         try:
             host = (urlsplit(page.url).hostname or "").casefold().rstrip(".")
         except Exception:
             host = ""
-        if ordinal and (host == "youtube.com" or host.endswith(".youtube.com")):
-            return await self._click_youtube_video_ordinal(page, ordinal.group(1), before)
+        is_youtube = (host == "youtube.com" or host.endswith(".youtube.com"))
+
+        if desc_cf in {"pause", "pause video", "pause playback", "pause the video"}:
+            return await self.pause_video()
+        if desc_cf in {"resume", "resume video", "resume playback", "resume the video"}:
+            return await self.resume_video()
+        if desc_cf in {"play this video", "play the video", "play video"}:
+            return await self.resume_video()
+        if is_youtube and (desc_cf.startswith("replay") or "play this video again" in desc_cf or "play again" in desc_cf):
+            return await self.replay_video(desc_str)
+        if is_youtube and desc_cf in {"next video", "play next video", "play the next video"}:
+            return await self._click_youtube_next_video(page)
+
+        ordinal_idx = _parse_ordinal_index(desc_str)
+        if ordinal_idx is not None:
+            if is_youtube:
+                return await self._click_youtube_video_ordinal(page, ordinal_idx, desc_str)
+            return await self._click_ordinal_result(
+                page, _INDEX_TO_ORDINAL.get(ordinal_idx, f"#{ordinal_idx + 1}"), before)
+
+        if is_youtube:
+            title_match = re.search(r"\b(?:video\s+)?titled\s+[\"']?(.+?)[\"']?$", desc_str, re.IGNORECASE)
+            if title_match:
+                return await self._click_youtube_video_by_title(page, title_match.group(1).strip())
         for role in ("button", "link", "searchbox", "textbox", "menuitem", "tab"):
             try:
                 loc = page.get_by_role(role, name=description)
@@ -1562,61 +1701,362 @@ class _BrowserSession:
             return outcome.failed("browser_control",
                                   f"result selection failed safely: {type(exc).__name__}")
 
-    async def _click_youtube_video_ordinal(self, page, ordinal: str, before: tuple) -> str:
-        """Select a real visible YouTube video card, excluding ads and chrome."""
-        try:
-            cards = await page.locator("ytd-video-renderer, ytd-rich-item-renderer").evaluate_all("""els => {
-              const seen = new Set();
-              return els.flatMap(card => {
-                const r = card.getBoundingClientRect(), s = getComputedStyle(card);
-                if (r.width < 2 || r.height < 2 || s.display === 'none' || s.visibility === 'hidden') return [];
-                if (card.hasAttribute('is-ad') || card.querySelector('ytd-ad-slot-renderer, #ad-badge, [id*=ad-badge]')) return [];
-                // Prefer the actual result-title anchor. A card's first watch
-                // link in DOM order is often its aria-hidden thumbnail, whose
-                // text is only a duration overlay such as "Now playing".
-                const a = card.querySelector('a#video-title[href*="/watch"]')
-                    || card.querySelector('a[href*="/watch?v="]:not([aria-hidden="true"])');
-                if (!a) return [];
-                const ar = a.getBoundingClientRect();
-                if (ar.width < 2 || ar.height < 2) return [];
-                const u = new URL(a.href, location.href);
-                const id = u.pathname === '/watch' ? u.searchParams.get('v') : null;
-                const title = (a.getAttribute('title')
-                    || a.querySelector('yt-formatted-string')?.innerText
-                    || a.innerText || a.textContent || '').trim();
-                if (!id || !title || seen.has(id)) return [];
-                seen.add(id);
-                return [{id, title: title.slice(0,160)}];
-              });
-            }""")
-            index = {"first": 0, "second": 1, "third": 2}.get(ordinal)
-            if ordinal == "last":
-                index = len(cards) - 1
-            if index is None or index < 0 or index >= len(cards):
-                return f"I found {len(cards)} visible non-ad YouTube video results; {ordinal} is unavailable, so nothing was clicked."
-            selected = cards[index]
-            video_id = str(selected.get("id", ""))
-            title = str(selected.get("title", ""))
-            if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id) or not title:
-                return "The selected result did not have a verifiable video identity; nothing was clicked."
-            # Use the video identity from the inspected result, never a generic
-            # page text/role match which could resolve to the YouTube logo.
-            loc = page.locator(f'a#video-title[href*="watch?v={video_id}"]')
-            count = await loc.count()
-            if count != 1 or not await loc.is_visible() or not await loc.is_enabled():
-                return "The inspected YouTube video target is no longer unique and visible; nothing was clicked."
-            await loc.click(timeout=8_000)
+    async def _extract_youtube_videos(self, page, *, include_shorts: bool = False) -> list[dict]:
+        """Extract ordered eligible non-ad, non-playlist, non-channel YouTube video results."""
+        inc_literal = "true" if include_shorts else "false"
+        js = f"""els => {{
+          const includeShorts = {inc_literal};
+          const seen = new Set();
+          const out = [];
+          for (const card of els) {{
+            const r = card.getBoundingClientRect(), s = getComputedStyle(card);
+            if (r.width < 2 || r.height < 2 || s.display === 'none' || s.visibility === 'hidden') continue;
+            if (card.hasAttribute('is-ad')
+                || card.closest('ytd-ad-slot-renderer, ytd-promoted-sparkles-web-renderer')
+                || card.querySelector('ytd-ad-slot-renderer, ytd-promoted-sparkles-web-renderer, #ad-badge, [id*=ad-badge], ytd-badge-supported-renderer[aria-label*="Sponsored" i]')) {{
+              continue;
+            }}
+            if (card.querySelector('ytd-playlist-renderer, ytd-channel-renderer')) continue;
+            if (!includeShorts && card.closest('ytd-reel-shelf-renderer')) continue;
+            // Prefer the actual result-title anchor over thumbnail duration overlays.
+            const a = card.querySelector('a#video-title[href*="/watch"], a#video-title-link[href*="/watch"], a.yt-lockup-metadata-view-model__title[href*="/watch"]')
+                || card.querySelector('a[href*="/watch?v="]:not([aria-hidden="true"])');
+            if (!a) continue;
+            const href = String(a.href || a.getAttribute('href') || '');
+            if (href.includes('/playlist') && !href.includes('/watch')) continue;
+            if (!includeShorts && href.includes('/shorts/')) continue;
+            const ar = a.getBoundingClientRect();
+            if (ar.width < 2 || ar.height < 2) continue;
+            const u = new URL(href, location.href);
+            const id = u.pathname === '/watch' ? u.searchParams.get('v') : null;
+            const title = (a.getAttribute('title')
+                || a.querySelector('yt-formatted-string, span')?.innerText
+                || a.innerText || a.textContent || '').trim();
+            const chEl = card.querySelector('ytd-channel-name a, #channel-name a, ytd-channel-name #text, .yt-content-metadata-view-model__metadata-row a');
+            const channel = (chEl?.innerText || chEl?.textContent || '').trim();
+            if (!id || !title || seen.has(id)) continue;
+            seen.add(id);
+            out.push({{
+              position: out.length + 1,
+              id,
+              url: `https://www.youtube.com/watch?v=${{id}}`,
+              title: title.slice(0, 160),
+              channel: channel.slice(0, 80),
+              is_ad: false,
+              is_playable: true,
+            }});
+          }}
+          return out;
+        }}"""
+        selector = "ytd-video-renderer, ytd-rich-item-renderer, ytd-compact-video-renderer, yt-lockup-view-model, ytd-grid-video-renderer"
+        cards = await page.locator(selector).evaluate_all(js)
+        if not cards and hasattr(page, "wait_for_selector"):
             try:
-                await page.wait_for_url(re.compile(r"https?://(?:www\\.)?youtube\\.com/watch\\?.*\\bv=" + re.escape(video_id) + r"(?:&|$)"), timeout=6_000)
+                await page.wait_for_selector(
+                    "ytd-video-renderer a#video-title, ytd-rich-item-renderer a#video-title, "
+                    "yt-lockup-view-model a[href*='/watch']",
+                    timeout=3_500,
+                )
+                cards = await page.locator(selector).evaluate_all(js)
             except Exception:
                 pass
-            current = urlsplit(page.url)
-            opened_id = next((value for key, value in parse_qsl(current.query) if key == "v"), "")
-            if current.path == "/watch" and opened_id == video_id:
-                return f"Opened and verified the {ordinal} YouTube video: {title!r}."
-            return f"Clicked the {ordinal} video target {title!r}, but the resulting page did not verify as that video."
+        return cards or []
+
+    async def _is_empty_youtube_home(self, page) -> bool:
+        try:
+            body = await page.locator("body").inner_text(timeout=1_500)
+            low = str(body or "").casefold()
+            if "try searching to get started" in low:
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _verify_youtube_playback(self, page, video_id: str, title: str,
+                                       channel: str = "", position: int | None = None) -> str:
+        """Open check + HTML5 <video> playback verification on /watch."""
+        try:
+            await page.wait_for_url(
+                re.compile(r"https?://(?:www\.)?youtube\.com/watch\?.*\bv=" + re.escape(video_id) + r"(?:&|$)"),
+                timeout=6_000,
+            )
+        except Exception:
+            pass
+        current = urlsplit(page.url)
+        opened_id = next((value for key, value in parse_qsl(current.query) if key == "v"), "")
+        if current.path != "/watch" or opened_id != video_id:
+            return outcome.failed(
+                "browser_control",
+                f"clicked video {title!r}, but resulting URL ({page.url}) did not match video {video_id}",
+                browser=self.browser_name, video_id=video_id, url=page.url, playback_verified=False,
+            )
+        ord_label = _INDEX_TO_ORDINAL.get((position or 1) - 1, f"#{position or 1}")
+        summary = f"Opened and verified the {ord_label} YouTube video: {title!r}."
+        if not hasattr(page, "evaluate"):
+            return outcome.done(
+                "browser_control",
+                action="play_video",
+                browser=getattr(self, "browser_name", "chrome"),
+                position=position,
+                title=title,
+                channel=channel,
+                video_id=video_id,
+                url=page.url,
+                detail=summary,
+                verified=True,
+            )
+        state = {}
+        for attempt in range(4):
+            try:
+                state = await page.evaluate(
+                    "() => { const v = document.querySelector('video'); "
+                    "if (!v) return {exists:false}; "
+                    "return {exists:true, paused:!!v.paused, currentTime:Number(v.currentTime||0), "
+                    "readyState:Number(v.readyState||0), duration:Number(v.duration||0)}; }"
+                )
+            except Exception:
+                state = {}
+            if state.get("exists") and not state.get("paused") and state.get("readyState", 0) >= 2:
+                break
+            if attempt == 1 and state.get("exists") and state.get("paused"):
+                try:
+                    await page.evaluate("() => { const v = document.querySelector('video'); if (v && v.paused) v.play(); }")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.25)
+        playing = bool(state.get("exists") and not state.get("paused") and state.get("readyState", 0) >= 2)
+        if not state.get("exists"):
+            return outcome.unverified(
+                "browser_control",
+                f"opened video {title!r}, but HTML5 video player did not initialize yet",
+                browser=getattr(self, "browser_name", "chrome"), action="play_video", video_id=video_id,
+                title=title, channel=channel, position=position, url=page.url, playback_verified=False,
+            )
+        return outcome.done(
+            "browser_control",
+            action="play_video",
+            browser=getattr(self, "browser_name", "chrome"),
+            position=position,
+            title=title,
+            channel=channel,
+            video_id=video_id,
+            url=page.url,
+            player_state=("playing" if playing else "paused"),
+            current_time=round(float(state.get("currentTime") or 0.0), 2),
+            playback_verified=playing,
+            detail=summary,
+            verified=True,
+        )
+
+    async def _click_youtube_video_ordinal(self, page, ordinal: int | str, before: tuple | str = ()) -> str:
+        """Select a real visible non-ad YouTube video by 0-based ordinal index or word (e.g. 'second')."""
+        try:
+            raw_label = before if isinstance(before, str) else ""
+            cards = await self._extract_youtube_videos(page, include_shorts=("short" in raw_label.casefold()))
+            idx = (_ORDINAL_WORDS.get(str(ordinal).lower()) if isinstance(ordinal, str) else int(ordinal))
+            if idx == -1:
+                idx = len(cards) - 1
+            if idx is None or idx < 0 or idx >= len(cards):
+                if len(cards) == 0 and await self._is_empty_youtube_home(page):
+                    return (
+                        "I see the YouTube home page ('Try searching to get started') with 0 visible "
+                        "video results; tell me what you want to search for or name a specific video title."
+                    )
+                return f"I found {len(cards)} eligible non-ad YouTube video results; requested position is unavailable, so nothing was clicked."
+            selected = cards[idx]
+            video_id = str(selected.get("id", ""))
+            title = str(selected.get("title", ""))
+            channel = str(selected.get("channel", ""))
+            if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id) or not title:
+                return "The selected result did not have a verifiable video identity; nothing was clicked."
+            loc = page.locator(f'a#video-title[href*="watch?v={video_id}"]')
+            count = await loc.count()
+            if count == 0:
+                loc = page.locator(f'a[href*="watch?v={video_id}"]')
+                count = await loc.count()
+            target_loc = loc if count == 1 else (loc.first if count > 1 else None)
+            if target_loc is None or not await target_loc.is_visible() or not await target_loc.is_enabled():
+                return "The inspected YouTube video target is no longer visible and clickable; nothing was clicked."
+            await target_loc.click(timeout=8_000)
+            return await self._verify_youtube_playback(page, video_id, title, channel=channel, position=idx + 1)
         except Exception as exc:
             return outcome.failed("browser_control", f"YouTube video targeting failed safely: {type(exc).__name__}: {exc}")
+
+    async def _click_youtube_video_by_title(self, page, wanted_title: str) -> str:
+        try:
+            cards = await self._extract_youtube_videos(page, include_shorts=False)
+            want = " ".join(wanted_title.casefold().split())
+            matches = [c for c in cards if want and want in c.get("title", "").casefold()]
+            if not matches:
+                return outcome.failed("browser_control", f"no eligible YouTube video matching title {wanted_title!r} was found among {len(cards)} results")
+            selected = matches[0]
+            video_id = str(selected["id"])
+            loc = page.locator(f'a#video-title[href*="watch?v={video_id}"]')
+            count = await loc.count()
+            if count == 0:
+                loc = page.locator(f'a[href*="watch?v={video_id}"]')
+                count = await loc.count()
+            target_loc = loc if count == 1 else loc.first
+            await target_loc.click(timeout=8_000)
+            return await self._verify_youtube_playback(
+                page, video_id, selected["title"],
+                channel=selected.get("channel", ""), position=selected.get("position"),
+            )
+        except Exception as exc:
+            return outcome.failed("browser_control", f"YouTube title selection failed: {type(exc).__name__}: {exc}")
+
+    async def pause_video(self) -> str:
+        page = await self._get_page()
+        try:
+            state = await page.evaluate(
+                "() => { const v = document.querySelector('video'); if (!v) return {exists:false}; "
+                "if (!v.paused) v.pause(); "
+                "return {exists:true, paused:!!v.paused, currentTime:Number(v.currentTime||0)}; }"
+            )
+            if not state or not state.get("exists"):
+                return outcome.failed("browser_control", "no active video player was found on this page", url=page.url)
+            paused = bool(state.get("paused"))
+            return outcome.done(
+                "browser_control", action="pause_video", browser=self.browser_name,
+                playback_state=("paused" if paused else "playing"),
+                current_time=round(float(state.get("currentTime") or 0.0), 2),
+                url=page.url, verified=paused,
+            )
+        except Exception as exc:
+            return outcome.failed("browser_control", f"pause failed: {type(exc).__name__}: {exc}")
+
+    async def resume_video(self) -> str:
+        page = await self._get_page()
+        try:
+            state = await page.evaluate(
+                "async () => { const v = document.querySelector('video'); if (!v) return {exists:false}; "
+                "if (v.paused) { try { await v.play(); } catch (e) {} } "
+                "return {exists:true, paused:!!v.paused, currentTime:Number(v.currentTime||0)}; }"
+            )
+            if not state or not state.get("exists"):
+                return outcome.failed("browser_control", "no active video player was found on this page", url=page.url)
+            playing = not bool(state.get("paused"))
+            return outcome.done(
+                "browser_control", action="resume_video", browser=self.browser_name,
+                playback_state=("playing" if playing else "paused"),
+                current_time=round(float(state.get("currentTime") or 0.0), 2),
+                url=page.url, verified=playing,
+            )
+        except Exception as exc:
+            return outcome.failed("browser_control", f"resume failed: {type(exc).__name__}: {exc}")
+
+    async def seek_video(self, seconds: float = 10.0) -> str:
+        page = await self._get_page()
+        try:
+            delta = float(seconds)
+            state = await page.evaluate(
+                """(delta) => {
+                    const v = document.querySelector('video');
+                    if (!v) return {exists: false};
+                    const before = Number(v.currentTime || 0);
+                    const dur = Number(v.duration || 0);
+                    const target = Math.max(0, dur > 0 ? Math.min(dur, before + delta) : before + delta);
+                    v.currentTime = target;
+                    const after = Number(v.currentTime || target);
+                    return {exists: true, before, after, paused: !!v.paused};
+                }""",
+                delta,
+            )
+            if not state or not state.get("exists"):
+                return outcome.failed("browser_control", "no active video player was found on this page", url=page.url)
+            before_t = round(float(state.get("before") or 0.0), 2)
+            after_t = round(float(state.get("after") or 0.0), 2)
+            moved = (after_t > before_t) if delta >= 0 else (after_t < before_t)
+            act_name = "seek_forward" if delta >= 0 else "seek_backward"
+            return outcome.done(
+                "browser_control", action=act_name, browser=self.browser_name,
+                dispatch_status="completed", input_status="completed",
+                verification_status=("verified" if moved else "unverified"),
+                seconds=round(abs(delta), 2), playback_before=before_t, playback_after=after_t,
+                url=page.url, verified=moved,
+                detail=f"Skipped {'forward' if delta >= 0 else 'backward'} {abs(round(delta))} seconds, Tarun-kun.",
+            )
+        except Exception as exc:
+            return outcome.failed("browser_control", f"seek failed: {type(exc).__name__}: {exc}")
+
+    async def focus_search_cdp(self) -> str:
+        page = await self._get_page()
+        try:
+            focused = await page.evaluate(
+                """() => {
+                    const sel = 'input#search, ytd-searchbox input, input[name="search_query"]';
+                    const el = document.querySelector(sel);
+                    if (!el) return {found: false};
+                    el.focus();
+                    el.click();
+                    return {found: true, active: document.activeElement === el};
+                }"""
+            )
+            if focused and focused.get("found"):
+                return outcome.done(
+                    "browser_control", action="focus_search", browser=self.browser_name,
+                    resolved_target="YouTube search bar", dispatch_status="completed",
+                    input_status="completed", verification_status=("verified" if focused.get("active") else "unverified"),
+                    verified=bool(focused.get("active")),
+                    detail="The YouTube search field is focused. What should I search for?",
+                )
+        except Exception:
+            pass
+        return outcome.failed("browser_control", "Could not locate YouTube search field on this page", browser=self.browser_name)
+
+    async def replay_video(self, target: str = "") -> str:
+        """Restart current video from 0:00 or re-select a requested ordinal result."""
+        ordinal_idx = _parse_ordinal_index(target) if target else None
+        if ordinal_idx is not None:
+            page = await self._get_page()
+            cards = await self._extract_youtube_videos(page, include_shorts=("short" in target.casefold()))
+            if not cards and "/watch" in str(page.url or ""):
+                try:
+                    await page.go_back(timeout=8_000)
+                except Exception:
+                    pass
+            res = await self._click_youtube_video_ordinal(page, ordinal_idx, target)
+            if res.startswith("status=done"):
+                try:
+                    await page.evaluate("async () => { const v = document.querySelector('video'); if (v) { v.currentTime = 0; await v.play(); } }")
+                except Exception:
+                    pass
+                return res + " replayed=true"
+            return res
+
+        page = await self._get_page()
+        try:
+            state = await page.evaluate(
+                "async () => { const v = document.querySelector('video'); if (!v) return {exists:false}; "
+                "v.currentTime = 0; try { await v.play(); } catch (e) {} "
+                "return {exists:true, paused:!!v.paused, currentTime:Number(v.currentTime||0)}; }"
+            )
+            if not state or not state.get("exists"):
+                return outcome.failed("browser_control", "no active video player was found to replay", url=page.url)
+            playing = not bool(state.get("paused"))
+            return outcome.done(
+                "browser_control", action="replay_video", browser=self.browser_name,
+                replayed=True, playback_state=("playing" if playing else "paused"),
+                current_time=round(float(state.get("currentTime") or 0.0), 2),
+                url=page.url, verified=playing,
+            )
+        except Exception as exc:
+            return outcome.failed("browser_control", f"replay failed: {type(exc).__name__}: {exc}")
+
+    async def _click_youtube_next_video(self, page) -> str:
+        """Select the next video on watch page or next recommended card."""
+        try:
+            btn = page.locator("a.ytp-next-button[href*='watch?v=']")
+            if await btn.count() == 1 and await btn.is_visible():
+                href = str(await btn.get_attribute("href") or "")
+                m = re.search(r"[?&]v=([A-Za-z0-9_-]{6,20})", href)
+                title = str(await btn.get_attribute("data-tooltip-text") or await btn.get_attribute("title") or "Next video")
+                await btn.click(timeout=6_000)
+                if m:
+                    return await self._verify_youtube_playback(page, m.group(1), title)
+            return await self._click_youtube_video_ordinal(page, 0, "next video")
+        except Exception as exc:
+            return outcome.failed("browser_control", f"next video failed: {type(exc).__name__}: {exc}")
 
     async def _click_unique(self, page, loc, before: tuple, label: str) -> str:
         count = await loc.count()
@@ -1915,13 +2355,29 @@ class _BrowserSession:
         except Exception:
             body = ""
         state = _classify_page_state(title, body) if ready in ("interactive", "complete") else "loading"
+        extra = {}
+        try:
+            host = (urlsplit(url).hostname or "").casefold()
+            if "youtube.com" in host:
+                videos = await self._extract_youtube_videos(page, include_shorts=False)
+                if videos:
+                    extra["video_count"] = len(videos)
+                    extra["top_videos"] = "; ".join(f"{v['position']}. {v['title']}" for v in videos[:5])
+        except Exception:
+            pass
         return outcome.done(
             "browser_control", verified=True, browser=self.browser_name,
-            url=url, title=title, page_state=state, ready_state=ready,
+            url=url, title=title, page_state=state, ready_state=ready, **extra,
         )
 
     async def close_tab(self) -> str:
         page = self._page
+        if (page is None or page.is_closed()) and self._context is not None:
+            try:
+                live = [p for p in self._context.pages if not p.is_closed()]
+                page = live[-1] if live else None
+            except Exception:
+                page = None
         if page and not page.is_closed():
             try:
                 dirty = await page.evaluate(
@@ -1935,18 +2391,22 @@ class _BrowserSession:
             except Exception:
                 pass
             ctx   = page.context
+            before_count = len([p for p in ctx.pages if not p.is_closed()])
             closed_url = getattr(page, "url", "")
             await page.close()
-            pages = ctx.pages
+            pages = [p for p in ctx.pages if not p.is_closed()]
             self._page = pages[-1] if pages else None
+            verified = bool(page.is_closed() or len(pages) < before_count)
             return outcome.done(
                 "browser_control",
                 action="close_tab",
+                browser=self.browser_name,
                 closed_url=closed_url,
-                verified=True,
+                verified=verified,
+                remaining_tabs=len(pages),
                 active_url=(self._page.url if self._page else ""),
             )
-        return "No active tab to close."
+        return outcome.failed("browser_control", "no active tab to close", browser=self.browser_name)
 
     async def screenshot(self, path: str = None) -> str:
         page = await self._get_page()
@@ -1986,13 +2446,37 @@ class _BrowserSession:
         return f"{self.browser_name} closed."
 
 class _SessionRegistry:
-    """Manages all active browser sessions."""
+    """Manages all active browser sessions and active window/page sync state."""
 
     def __init__(self):
         self._sessions:        dict[str, _BrowserSession] = {}
         self._active_browser:  str                        = ""
+        self._task_browser:    str                        = ""
         self._lock             = threading.Lock()
         self._last_native_url: str                        = ""
+        self._sync_state:      dict[str, dict]            = {}
+
+    def invalidate_sync(self, browser_name: str | None = None) -> None:
+        with self._lock:
+            if not browser_name:
+                self._sync_state.clear()
+            else:
+                name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+                self._sync_state.pop(name, None)
+
+    def update_sync(self, browser_name: str, data: dict) -> dict:
+        name = _ALIASES.get(str(browser_name or "chrome").lower().strip(), str(browser_name or "chrome").lower().strip())
+        snap = dict(data or {})
+        snap.setdefault("browser", name)
+        snap["timestamp"] = time.time()
+        with self._lock:
+            self._sync_state[name] = snap
+            return dict(snap)
+
+    def get_sync(self, browser_name: str | None = None) -> dict:
+        name = _ALIASES.get(str(browser_name or self._active_browser or "chrome").lower().strip(), str(browser_name or self._active_browser or "chrome").lower().strip())
+        with self._lock:
+            return dict(self._sync_state.get(name) or {})
 
     def has(self, browser_name: str | None = None) -> bool:
         """Is there an active automation session for this browser (or any)?"""
@@ -2025,16 +2509,11 @@ class _SessionRegistry:
         name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
         with self._lock:
             self._active_browser = name
+            self._task_browser = name
         return name
 
     def get(self, browser_name: str | None = None) -> _BrowserSession:
-        if not browser_name:
-            browser_name = (
-                self._active_browser
-                or _detect_running_browser()
-                or _detect_default_browser()
-            )
-        browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+        browser_name = select_browser(browser_name)
         sess = self._get_or_create(browser_name)
         self._active_browser = browser_name
         return sess
@@ -2082,6 +2561,1698 @@ class _SessionRegistry:
 _registry = _SessionRegistry()
 
 
+def _proc_matches_browser(app_name: str, title: str, browser_name: str) -> bool:
+    b = _ALIASES.get(str(browser_name or "").lower().strip(), str(browser_name or "").lower().strip())
+    a_cf = str(app_name or "").casefold()
+    t_cf = str(title or "").casefold()
+    if b == "edge":
+        return "msedge" in a_cf or "edge" in a_cf or "microsoft edge" in t_cf
+    if b == "chrome":
+        return "chrome" in a_cf or "google chrome" in t_cf
+    return bool(b and (b in a_cf or b in t_cf))
+
+
+def _has_running_or_visible_browser(browser_name: str) -> bool:
+    b = _ALIASES.get(str(browser_name or "").lower().strip(), str(browser_name or "").lower().strip())
+    if not b:
+        return False
+    try:
+        if appidentity.running(b):
+            return True
+    except Exception:
+        pass
+    try:
+        from core import screenview
+        for app, title in screenview.all_windows():
+            if _proc_matches_browser(app, title, b):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _should_use_native_window(browser_name: str | None) -> bool:
+    b = select_browser(browser_name)
+    if _registry.has(b):
+        return False
+    if _discover_running_cdp_endpoint(b):
+        return False
+    return _has_running_or_visible_browser(b)
+
+
+def _find_browser_window(browser_name: str) -> dict:
+    """Identify the actual visible foreground/open window for ``browser_name``."""
+    b = _ALIASES.get(str(browser_name or "chrome").lower().strip(), str(browser_name or "chrome").lower().strip())
+    try:
+        from core import screenview
+        fg_app, fg_title, fg_pid, fg_hwnd = screenview._foreground()
+        if _proc_matches_browser(fg_app, fg_title, b):
+            return {
+                "found": True,
+                "foreground": True,
+                "browser": b,
+                "app": fg_app,
+                "title": fg_title,
+                "pid": int(fg_pid or 0),
+                "hwnd": int(fg_hwnd or 0),
+            }
+        for app, title in screenview.all_windows():
+            if _proc_matches_browser(app, title, b):
+                return {
+                    "found": True,
+                    "foreground": False,
+                    "browser": b,
+                    "app": app,
+                    "title": title,
+                    "pid": 0,
+                    "hwnd": 0,
+                }
+    except Exception:
+        pass
+    running = bool(appidentity.running(b)) if b else False
+    return {"found": running, "foreground": False, "browser": b, "app": b, "title": "", "pid": 0, "hwnd": 0}
+
+
+_DURATION_RE = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$")
+_YT_META_RE = re.compile(
+    r"(?:^\d+(?:\.\d+)?[KMB]?\s+views?\b|\bviews?\s*[·•]|\b\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago\b|^@[A-Za-z0-9._-]{2,}$)",
+    re.IGNORECASE,
+)
+_YT_NAV_NOISE = frozenset({
+    "home", "shorts", "subscriptions", "you", "history", "playlists",
+    "watch later", "liked videos", "trending", "music", "gaming", "news",
+    "sports", "podcasts", "sign in", "create", "notifications", "search",
+    "search with your voice", "skip navigation", "guide", "settings",
+    "try searching to get started", "youtube", "youtube home",
+    "all", "filters", "filter", "channels", "videos", "posts", "playlist",
+    "live", "recently uploaded", "watched", "new to you", "for you",
+    "from your search", "people also watched", "previously watched",
+    "related to your search", "share", "save", "download", "subscribe",
+    "subscribed", "show more", "show less", "4k", "cc",
+})
+
+
+def _extract_native_youtube_candidates(view, *, include_shorts: bool = False) -> tuple[list[dict], bool]:
+    """Extract ordered non-ad video candidates from UIA/OCR on the visible Chrome window."""
+    elements = list(getattr(view, "elements", ()) or ())
+    mon = getattr(view, "monitor", None) or {}
+    mon_top = int(mon.get("top", 0) or 0)
+    mon_left = int(mon.get("left", 0) or 0)
+    mon_w = int(mon.get("width", 1920) or 1920)
+    header_floor = mon_top + 130
+    ocr_floor = mon_top + 185  # Excludes Chrome toolbar + YouTube masthead/filter chips
+    sidebar_ceil = mon_left + (200 if mon_w >= 1100 else 60)
+    view_source = str(getattr(view, "source", "") or "").casefold()
+
+    joined_low = " ".join(
+        str(getattr(el, "name", "") or getattr(el, "value", "") or "").casefold()
+        for el in elements
+    )
+    empty_home = "try searching to get started" in joined_low
+
+    now_m = time.monotonic()
+    candidates: list[dict] = []
+    seen_titles: set[str] = set()
+    for el in elements:
+        role = str(getattr(el, "role", "") or "").casefold()
+        is_ocr = ("ocr" in role) or (view_source == "ocr" and role in {"text", "ocr_text", ""})
+        name = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or "").split())
+        if not name or len(name) < 4:
+            continue
+        low = name.casefold()
+        if low in _YT_NAV_NOISE or _DURATION_RE.match(name) or _YT_META_RE.search(name):
+            continue
+        if any(ad in low for ad in ("sponsored", "ad ·", "advertisement", "shop now", "learn more")):
+            continue
+        if not include_shorts and ("#shorts" in low or low == "shorts"):
+            continue
+        if is_ocr and len(name.split()) < 2 and len(name) < 14:
+            continue
+        top = int(getattr(el, "top", 0) or 0)
+        left = int(getattr(el, "left", 0) or 0)
+        width = int(getattr(el, "width", 0) or 0)
+        height = int(getattr(el, "height", 0) or 0)
+        if top < (ocr_floor if is_ocr else header_floor) or left < sidebar_ceil:
+            continue
+        if width < 90 or height < 14:
+            continue
+        # Only take real interactive/text headings or clickable video titles from UIA/OCR
+        if role not in {"link", "button", "heading", "text", "ocr_text", "group", ""}:
+            if "link" not in role and "text" not in role and "heading" not in role:
+                continue
+        if low in seen_titles:
+            continue
+        seen_titles.add(low)
+        cx, cy = (getattr(el, "center", None) or (left + max(1, width // 2), top + max(1, height // 2)))
+        src_kind = "ocr" if is_ocr else "uia"
+        candidates.append({
+            "position": len(candidates) + 1,
+            "title": name[:160],
+            "point": (int(cx), int(cy)),
+            "rect": (left, top, width, height),
+            "top": top,
+            "left": left,
+            "source": src_kind,
+            "confidence": ("high" if src_kind == "uia" and "link" in role else "medium"),
+            "observed_at": now_m,
+            "element": el,
+        })
+    candidates.sort(key=lambda item: (item["top"] // 60, item["left"]))
+    for idx, item in enumerate(candidates, 1):
+        item["position"] = idx
+    return candidates, empty_home
+
+
+def _inspect_visible_browser_window(browser_name: str, *, focus_if_needed: bool = False,
+                                    allow_ocr: bool = True) -> dict:
+    """Synchronize foreground window identity, URL, search query, and visible YouTube state."""
+    from core import screenact, screenview
+
+    win = _find_browser_window(browser_name)
+    if focus_if_needed and win.get("found") and not win.get("foreground"):
+        try:
+            screenact.focus_app(win["browser"])
+            time.sleep(0.2)
+            win = _find_browser_window(win["browser"])
+        except Exception:
+            pass
+
+    view = None
+    url = ""
+    if win.get("foreground") and _proc_matches_browser(win.get("app", ""), win.get("title", ""), win["browser"]):
+        try:
+            view = screenview.look(budget_s=(2.8 if allow_ocr else 1.2), allow_ocr=allow_ocr)
+        except Exception:
+            view = None
+
+    uia_count = 0
+    ocr_count = 0
+    elements = list(getattr(view, "elements", ()) or ()) if view is not None else []
+    for el in elements:
+        r = str(getattr(el, "role", "") or "").casefold()
+        if "ocr" in r:
+            ocr_count += 1
+        else:
+            uia_count += 1
+        val = str(getattr(el, "value", "") or getattr(el, "name", "") or "").strip()
+        label_low = str(getattr(el, "name", "") or getattr(el, "label", "") or "").casefold()
+        if not url and ("address" in label_low or "search bar" in label_low or "omnibox" in label_low) and "." in val:
+            url = val if "://" in val else f"https://{val}"
+        elif not url and ("youtube.com/" in val.casefold() or "http://" in val.casefold() or "https://" in val.casefold()):
+            url = val
+
+    title = str(win.get("title") or (getattr(view, "title", "") if view else "") or "")
+    search_query = ""
+    if "search_query=" in url:
+        try:
+            search_query = next((v for k, v in parse_qsl(urlsplit(url).query) if k == "search_query"), "")
+        except Exception:
+            search_query = ""
+    elif " - youtube" in title.casefold():
+        candidate_q = re.sub(r"\s*-\s*YouTube.*$", "", title, flags=re.IGNORECASE).strip()
+        if candidate_q and candidate_q.casefold() not in {"youtube", "home", "(1) youtube"}:
+            search_query = candidate_q
+
+    videos, empty_home = _extract_native_youtube_candidates(view) if view is not None else ([], False)
+    if empty_home:
+        videos = []
+    src = getattr(view, "source", "none") if view is not None else "window_list"
+    if uia_count and ocr_count:
+        obs_source = "windows_uia_and_ocr"
+    elif ocr_count:
+        obs_source = "windows_ocr"
+    elif uia_count:
+        obs_source = "windows_uia"
+    else:
+        obs_source = str(src or "window_list")
+
+    extracted_text_count = uia_count + ocr_count
+    if videos or extracted_text_count >= 4:
+        confidence = "high"
+    elif extracted_text_count > 0:
+        confidence = "medium"
+    else:
+        confidence = "uncertain"
+    app_exe = str(win.get("app") or f"{win['browser']}.exe")
+    window_identity = f"{app_exe}: {title}" if title else app_exe
+    is_wa = "whatsapp" in (title + " " + url).casefold()
+    wa_contacts: list[dict] = []
+    wa_chat: dict = {}
+    if is_wa and view is not None:
+        try:
+            from plugins import _whatsapp_core as _wa
+            wa_contacts = _wa.extract_whatsapp_contacts(view, query=search_query)
+            wa_chat = _wa.verify_selected_chat(view)
+        except Exception:
+            wa_contacts, wa_chat = [], {}
+    try:
+        from core import desktop_control as _dc
+        diag_updates = dict(
+            last_obs_source=obs_source,
+            ocr_count=ocr_count,
+            uia_count=uia_count,
+            chrome_detected=bool(win.get("found") and win["browser"] == "chrome"),
+            chrome_foreground=bool(win.get("foreground") and win["browser"] == "chrome"),
+            foreground_app=(app_exe if win.get("foreground") else _dc.snapshot().get("foreground_app", "—")),
+        )
+        if is_wa:
+            diag_updates["active_application"] = "WhatsApp (Chrome)"
+            diag_updates["unique_contact_count"] = len(wa_contacts)
+            diag_updates["selected_chat_verified"] = bool(wa_chat.get("verified"))
+            if wa_chat.get("active_contact"):
+                diag_updates["active_contact"] = wa_chat["active_contact"]
+                diag_updates["active_chat_id"] = wa_chat.get("chat_id", "")
+        _dc.record_diagnostics(**diag_updates)
+    except Exception:
+        pass
+
+    snap = {
+        "browser": win["browser"],
+        "hwnd": win.get("hwnd", 0),
+        "pid": win.get("pid", 0),
+        "title": title,
+        "window_identity": window_identity,
+        "url": url,
+        "foreground": bool(win.get("foreground")),
+        "search_query": search_query,
+        "empty_home": bool(empty_home),
+        "videos": videos,
+        "wa_contacts": wa_contacts,
+        "wa_chat": wa_chat,
+        "uia_items": uia_count,
+        "ocr_items": ocr_count,
+        "extracted_text_count": extracted_text_count,
+        "confidence": confidence,
+        "target_identified": bool(videos or wa_contacts or wa_chat.get("verified")),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "source": obs_source,
+        "cdp_available": False,
+        "view": view,
+    }
+    _registry.update_sync(win["browser"], snap)
+    return snap
+
+
+def _inspect_browser_sync_safe(browser_name: str, *, allow_ocr: bool = True) -> dict:
+    return _inspect_visible_browser_window(browser_name, focus_if_needed=True, allow_ocr=allow_ocr)
+
+
+def _ensure_browser_foreground(bname: str, win: dict, title_hint: str = "") -> tuple[bool, dict, str]:
+    """Activate and verify that the requested browser window (not REM's own window) is foreground."""
+    from core import appidentity, desktop_control, screenact, screenview
+
+    if not win.get("found"):
+        desktop_control.record_diagnostics(chrome_detected=False, chrome_foreground=False)
+        return False, win, f"no running {bname} window was found and CDP is unavailable; did not substitute another browser"
+
+    if win.get("foreground") and _proc_matches_browser(win.get("app", ""), win.get("title", ""), bname):
+        if not screenview.is_own_pid(int(win.get("pid", 0) or 0)):
+            desktop_control.record_diagnostics(
+                chrome_detected=True, chrome_foreground=True,
+                foreground_app=str(win.get("app") or bname),
+            )
+            return True, win, ""
+
+    # Activate using screenact.focus_app first, then full Win32 multi-process HWND focus fallback
+    act = screenact.focus_app(bname)
+    time.sleep(0.15)
+    refreshed = _find_browser_window(bname)
+    if refreshed.get("foreground") and _proc_matches_browser(refreshed.get("app", ""), refreshed.get("title", ""), bname):
+        if not screenview.is_own_pid(int(refreshed.get("pid", 0) or 0)):
+            desktop_control.record_diagnostics(
+                chrome_detected=True, chrome_foreground=True,
+                foreground_app=str(refreshed.get("app") or bname),
+            )
+            return True, refreshed, ""
+
+    focus_res = appidentity.focus_window_by_app(bname, title_hint=title_hint or str(win.get("title") or ""))
+    if focus_res.get("activated"):
+        time.sleep(0.1)
+        refreshed2 = _find_browser_window(bname)
+        if refreshed2.get("foreground") or focus_res.get("target_hwnd"):
+            merged = {
+                **refreshed,
+                "found": True,
+                "foreground": True,
+                "hwnd": int(refreshed2.get("hwnd") or focus_res.get("target_hwnd") or 0),
+                "pid": int(refreshed2.get("pid") or focus_res.get("target_pid") or 0),
+                "title": str(refreshed2.get("title") or focus_res.get("target_window_title") or win.get("title") or ""),
+            }
+            desktop_control.record_diagnostics(
+                chrome_detected=True, chrome_foreground=True,
+                foreground_app=str(merged.get("app") or bname),
+            )
+            return True, merged, ""
+
+    desktop_control.record_diagnostics(
+        chrome_detected=bool(win.get("found")), chrome_foreground=False,
+        foreground_app=str(refreshed.get("app") or "unknown"),
+    )
+    return False, refreshed, f"I couldn't complete that action because {bname} did not become the foreground window ({act.error or focus_res.get('reason') or 'foreground lock'})."
+
+
+def _extract_yt_time_seconds(view) -> float | None:
+    """Read visible player timestamp (e.g. '1:24 / 12:10' or '1:24') from UIA/OCR if exposed."""
+    if view is None:
+        return None
+    for el in getattr(view, "elements", ()) or ():
+        txt = str(getattr(el, "name", "") or getattr(el, "value", "") or "").strip()
+        if not txt:
+            continue
+        m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*/|\s*$)", txt)
+        if m:
+            parts = [int(p) for p in m.groups() if p is not None]
+            if len(parts) == 2:
+                return float(parts[0] * 60 + parts[1])
+            if len(parts) == 3:
+                return float(parts[0] * 3600 + parts[1] * 60 + parts[2])
+    return None
+
+
+def _native_browser_action(action: str, params: dict, browser_name: str, player=None) -> str:
+    """Operate directly on the user's real visible browser window when CDP is unavailable."""
+    from core import screenact, screenview
+
+    bname = _ALIASES.get(str(browser_name or "chrome").lower().strip(), str(browser_name or "chrome").lower().strip())
+    win = _find_browser_window(bname)
+    if action in ("inspect", "get_url", "get_text"):
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
+        videos = sync.get("videos") or []
+        wa_contacts = sync.get("wa_contacts") or []
+        wa_chat = sync.get("wa_chat") or {}
+        is_wa_surface = "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold()
+        summary_parts = []
+        if is_wa_surface:
+            if wa_chat.get("verified"):
+                summary_parts.append(f"Selected WhatsApp chat: {wa_chat['active_contact']}")
+            if wa_contacts:
+                summary_parts.append(
+                    f"Unique WhatsApp contacts ({len(wa_contacts)}): "
+                    + "; ".join(f"{c['position']}. {c['display_name']}" for c in wa_contacts[:6])
+                )
+        elif sync.get("empty_home"):
+            summary_parts.append("YouTube Home ('Try searching to get started', 0 results)")
+        elif videos:
+            summary_parts.append("Videos: " + "; ".join(f"{v['position']}. {v['title']}" for v in videos[:5]))
+        if not win.get("found") and not sync.get("title") and not sync.get("url"):
+            return outcome.unverified(
+                "browser_control",
+                f"no controllable {bname} tab or active browser window title was found",
+                browser=bname, control_mode="native_windows", cdp_available=False,
+                window_identity=sync.get("window_identity", ""),
+                timestamp=sync.get("timestamp", ""),
+                extracted_text_count=sync.get("extracted_text_count", 0),
+                uia_items=sync.get("uia_items", 0),
+                ocr_items=sync.get("ocr_items", 0),
+                confidence="uncertain",
+                target_identified=False,
+                page_state="unverified", verification_step="open_browser_window",
+            )
+        if is_wa_surface:
+            try:
+                from core import desktop_control as _dc
+                _auth_ctx = _dc.current_bound_auth_context()
+                if wa_chat.get("verified") and wa_chat.get("active_contact"):
+                    _dc.set_active_target(
+                        target_type="contact",
+                        exact_target_name=wa_chat["active_contact"],
+                        browser=bname, tab_title=sync.get("title", ""), tab_url=sync.get("url", ""),
+                        confidence="high", extraction_source=sync.get("source", ""), auth_context=_auth_ctx,
+                    )
+                elif wa_contacts:
+                    _dc.set_active_target(
+                        target_type="contact",
+                        exact_target_name=wa_contacts[0]["display_name"],
+                        browser=bname, tab_title=sync.get("title", ""), tab_url=sync.get("url", ""),
+                        result_position=1, point=wa_contacts[0]["point"], rect=wa_contacts[0].get("rect"),
+                        confidence=wa_contacts[0].get("confidence", "medium"),
+                        extraction_source=wa_contacts[0].get("source", ""), auth_context=_auth_ctx,
+                    )
+            except Exception:
+                pass
+            return outcome.done(
+                "browser_control", action=action, browser=bname, control_mode="native_windows",
+                active_application="WhatsApp (Chrome)",
+                unique_contact_count=len(wa_contacts),
+                active_contact=wa_chat.get("active_contact", wa_contacts[0]["display_name"] if len(wa_contacts) == 1 else ""),
+                selected_chat_verified=bool(wa_chat.get("verified")),
+                uia_items=sync.get("uia_items", 0), ocr_items=sync.get("ocr_items", 0),
+                extracted_text_count=sync.get("extracted_text_count", 0),
+                source=sync.get("source", "windows_uia"),
+                detail=(" | ".join(summary_parts) if summary_parts else "WhatsApp is open; 0 matching contacts visible."),
+                verified=bool(wa_contacts or wa_chat.get("verified")),
+            )
+        if action == "get_url":
+            if sync.get("url"):
+                return outcome.done(
+                    "browser_control", action="get_url", browser=bname,
+                    control_mode="native_windows", cdp_available=False,
+                    url=sync["url"], title=sync.get("title", ""),
+                    window_identity=sync.get("window_identity", ""),
+                    window_pid=sync.get("pid", 0), window_hwnd=sync.get("hwnd", 0),
+                    timestamp=sync.get("timestamp", ""),
+                    extracted_text_count=sync.get("extracted_text_count", 0),
+                    uia_items=sync.get("uia_items", 0),
+                    ocr_items=sync.get("ocr_items", 0),
+                    confidence=sync.get("confidence", "medium"),
+                    source=sync.get("source", "windows_uia"), verified=True,
+                )
+            return outcome.unverified(
+                "browser_control",
+                f"CDP is unavailable on {bname} and UIA did not expose the full URL; active window title is {sync.get('title')!r}",
+                browser=bname, control_mode="native_windows", cdp_available=False,
+                title=sync.get("title", ""), window_pid=sync.get("pid", 0),
+                window_identity=sync.get("window_identity", ""),
+                timestamp=sync.get("timestamp", ""),
+                extracted_text_count=sync.get("extracted_text_count", 0),
+                uia_items=sync.get("uia_items", 0),
+                ocr_items=sync.get("ocr_items", 0),
+                confidence=sync.get("confidence", "uncertain"),
+                source=sync.get("source", "windows_uia"),
+            )
+        is_youtube = "youtube" in (sync.get("title", "") + " " + sync.get("url", "")).casefold()
+        if is_youtube and not videos and not sync.get("empty_home"):
+            return outcome.unverified(
+                "browser_control",
+                "Tarun-kun, I can see YouTube, but I can't reliably read the video titles right now.",
+                action=action,
+                browser=bname,
+                control_mode="native_windows",
+                cdp_available=False,
+                window_identity=sync.get("window_identity", ""),
+                source=sync.get("source", "none"),
+                timestamp=sync.get("timestamp", ""),
+                window_pid=sync.get("pid", 0),
+                window_hwnd=sync.get("hwnd", 0),
+                title=sync.get("title", ""),
+                extracted_text_count=sync.get("extracted_text_count", 0),
+                uia_items=sync.get("uia_items", 0),
+                ocr_items=sync.get("ocr_items", 0),
+                confidence=sync.get("confidence", "uncertain"),
+                target_identified=False,
+                page_state="unverified",
+            )
+        highlighted_pos = None
+        highlighted_title = ""
+        try:
+            from core import desktop_control as _dc
+            auth_ctx = _dc.current_bound_auth_context()
+            req_text = str(
+                params.get("description") or params.get("target")
+                or (getattr(auth_ctx, "instruction", "") if auth_ctx else "")
+                or ""
+            )
+            req_ord = _parse_ordinal_index(req_text)
+            if videos:
+                pick_idx = (len(videos) - 1) if req_ord == -1 else (req_ord if req_ord is not None else 0)
+                if 0 <= pick_idx < len(videos):
+                    chosen_v = videos[pick_idx]
+                    highlighted_pos = chosen_v["position"]
+                    highlighted_title = chosen_v["title"]
+                    _dc.set_active_target(
+                        target_type="video",
+                        exact_target_name=highlighted_title,
+                        browser=bname,
+                        tab_title=sync.get("title", ""),
+                        tab_url=sync.get("url", ""),
+                        result_position=highlighted_pos,
+                        point=chosen_v["point"],
+                        rect=chosen_v.get("rect"),
+                        confidence=chosen_v.get("confidence", "medium"),
+                        extraction_source=sync.get("source", ""),
+                        results=videos,
+                        auth_context=auth_ctx,
+                    )
+        except Exception:
+            pass
+        return outcome.done(
+            "browser_control",
+            action=action,
+            browser=bname,
+            control_mode="native_windows",
+            cdp_available=False,
+            window_identity=sync.get("window_identity", ""),
+            source=sync.get("source", "windows_uia"),
+            timestamp=sync.get("timestamp", ""),
+            window_pid=sync.get("pid", 0),
+            window_hwnd=sync.get("hwnd", 0),
+            title=sync.get("title", ""),
+            url=sync.get("url", ""),
+            search_query=sync.get("search_query", ""),
+            extracted_text_count=sync.get("extracted_text_count", 0),
+            uia_items=sync.get("uia_items", 0),
+            ocr_items=sync.get("ocr_items", 0),
+            confidence=sync.get("confidence", "medium"),
+            target_identified=bool(videos),
+            resolved_target=(highlighted_title or sync.get("title", "")),
+            highlighted_position=(highlighted_pos or 0),
+            highlighted_title=highlighted_title,
+            video_count=len(videos),
+            empty_home=bool(sync.get("empty_home")),
+            detail=(" | ".join(summary_parts) if summary_parts else sync.get("title", "")),
+            verified=bool(videos or sync.get("empty_home")),
+        )
+
+    if not win.get("found"):
+        return outcome.failed(
+            "browser_control",
+            f"no running {bname} window was found and CDP is unavailable; did not substitute another browser",
+            action=action, browser=bname, dispatch_status="completed", input_status="not_executed",
+            verification_status="unverified", cdp_available=False,
+        )
+    ok_fg, win, fg_err = _ensure_browser_foreground(bname, win, title_hint=str(params.get("description") or params.get("target") or ""))
+    if not ok_fg:
+        return outcome.failed(
+            "browser_control", fg_err,
+            action=action, browser=bname,
+            dispatch_status="completed", input_status="failed",
+            verification_status="unverified", failure_reason="foreground_activation_failed",
+            cdp_available=False,
+        )
+
+    # Always discard stale sync before transitions or reads.
+    if action in ("go_to", "search", "new_tab", "switch_tab", "smart_click", "play_video",
+                  "replay_video", "back", "forward", "reload", "close_tab"):
+        _registry.invalidate_sync(bname)
+
+    if action in ("go_to", "search", "new_tab"):
+        if action == "search":
+            eng = str(params.get("engine") or "").lower().strip()
+            sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=False)
+            if not eng:
+                hint = (sync.get("title", "") + " " + sync.get("url", "")).casefold()
+                eng = "youtube" if "youtube" in hint else "google"
+            base = _SEARCH_ENGINES.get(eng, _SEARCH_ENGINES["google"])
+            nav_url = base + str(params.get("query") or "").strip().replace(" ", "+")
+        else:
+            nav_url = str(params.get("url") or "").strip()
+        if nav_url:
+            try:
+                nav_url = _normalize_url(nav_url)
+            except ValueError:
+                return outcome.ask("browser_control", "Which website did you mean? Please give me its name or web address.", verified=False)
+        chord = "ctrl+t" if action == "new_tab" else "ctrl+l"
+        key_res = screenact.press(chord)
+        if not key_res.ok:
+            return outcome.failed("browser_control", f"could not focus {bname} address bar: {key_res.error}", browser=bname)
+        time.sleep(0.1)
+        if nav_url:
+            type_res = screenact.type_text(nav_url, clear_first=True)
+            if not type_res.ok:
+                return outcome.failed("browser_control", f"could not type URL into {bname}: {type_res.error}", browser=bname)
+            time.sleep(0.08)
+            enter_res = screenact.press("enter")
+            if not enter_res.ok:
+                return outcome.failed("browser_control", f"could not submit navigation in {bname}: {enter_res.error}", browser=bname)
+            time.sleep(0.8)
+            _registry.invalidate_sync(bname)
+            refreshed = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+            return outcome.done(
+                "browser_control", action=action, browser=bname,
+                control_mode="native_windows", cdp_available=False,
+                url=refreshed.get("url") or nav_url, title=refreshed.get("title", ""),
+                window_pid=refreshed.get("pid", 0), verified=bool(refreshed.get("title")),
+            )
+        return outcome.done("browser_control", action="new_tab", browser=bname, control_mode="native_windows", cdp_available=False, verified=True)
+
+    if action in ("compose_message", "update_draft"):
+        from core import desktop_control as _dc
+        from plugins import _whatsapp_core as _wa
+
+        _auth_ctx = _dc.current_bound_auth_context()
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
+        view = sync.get("view")
+        comp_state = _dc.get_active_composition_state(_auth_ctx) or {}
+        expected_contact = str(
+            params.get("receiver") or params.get("contact")
+            or comp_state.get("selected_contact")
+            or _dc.snapshot().get("active_contact") or ""
+        ).strip()
+        if expected_contact == "—":
+            expected_contact = ""
+        chat_hdr = _wa.verify_selected_chat(view, expected_contact=expected_contact)
+        comp_box = _wa.locate_whatsapp_composer(view)
+        if comp_box is None:
+            return outcome.failed(
+                "browser_control",
+                "Could not locate the active conversation's message composer; nothing was typed or sent.",
+                action=action, browser=bname,
+                dispatch_status="completed", input_status="not_executed", verification_status="unverified",
+                message_sent=False,
+            )
+        prev_draft = str(comp_state.get("generated_content") or "")
+        inst_text = str(
+            params.get("composition_prompt") or params.get("description")
+            or (getattr(_auth_ctx, "instruction", "") if _auth_ctx else "")
+            or action
+        )
+        draft_lang = (
+            "Hindi" if ("hindi" in inst_text.casefold() or re.search(r"[\u0900-\u097F]", inst_text))
+            else ("English" if "english" in inst_text.casefold() else "")
+        )
+        draft = str(params.get("text") or "").strip() or _wa.generate_autonomous_draft(
+            inst_text,
+            recipient=str(chat_hdr.get("active_contact") or expected_contact),
+            previous_draft=(prev_draft if action == "update_draft" or prev_draft else ""),
+            language=draft_lang,
+        )
+        pt = screenact.Point(comp_box["x"], comp_box["y"], origin="element", label=comp_box["label"])
+        mv = screenact.move_cursor(pt)
+        clk = screenact.click(pt)
+        if not clk.ok:
+            return outcome.failed(
+                "browser_control", f"clicking WhatsApp composer failed: {clk.error}",
+                action=action, browser=bname, dispatch_status="completed",
+                input_status="failed", verification_status="unverified", message_sent=False,
+            )
+        time.sleep(0.08)
+        t_res = screenact.type_text(draft, clear_first=True)
+        if not t_res.ok:
+            return outcome.failed(
+                "browser_control", f"typing draft failed: {t_res.error}",
+                action=action, browser=bname, dispatch_status="completed",
+                input_status="failed", verification_status="unverified", message_sent=False,
+            )
+        after_v = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+        after_vals = " ".join(
+            str(getattr(e, "value", "") or getattr(e, "name", "") or "")
+            for e in (getattr(after_v.get("view"), "elements", ()) or ())
+        ).casefold()
+        readback_ok = bool(draft and draft.splitlines()[0].strip().casefold() in after_vals)
+        contact_name = str(chat_hdr.get("active_contact") or expected_contact)
+        _dc.set_active_composition_state(
+            composition_requested=True,
+            composition_task_id=str(getattr(_auth_ctx, "task_id", "") or ""),
+            selected_contact=contact_name,
+            generated_content=draft,
+            typing_authorized=True,
+            message_sent=False,
+            language=draft_lang,
+            auth_context=_auth_ctx,
+        )
+        _dc.record_diagnostics(
+            composition_status=("updated" if action == "update_draft" else "generated"),
+            typing_status=("verified" if readback_ok else "typed_unverified"),
+            sending_status="not_sent",
+            last_keyboard_status=("ok" if t_res.ok else "failed"),
+        )
+        return outcome.done(
+            "browser_control", action=action, browser=bname,
+            control_mode="native_windows", resolved_target=comp_box["label"],
+            selected_contact=contact_name, selected_chat_verified=bool(chat_hdr.get("verified")),
+            generated_content_hash=_wa.draft_hash(draft),
+            composition_requested=True, typing_authorized=True, message_sent=False,
+            dispatch_status="completed", input_status="completed",
+            verification_status=("verified" if readback_ok else "input_dispatched"),
+            cursor_moved=mv.ok, verified=True,
+            detail=f"Drafted and typed message into WhatsApp composer for {contact_name or 'active chat'} without sending.",
+        )
+
+    if action == "search_contact":
+        from core import desktop_control as _dc
+        from plugins import _whatsapp_core as _wa
+
+        q = str(params.get("text") or params.get("query") or params.get("description") or "").strip()
+        if not q:
+            return outcome.ask("browser_control", "Which contact or chat should I search for?", browser=bname, verified=False)
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
+        sb = _wa.locate_whatsapp_search_bar(sync.get("view"))
+        if sb is None:
+            return outcome.failed("browser_control", "Could not locate WhatsApp's search bar.", action="search_contact", browser=bname)
+        pt = screenact.Point(sb["x"], sb["y"], origin="element", label=sb["label"])
+        screenact.move_cursor(pt)
+        clk = screenact.click(pt)
+        if not clk.ok:
+            return outcome.failed("browser_control", f"clicking WhatsApp search failed: {clk.error}", action="search_contact", browser=bname)
+        t_res = screenact.type_text(q, clear_first=True)
+        if not t_res.ok:
+            return outcome.failed("browser_control", f"typing contact query failed: {t_res.error}", action="search_contact", browser=bname)
+        time.sleep(0.35)
+        _registry.invalidate_sync(bname)
+        after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
+        contacts = _wa.extract_whatsapp_contacts(after.get("view"), query=q)
+        _dc.record_diagnostics(unique_contact_count=len(contacts), active_application="WhatsApp (Chrome)")
+        if contacts:
+            _dc.set_active_target(
+                target_type="contact", exact_target_name=contacts[0]["display_name"],
+                browser=bname, tab_title=after.get("title", ""), tab_url=after.get("url", ""),
+                result_position=1, point=contacts[0]["point"], rect=contacts[0].get("rect"),
+                confidence=contacts[0].get("confidence", "medium"), extraction_source=contacts[0].get("source", ""),
+                results=contacts,
+                auth_context=_dc.current_bound_auth_context(),
+            )
+        return outcome.done(
+            "browser_control", action="search_contact", browser=bname,
+            resolved_target=q, unique_contact_count=len(contacts),
+            matched_contacts="; ".join(c["display_name"] for c in contacts[:5]),
+            dispatch_status="completed", input_status="completed",
+            verification_status=("verified" if contacts else "unverified"),
+            verified=bool(contacts),
+        )
+
+    def _click_diag(clk_action: str, pt, *, rect_info=None) -> tuple:
+        cb = screenact.get_cursor_pos() if hasattr(screenact, "get_cursor_pos") else (0, 0)
+        mv = screenact.move_cursor(pt)
+        if clk_action == "right_click":
+            clk = screenact.right_click(pt)
+        elif clk_action == "double_click":
+            clk = screenact.double_click(pt)
+        else:
+            clk = screenact.click(pt)
+        ca = screenact.get_cursor_pos() if hasattr(screenact, "get_cursor_pos") else (getattr(pt, "x", 0), getattr(pt, "y", 0))
+        thwnd = int(win.get("hwnd", 0) or 0)
+        tpid = int(win.get("pid", 0) or 0)
+        fhwnd = thwnd
+        try:
+            from core import desktop_control as _dc_local
+            _dc_local.record_diagnostics(
+                last_cursor_pos=f"{ca[0]},{ca[1]}",
+                last_mouse_status=("ok" if clk.ok else "failed"),
+            )
+        except Exception:
+            pass
+        return mv, clk, {
+            "target_hwnd": thwnd,
+            "target_pid": tpid,
+            "foreground_hwnd": fhwnd,
+            "target_rect": str(rect_info or ""),
+            "cursor_before": f"{cb[0]},{cb[1]}",
+            "cursor_after": f"{ca[0]},{ca[1]}",
+            "dispatch_status": ("completed" if clk.ok else "failed"),
+            "input_status": ("completed" if clk.ok else "failed"),
+        }
+
+    if action == "select_contact":
+        from core import desktop_control as _dc
+        from plugins import _whatsapp_core as _wa
+
+        _auth_ctx = _dc.current_bound_auth_context()
+        desc = str(params.get("description") or params.get("text") or params.get("query") or "").strip()
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
+        view = sync.get("view")
+        ord_idx = _parse_ordinal_index(desc)
+        ref = _dc.get_active_target(_auth_ctx)
+        if not desc and ref and ref.get("target_type") == "contact":
+            desc = str(ref.get("exact_target_name") or "").strip()
+        cleaned_query = re.sub(
+            r"\b(?:the|first|second|third|fourth|last|1st|2nd|3rd|4th|one|open|select|click|chat|contact)\b",
+            "", desc, flags=re.IGNORECASE,
+        ).strip()
+        contacts = _wa.extract_whatsapp_contacts(view, query=cleaned_query)
+        if not contacts and ref and ref.get("results"):
+            contacts = list(ref.get("results") or ())
+        _dc.record_diagnostics(unique_contact_count=len(contacts), active_application="WhatsApp (Chrome)")
+        if not contacts:
+            return outcome.unverified(
+                "browser_control", f"No WhatsApp contact matching {desc or 'selection'!r} was found on screen.",
+                action="select_contact", browser=bname, verified=False,
+            )
+        chosen = None
+        if ord_idx is not None:
+            pick = (len(contacts) - 1) if ord_idx == -1 else ord_idx
+            if 0 <= pick < len(contacts):
+                chosen = contacts[pick]
+        if chosen is None:
+            exact = [c for c in contacts if cleaned_query and c["display_name"].casefold() == cleaned_query.casefold()]
+            chosen = exact[0] if len(exact) == 1 else (contacts[0] if len(contacts) == 1 else None)
+        if chosen is None:
+            _dc.set_active_target(
+                target_type="contact", exact_target_name=contacts[0]["display_name"],
+                browser=bname, tab_title=sync.get("title", ""), tab_url=sync.get("url", ""),
+                result_position=1, point=contacts[0]["point"], rect=contacts[0].get("rect"),
+                results=contacts, auth_context=_auth_ctx,
+            )
+            names = ", ".join(c["display_name"] for c in contacts[:4])
+            return outcome.ask(
+                "browser_control",
+                f"I found {len(contacts)} contacts matching {cleaned_query or desc!r}: {names}. Which one should I open — first or second?",
+                browser=bname, unique_contact_count=len(contacts), verified=False,
+            )
+        pt = screenact.Point(chosen["point"][0], chosen["point"][1], origin="element", label=chosen["display_name"])
+        mv, clk, cdiag = _click_diag("click", pt, rect_info=chosen.get("rect"))
+        if not clk.ok:
+            return outcome.failed("browser_control", f"clicking contact {chosen['display_name']!r} failed: {clk.error}", action="select_contact", browser=bname, **cdiag)
+        time.sleep(0.35)
+        _registry.invalidate_sync(bname)
+        after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
+        hdr = _wa.verify_selected_chat(after.get("view"), expected_contact=chosen["display_name"])
+        chat_id = str(chosen.get("id") or _wa.draft_hash(chosen["display_name"]))
+        _dc.set_active_target(
+            target_type="contact", exact_target_name=chosen["display_name"],
+            browser=bname, tab_title=after.get("title", ""), tab_url=after.get("url", ""),
+            result_position=chosen.get("position", 1), point=chosen["point"], rect=chosen.get("rect"),
+            confidence=chosen.get("confidence", "high"), extraction_source=chosen.get("source", ""),
+            auth_context=_auth_ctx,
+        )
+        _dc.set_active_composition_state(
+            composition_requested=False,
+            composition_task_id=str(getattr(_auth_ctx, "task_id", "") or ""),
+            selected_contact=chosen["display_name"],
+            generated_content="",
+            typing_authorized=False,
+            message_sent=False,
+            auth_context=_auth_ctx,
+        )
+        _dc.record_diagnostics(
+            active_application="WhatsApp (Chrome)",
+            active_contact=chosen["display_name"],
+            active_chat_id=chat_id,
+            selected_chat_verified=bool(hdr.get("verified")),
+            unique_contact_count=len(contacts),
+        )
+        return outcome.done(
+            "browser_control", action="select_contact", browser=bname,
+            resolved_target=chosen["display_name"], active_contact=chosen["display_name"],
+            active_chat_id=chat_id, unique_contact_count=len(contacts),
+            selected_chat_verified=bool(hdr.get("verified")),
+            verification_status=("verified" if hdr.get("verified") else "input_dispatched"),
+            cursor_moved=mv.ok, click_executed=clk.ok, verified=True, **cdiag,
+        )
+
+    if action in ("smart_type", "type"):
+        text_val = str(params.get("text") or "")
+        desc = str(params.get("description") or params.get("selector") or "").strip()
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
+        view = sync.get("view")
+        is_wa_page = "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold()
+        target_el = None
+        if view is not None and not is_wa_page:
+            for el in getattr(view, "elements", ()) or ():
+                role_cf = str(getattr(el, "role", "") or "").casefold()
+                name_cf = str(getattr(el, "name", "") or "").casefold()
+                if desc and role_cf in {"edit", "combobox"} and _is_search_bar_query(desc):
+                    if "address" in name_cf or "omnibox" in name_cf or "url" in name_cf:
+                        continue
+                    if "search" in name_cf or getattr(el, "focused", False):
+                        target_el = el
+                        break
+                elif desc and role_cf in {"edit", "combobox"} and desc.casefold() in name_cf:
+                    target_el = el
+                    break
+                elif not desc and getattr(el, "focused", False) and role_cf in {"edit", "combobox", "searchbox"}:
+                    target_el = el
+                    break
+        target_label = ""
+        detection_source = ""
+        cdiag = {
+            "target_hwnd": int(win.get("hwnd", 0) or 0),
+            "target_pid": int(win.get("pid", 0) or 0),
+            "foreground_hwnd": int(win.get("hwnd", 0) or 0),
+            "target_rect": "",
+            "cursor_before": "",
+            "cursor_after": "",
+            "dispatch_status": "completed",
+            "input_status": "completed",
+        }
+        is_wa_composer = False
+        if is_wa_page:
+            from plugins import _whatsapp_core as _wa
+            desc_cf = desc.casefold()
+            if _is_search_bar_query(desc):
+                sb = _wa.locate_whatsapp_search_bar(view)
+                if sb is None:
+                    return outcome.failed("browser_control", "Could not locate WhatsApp search bar.", action=action, browser=bname)
+                pt = screenact.Point(sb["x"], sb["y"], origin="element", label=sb["label"])
+                mv, clk, cdiag = _click_diag("click", pt)
+                if not clk.ok:
+                    return outcome.failed("browser_control", f"clicking WhatsApp search failed: {clk.error}", action=action, browser=bname, **cdiag)
+                target_label, detection_source = sb["label"], sb["source"]
+                time.sleep(0.1)
+            elif (
+                any(k in desc_cf for k in ("message", "chat", "composer", "draft", "reply", "input"))
+                or not desc
+            ):
+                comp = _wa.locate_whatsapp_composer(view)
+                if comp is None:
+                    return outcome.failed("browser_control", "Could not locate active WhatsApp message composer.", action=action, browser=bname)
+                pt = screenact.Point(comp["x"], comp["y"], origin="element", label=comp["label"])
+                mv, clk, cdiag = _click_diag("click", pt)
+                if not clk.ok:
+                    return outcome.failed("browser_control", f"clicking WhatsApp composer failed: {clk.error}", action=action, browser=bname, **cdiag)
+                target_label, detection_source, is_wa_composer = comp["label"], comp["source"], True
+                time.sleep(0.08)
+            else:
+                return outcome.failed("browser_control", f"no WhatsApp field matching {desc!r} was found.", action=action, browser=bname)
+        elif target_el is not None:
+            pt = screenact.Point.from_element(target_el)
+            mv, clk, cdiag = _click_diag("click", pt, rect_info=getattr(target_el, "rect", ""))
+            if not clk.ok:
+                return outcome.failed("browser_control", f"clicking search field failed in {bname}: {clk.error}", browser=bname, **cdiag)
+            target_label = str(getattr(target_el, "name", "") or "input")
+            detection_source = "uia"
+            time.sleep(0.1)
+        elif _is_search_bar_query(desc) or (not desc and "youtube" in (sync.get("title", "") + sync.get("url", "")).casefold()):
+            sb = _locate_youtube_search_bar_native(sync, bname, desc or "YouTube search bar")
+            if sb is not None:
+                pt = screenact.Point(sb["x"], sb["y"], origin="element", label=sb["label"])
+                mv, clk, cdiag = _click_diag("click", pt)
+                if not clk.ok:
+                    return outcome.failed("browser_control", f"clicking YouTube search bar failed in {bname}: {clk.error}", browser=bname, **cdiag)
+                target_label = sb["label"]
+                detection_source = sb["source"]
+                time.sleep(0.1)
+            elif not desc:
+                screenact.press("/")
+                time.sleep(0.15)
+                target_label = "YouTube search shortcut"
+                detection_source = "shortcut_focus"
+            else:
+                return outcome.failed(
+                    "browser_control",
+                    f"no visible search field matching {desc!r} was found in {bname}",
+                    browser=bname,
+                    window_identity=sync.get("window_identity", ""),
+                    uia_items=sync.get("uia_items", 0),
+                    ocr_items=sync.get("ocr_items", 0),
+                    confidence=sync.get("confidence", "uncertain"),
+                    target_identified=False,
+                )
+        elif not desc and "chrome" in win.get("app", "").casefold():
+            # Focused input from prior click ("Click the YouTube search bar" -> "Type short")
+            target_label = "focused Chrome input"
+            detection_source = "focused_chrome"
+        else:
+            return outcome.failed("browser_control", f"no editable UIA field matching {desc or 'input'!r} was found in {bname}", browser=bname)
+        clear_req = bool(params.get("clear_first", is_wa_composer))
+        t_res = screenact.type_text(text_val, clear_first=clear_req)
+        if not t_res.ok:
+            return outcome.failed("browser_control", f"typing failed in {bname}: {t_res.error}", browser=bname, **cdiag)
+        if not is_wa_composer and (params.get("submit") or params.get("press_enter")):
+            enter_res = screenact.press("enter")
+            if not enter_res.ok:
+                return outcome.failed("browser_control", f"Enter after typing failed in {bname}: {enter_res.error}", browser=bname, **cdiag)
+        after_type = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+        after_vals = " ".join(
+            str(getattr(e, "value", "") or getattr(e, "name", "") or "")
+            for e in (getattr(after_type.get("view"), "elements", ()) or ())
+        ).casefold()
+        typed_confirmed = bool(text_val and text_val.splitlines()[0].strip().casefold() in after_vals)
+        if is_wa_composer:
+            from core import desktop_control as _dc
+            _dc.record_diagnostics(
+                active_application="WhatsApp (Chrome)",
+                typing_status=("verified" if typed_confirmed else "typed_unverified"),
+                sending_status="not_sent",
+                last_keyboard_status="ok",
+            )
+        return outcome.done(
+            "browser_control", action=action, browser=bname,
+            control_mode="native_windows",
+            requested_action=action,
+            target=(target_label or desc or "search bar"),
+            detection_source=detection_source,
+            execution_status="completed",
+            verification_status=("verified" if typed_confirmed else "input_dispatched"),
+            text_entered=True, entered_text=text_val,
+            message_sent=(False if is_wa_composer else None),
+            verified=True, **cdiag,
+        )
+
+    if action in ("play_video", "smart_click", "click", "left_click", "right_click", "double_click", "replay_video"):
+        desc = str(params.get("description") or params.get("text") or params.get("selector") or "").strip()
+        if action == "replay_video" and not _parse_ordinal_index(desc):
+            key_res = screenact.press("0")
+            if not key_res.ok:
+                return outcome.failed("browser_control", f"replay key failed in {bname}: {key_res.error}", browser=bname)
+            return outcome.done(
+                "browser_control", action="replay_video", browser=bname,
+                control_mode="native_windows", cdp_available=False,
+                replayed=True, playback_verified=False, verified=False,
+                detail="Sent YouTube restart key '0' to active Chrome window; HTML5 video time cannot be read without CDP.",
+            )
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
+        try:
+            from core import desktop_control as _dc
+            _auth_ctx = _dc.current_bound_auth_context()
+            _cur_task_id = str(getattr(_auth_ctx, "task_id", "") or "") if _auth_ctx is not None else ""
+        except Exception:
+            _dc, _auth_ctx, _cur_task_id = None, None, ""
+        desc_cf = desc.casefold()
+        _is_pronoun_target = desc_cf in {
+            "it", "that", "this", "that one", "this one", "that video", "this video",
+            "open it", "open that", "click it", "click that", "play it", "play that",
+            "yes click it", "select it", "that field", "that bar",
+            "second one", "the second one", "first one", "the first one", "third one", "the third one",
+        }
+        _resolved_ref = (
+            _dc.resolve_target_reference(desc, auth_context=_auth_ctx, request_text=str(getattr(_auth_ctx, "instruction", "") or ""))
+            if (_dc is not None and _is_pronoun_target and (_auth_ctx is not None or _dc.get_active_target(None))) else None
+        )
+        if _resolved_ref is not None and sync.get("empty_home"):
+            _resolved_ref = None
+        if _resolved_ref is not None:
+            ref_tab = str(_resolved_ref.get("tab_title") or "").strip().casefold()
+            cur_tab = str(sync.get("title") or "").strip().casefold()
+            if ref_tab and cur_tab and ref_tab != cur_tab:
+                _resolved_ref = None
+        _is_search_target = _is_search_bar_query(desc) or (
+            _resolved_ref is not None and _resolved_ref.get("target_type") == "search_bar"
+        )
+        if _is_search_target:
+            sb = _locate_youtube_search_bar_native(sync, bname, desc or "YouTube search bar")
+            if sb is None and "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold():
+                from plugins import _whatsapp_core as _wa
+                sb = _wa.locate_whatsapp_search_bar(sync.get("view"))
+            if sb is None and _resolved_ref and _resolved_ref.get("point"):
+                sx, sy = _resolved_ref["point"]
+                sb = {"x": sx, "y": sy, "label": _resolved_ref.get("exact_target_name") or "YouTube search bar", "source": _resolved_ref.get("extraction_source") or "active_target"}
+            if sb is None:
+                return outcome.failed(
+                    "browser_control",
+                    f"Could not find the YouTube search bar in the active {bname} window ({sync.get('title', '')})",
+                    action=action, browser=bname, task_id=_cur_task_id,
+                    execution_status="failed", verification_status="unverified",
+                    control_mode="native_windows", cdp_available=False,
+                )
+            pt = screenact.Point(sb["x"], sb["y"], origin="element", label=sb["label"])
+            mv, clk, cdiag = _click_diag(action, pt)
+            if not clk.ok:
+                return outcome.failed(
+                    "browser_control", f"{action} on YouTube search bar failed: {clk.error}",
+                    action=action, resolved_target=sb["label"], browser=bname, task_id=_cur_task_id,
+                    execution_status="failed", verification_status="unverified", **cdiag,
+                )
+            if _dc is not None:
+                _dc.set_active_target(
+                    target_type="search_bar", exact_target_name=sb["label"],
+                    browser=bname, tab_title=sync.get("title", ""), tab_url=sync.get("url", ""),
+                    point=(sb["x"], sb["y"]), confidence=("high" if "uia" in sb["source"] else "medium"),
+                    extraction_source=sb["source"], auth_context=_auth_ctx,
+                )
+            return outcome.done(
+                "browser_control", action=action, browser=bname, task_id=_cur_task_id,
+                control_mode="native_windows", cdp_available=False,
+                resolved_target=sb["label"], target=sb["label"], detection_source=sb["source"],
+                execution_status="completed", verification_status=("verified" if mv.ok and clk.ok else "unverified"),
+                x=sb["x"], y=sb["y"], cursor_moved=mv.ok,
+                click_executed=clk.ok, verified=True, **cdiag,
+            )
+        if (
+            "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold()
+            and action in {"smart_click", "click", "left_click"}
+            and desc
+            and (
+                (_resolved_ref is not None and _resolved_ref.get("target_type") == "contact")
+                or any(k in desc_cf for k in ("chat", "contact"))
+                or desc_cf not in {"message box", "composer"}
+            )
+        ):
+            from plugins import _whatsapp_core as _wa
+            c_query = (
+                str(_resolved_ref.get("exact_target_name") or "")
+                if (_resolved_ref is not None and _resolved_ref.get("target_type") == "contact")
+                else re.sub(r"\b(?:open|select|click|chat|contact)\b", "", desc, flags=re.IGNORECASE).strip() or desc
+            )
+            wa_contacts = _wa.extract_whatsapp_contacts(sync.get("view"), query=c_query)
+            if wa_contacts:
+                exact = [c for c in wa_contacts if c["display_name"].casefold() == c_query.casefold()]
+                chosen_c = exact[0] if len(exact) == 1 else (wa_contacts[0] if len(wa_contacts) == 1 else None)
+                if chosen_c is None:
+                    names = ", ".join(c["display_name"] for c in wa_contacts[:4])
+                    return outcome.ask(
+                        "browser_control",
+                        f"I see {len(wa_contacts)} unique contacts matching {c_query!r}: {names}. Which one should I open?",
+                        browser=bname, unique_contact_count=len(wa_contacts), verified=False,
+                    )
+                pt = screenact.Point(chosen_c["point"][0], chosen_c["point"][1], origin="element", label=chosen_c["display_name"])
+                mv, clk, cdiag = _click_diag(action, pt, rect_info=chosen_c.get("rect"))
+                if not clk.ok:
+                    return outcome.failed("browser_control", f"clicking contact {chosen_c['display_name']!r} failed: {clk.error}", action=action, browser=bname, **cdiag)
+                time.sleep(0.35)
+                _registry.invalidate_sync(bname)
+                after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
+                hdr = _wa.verify_selected_chat(after.get("view"), expected_contact=chosen_c["display_name"])
+                chat_id = str(chosen_c.get("id") or _wa.draft_hash(chosen_c["display_name"]))
+                if _dc is not None:
+                    _dc.set_active_target(
+                        target_type="contact", exact_target_name=chosen_c["display_name"],
+                        browser=bname, tab_title=after.get("title", ""), tab_url=after.get("url", ""),
+                        result_position=chosen_c.get("position", 1), point=chosen_c["point"], rect=chosen_c.get("rect"),
+                        confidence=chosen_c.get("confidence", "high"), extraction_source=chosen_c.get("source", ""),
+                        auth_context=_auth_ctx,
+                    )
+                    _dc.record_diagnostics(
+                        active_application="WhatsApp (Chrome)",
+                        active_contact=chosen_c["display_name"],
+                        active_chat_id=chat_id,
+                        selected_chat_verified=bool(hdr.get("verified")),
+                        unique_contact_count=len(wa_contacts),
+                    )
+                return outcome.done(
+                    "browser_control", action=action, browser=bname, task_id=_cur_task_id,
+                    control_mode="native_windows", resolved_target=chosen_c["display_name"],
+                    active_contact=chosen_c["display_name"], active_chat_id=chat_id,
+                    unique_contact_count=len(wa_contacts), selected_chat_verified=bool(hdr.get("verified")),
+                    verification_status=("verified" if hdr.get("verified") else "input_dispatched"),
+                    cursor_moved=mv.ok, click_executed=clk.ok, verified=True, **cdiag,
+                )
+        videos = sync.get("videos") or []
+        if _resolved_ref is not None and _resolved_ref.get("target_type") == "video":
+            # Prefer freshly re-observed matching item by title/position when present,
+            # falling back cleanly to the fresh resolved target snapshot (<=120s).
+            ref_title = str(_resolved_ref.get("exact_target_name") or "").strip()
+            ref_pos = _resolved_ref.get("result_position")
+            matched_fresh = next(
+                (v for v in videos if ref_title and v["title"].casefold() == ref_title.casefold()),
+                None,
+            )
+            if matched_fresh is None and ref_pos and 1 <= int(ref_pos) <= len(videos):
+                matched_fresh = videos[int(ref_pos) - 1]
+            chosen = matched_fresh or (
+                {
+                    "position": ref_pos or 1,
+                    "title": ref_title or "video",
+                    "point": _resolved_ref["point"],
+                    "source": _resolved_ref.get("extraction_source") or "active_target",
+                }
+                if _resolved_ref.get("point") else None
+            )
+            if chosen is not None:
+                cx, cy = chosen["point"]
+                pt = screenact.Point(cx, cy, origin="element", label=chosen["title"])
+                mv, clk, cdiag = _click_diag(action, pt, rect_info=chosen.get("rect"))
+                if not clk.ok:
+                    return outcome.failed(
+                        "browser_control", f"real click on {chosen['title']!r} failed: {clk.error}",
+                        action=action, resolved_target=chosen["title"], browser=bname, task_id=_cur_task_id,
+                        execution_status="failed", verification_status="unverified", **cdiag,
+                    )
+                time.sleep(0.75)
+                _registry.invalidate_sync(bname)
+                after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+                title_changed = bool(after.get("title") and after.get("title") != sync.get("title"))
+                if title_changed:
+                    return outcome.done(
+                        "browser_control",
+                        action=action, browser=bname, task_id=_cur_task_id,
+                        control_mode="native_windows", cdp_available=False,
+                        resolved_target=chosen["title"], target=chosen["title"],
+                        execution_status="completed", verification_status="verified",
+                        position=chosen["position"], title=chosen["title"],
+                        source=chosen["source"], cursor_moved=mv.ok, click_executed=clk.ok,
+                        playback_verified=False, resulting_title=after.get("title", ""),
+                        detail=f"The video is {chosen['title']!r}. Clicked it in {bname}.",
+                        verified=True, **cdiag,
+                    )
+                return outcome.unverified(
+                    "browser_control",
+                    "I sent the click, Tarun-kun, but I couldn't confirm that the video opened.",
+                    action=action, browser=bname, task_id=_cur_task_id,
+                    control_mode="native_windows", cdp_available=False,
+                    resolved_target=chosen["title"], target=chosen["title"],
+                    execution_status="completed", verification_status="unverified",
+                    position=chosen["position"], title=chosen["title"],
+                    cursor_moved=mv.ok, click_executed=clk.ok, playback_verified=False,
+                    verified=False, **cdiag,
+                )
+        ordinal_idx = _parse_ordinal_index(desc or ("first video" if action == "play_video" else ""))
+        if ordinal_idx is not None:
+            if not videos:
+                if sync.get("empty_home"):
+                    return (
+                        "I see the YouTube home page in Chrome ('Try searching to get started') "
+                        "with 0 visible video results; tell me what to search for or name a specific video title."
+                    )
+                return outcome.unverified(
+                    "browser_control",
+                    "Tarun-kun, I can see YouTube, but I can't reliably read the video titles right now.",
+                    action=action,
+                    browser=bname, task_id=_cur_task_id, cdp_available=False,
+                    window_identity=sync.get("window_identity", ""),
+                    source=sync.get("source", "none"),
+                    timestamp=sync.get("timestamp", ""),
+                    extracted_text_count=sync.get("extracted_text_count", 0),
+                    uia_items=sync.get("uia_items", 0),
+                    ocr_items=sync.get("ocr_items", 0),
+                    confidence=sync.get("confidence", "uncertain"),
+                    execution_status="not_executed",
+                    verification_status="unverified",
+                    target_identified=False,
+                    page_state="unverified",
+                )
+            idx = len(videos) - 1 if ordinal_idx == -1 else ordinal_idx
+            if idx < 0 or idx >= len(videos):
+                return f"I found {len(videos)} eligible non-ad YouTube video results in {bname}; requested position is unavailable, so nothing was clicked."
+            chosen = videos[idx]
+            if _dc is not None:
+                _dc.set_active_target(
+                    target_type="video", exact_target_name=chosen["title"],
+                    browser=bname, tab_title=sync.get("title", ""), tab_url=sync.get("url", ""),
+                    result_position=chosen["position"], point=chosen["point"],
+                    rect=chosen.get("rect"), confidence=chosen.get("confidence", "medium"),
+                    extraction_source=chosen.get("source", ""), results=videos, auth_context=_auth_ctx,
+                )
+            cx, cy = chosen["point"]
+            pt = screenact.Point(cx, cy, origin="element", label=chosen["title"])
+            mv, clk, cdiag = _click_diag(action, pt, rect_info=chosen.get("rect"))
+            if not clk.ok:
+                return outcome.failed(
+                    "browser_control", f"real click on {chosen['title']!r} failed: {clk.error}",
+                    action="play_video", resolved_target=chosen["title"], browser=bname, task_id=_cur_task_id,
+                    execution_status="failed", verification_status="unverified", **cdiag,
+                )
+            time.sleep(0.75)
+            _registry.invalidate_sync(bname)
+            after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+            title_changed = bool(after.get("title") and after.get("title") != sync.get("title"))
+            if title_changed:
+                return outcome.done(
+                    "browser_control",
+                    action="play_video",
+                    browser=bname, task_id=_cur_task_id,
+                    control_mode="native_windows",
+                    resolved_target=chosen["title"], target=chosen["title"],
+                    execution_status="completed", verification_status="verified",
+                    cdp_available=False,
+                    position=chosen["position"],
+                    title=chosen["title"],
+                    source=chosen["source"],
+                    cursor_moved=mv.ok,
+                    click_executed=clk.ok,
+                    playback_verified=False,
+                    resulting_title=after.get("title", ""),
+                    detail=f"The {chosen['position']} video is {chosen['title']!r}. Clicked it in {bname}.",
+                    verified=True, **cdiag,
+                )
+            return outcome.unverified(
+                "browser_control",
+                "I sent the click, Tarun-kun, but I couldn't confirm that the video opened.",
+                action="play_video", browser=bname, task_id=_cur_task_id,
+                control_mode="native_windows", cdp_available=False,
+                resolved_target=chosen["title"], target=chosen["title"],
+                execution_status="completed", verification_status="unverified",
+                position=chosen["position"], title=chosen["title"],
+                source=chosen["source"], cursor_moved=mv.ok, click_executed=clk.ok,
+                playback_verified=False, verified=False, **cdiag,
+            )
+        # Pronoun references with no fresh resolved target ask cleanly instead of guessing
+        if desc.casefold() in {"it", "that", "this", "that video", "this video", "open it", "click it", "click that", "second one", "the second one"}:
+            return outcome.ask(
+                "browser_control",
+                "I couldn't match a fresh visible target for that reference; which video or control should I click, Tarun-kun?",
+                browser=bname, task_id=_cur_task_id, verified=False,
+            )
+        # Non-ordinal named click / title search via UIA/OCR in visible Chrome window
+        view = sync.get("view")
+        if view is not None and desc:
+            needle = desc.casefold()
+            title_m = re.search(r"\b(?:video\s+)?titled\s+[\"']?(.+?)[\"']?$", desc, re.IGNORECASE)
+            if title_m:
+                needle = title_m.group(1).strip().casefold()
+            for v in videos:
+                if needle in v["title"].casefold():
+                    if _dc is not None:
+                        _dc.set_active_target(
+                            target_type="video", exact_target_name=v["title"],
+                            browser=bname, tab_title=sync.get("title", ""), tab_url=sync.get("url", ""),
+                            result_position=v["position"], point=v["point"],
+                            rect=v.get("rect"), confidence=v.get("confidence", "medium"),
+                            extraction_source=v.get("source", ""), results=videos, auth_context=_auth_ctx,
+                        )
+                    pt = screenact.Point(v["point"][0], v["point"][1], origin="element", label=v["title"])
+                    mv, clk, cdiag = _click_diag(action, pt, rect_info=v.get("rect"))
+                    if not clk.ok:
+                        return outcome.failed(
+                            "browser_control", f"real click on {v['title']!r} failed: {clk.error}",
+                            action=action, resolved_target=v["title"], browser=bname, task_id=_cur_task_id,
+                            execution_status="failed", verification_status="unverified", **cdiag,
+                        )
+                    time.sleep(0.75)
+                    _registry.invalidate_sync(bname)
+                    after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+                    title_changed = bool(after.get("title") and after.get("title") != sync.get("title"))
+                    if title_changed:
+                        return outcome.done(
+                            "browser_control", action=action, browser=bname, task_id=_cur_task_id,
+                            control_mode="native_windows", cdp_available=False,
+                            resolved_target=v["title"], target=v["title"],
+                            execution_status="completed", verification_status="verified",
+                            title=v["title"], cursor_moved=mv.ok, click_executed=clk.ok,
+                            playback_verified=False, resulting_title=after.get("title", ""), verified=True, **cdiag,
+                        )
+                    return outcome.unverified(
+                        "browser_control",
+                        "I sent the click, Tarun-kun, but I couldn't confirm that the video opened.",
+                        action=action, browser=bname, task_id=_cur_task_id,
+                        control_mode="native_windows", cdp_available=False,
+                        resolved_target=v["title"], target=v["title"],
+                        execution_status="completed", verification_status="unverified",
+                        title=v["title"], cursor_moved=mv.ok, click_executed=clk.ok,
+                        playback_verified=False, verified=False, **cdiag,
+                    )
+            for el in getattr(view, "elements", ()) or ():
+                label = str(getattr(el, "name", "") or getattr(el, "label", "") or "")
+                if label and needle in label.casefold():
+                    pt = screenact.Point.from_element(el)
+                    mv, clk, cdiag = _click_diag(action, pt, rect_info=getattr(el, "rect", ""))
+                    return outcome.done(
+                        "browser_control", action=action, browser=bname, task_id=_cur_task_id,
+                        control_mode="native_windows", cdp_available=False,
+                        resolved_target=label, target=label,
+                        execution_status=("completed" if clk.ok else "failed"),
+                        verification_status=("verified" if mv.ok and clk.ok else "unverified"),
+                        click_executed=clk.ok, cursor_moved=mv.ok, verified=clk.ok, **cdiag,
+                    )
+        return outcome.failed("browser_control", f"Could not find element {desc!r} in the active {bname} window", action=action, browser=bname, task_id=_cur_task_id, execution_status="failed", verification_status="unverified", cdp_available=False)
+
+    if action == "focus_search":
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
+        sb = _locate_youtube_search_bar_native(sync, bname, str(params.get("description") or "YouTube search bar"))
+        if sb is None:
+            return outcome.failed(
+                "browser_control",
+                f"Could not locate the YouTube search bar in the active {bname} window",
+                action="focus_search", browser=bname, dispatch_status="completed",
+                input_status="failed", verification_status="unverified", cdp_available=False,
+            )
+        pt = screenact.Point(sb["x"], sb["y"], origin="element", label=sb["label"])
+        mv = screenact.move_cursor(pt)
+        clk = screenact.click(pt)
+        if not clk.ok:
+            return outcome.failed(
+                "browser_control", f"clicking YouTube search bar failed: {clk.error}",
+                action="focus_search", browser=bname, resolved_target=sb["label"],
+                dispatch_status="completed", input_status="failed", verification_status="unverified",
+            )
+        return outcome.done(
+            "browser_control", action="focus_search", browser=bname,
+            control_mode="native_windows", cdp_available=False,
+            resolved_target=sb["label"], target=sb["label"], detection_source=sb["source"],
+            dispatch_status="completed", input_status="completed",
+            verification_status=("verified" if mv.ok and clk.ok else "unverified"),
+            cursor_position=f"{sb['x']},{sb['y']}", cursor_moved=mv.ok, click_executed=clk.ok,
+            detail="The YouTube search field is focused. What should I search for?",
+            verified=bool(mv.ok and clk.ok),
+        )
+
+    if action in ("seek_forward", "seek_backward", "set_playback_position"):
+        from core import desktop_control as _dc
+        forward = (action != "seek_backward")
+        raw_val = params.get("seconds") or params.get("value") or params.get("position") or params.get("text")
+        secs = 10
+        if raw_val is not None:
+            m_sec = re.search(r"-?\d+", str(raw_val))
+            if m_sec:
+                secs = max(1, min(600, abs(int(m_sec.group(0)))))
+        before_sync = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+        before_pos = _extract_yt_time_seconds(before_sync.get("view"))
+        # If a search/edit input currently owns focus, press Escape first so player keys reach <video>
+        for el in (getattr(before_sync.get("view"), "elements", ()) or ()):
+            if getattr(el, "focused", False) and str(getattr(el, "role", "") or "").casefold() in {"edit", "combobox", "searchbox"}:
+                screenact.press("escape")
+                time.sleep(0.08)
+                break
+        ten_chunks = secs // 10
+        rem = secs % 10
+        five_chunks = max(1 if ten_chunks == 0 else 0, round(rem / 5))
+        key_big = "l" if forward else "j"
+        key_small = "right" if forward else "left"
+        sent_ok = True
+        for _ in range(ten_chunks):
+            r_k = screenact.press(key_big)
+            sent_ok = sent_ok and bool(r_k.ok)
+            time.sleep(0.05)
+        for _ in range(five_chunks):
+            r_k = screenact.press(key_small)
+            sent_ok = sent_ok and bool(r_k.ok)
+            time.sleep(0.05)
+        if not sent_ok:
+            return outcome.failed(
+                "browser_control", f"seek shortcut failed in {bname}",
+                action=action, browser=bname, dispatch_status="completed",
+                input_status="failed", verification_status="unverified",
+            )
+        time.sleep(0.25)
+        after_sync = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+        after_pos = _extract_yt_time_seconds(after_sync.get("view"))
+        _dc.record_diagnostics(last_media_status=f"{action} {'+' if forward else '-'}{secs}s")
+        pos_changed = (
+            before_pos is not None and after_pos is not None
+            and ((after_pos > before_pos) if forward else (after_pos < before_pos))
+        )
+        if pos_changed:
+            return outcome.done(
+                "browser_control", action=action, browser=bname, control_mode="native_windows",
+                resolved_target=win.get("title", "YouTube video"),
+                dispatch_status="completed", input_status="completed", verification_status="verified",
+                seconds=secs, playback_before=before_pos, playback_after=after_pos,
+                detail=f"Skipped {'forward' if forward else 'backward'} {secs} seconds, Tarun-kun.",
+                verified=True,
+            )
+        return outcome.unverified(
+            "browser_control",
+            f"I sent the {secs}-second {'forward' if forward else 'backward'} seek, Tarun-kun, but couldn't confirm the exact timestamp without DOM access.",
+            action=action, browser=bname, control_mode="native_windows",
+            resolved_target=win.get("title", "YouTube video"),
+            dispatch_status="completed", input_status="completed", verification_status="unverified",
+            seconds=secs, playback_before=before_pos, playback_after=after_pos, verified=False,
+        )
+
+    if action in ("volume_up", "volume_down", "mute", "unmute"):
+        from core import desktop_control as _dc
+        key = {"volume_up": "up", "volume_down": "down", "mute": "m", "unmute": "m"}[action]
+        r_v = screenact.press(key)
+        _dc.record_diagnostics(last_media_status=f"{action}:{'ok' if r_v.ok else 'fail'}")
+        if not r_v.ok:
+            return outcome.failed("browser_control", f"{action} failed in {bname}: {r_v.error}", action=action, browser=bname)
+        return outcome.unverified(
+            "browser_control", f"Sent {action} key to active {bname} window.",
+            action=action, browser=bname, control_mode="native_windows",
+            dispatch_status="completed", input_status="completed", verification_status="unverified",
+        )
+
+    if action in ("pause_video", "resume_video"):
+        from core import desktop_control as _dc
+        k_res = screenact.press("k")
+        _dc.record_diagnostics(last_media_status=f"{action}:{'ok' if k_res.ok else 'fail'}")
+        if not k_res.ok:
+            return outcome.failed("browser_control", f"media toggle failed in {bname}: {k_res.error}", browser=bname)
+        return outcome.done(
+            "browser_control", action=action, browser=bname,
+            control_mode="native_windows", cdp_available=False,
+            dispatch_status="completed", input_status="completed",
+            verification_status="unverified", playback_verified=False, verified=False,
+            detail=("Done, Tarun-kun. Sent play toggle to resume playback." if action == "resume_video" else "Sent play/pause key 'k' to pause the video."),
+        )
+
+    if action == "screenshot":
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=False)
+        return outcome.done(
+            "browser_control", action="screenshot", browser=bname,
+            control_mode="native_windows", window_identity=sync.get("window_identity", ""),
+            target_hwnd=int(win.get("hwnd", 0) or 0), target_pid=int(win.get("pid", 0) or 0),
+            dispatch_status="completed", input_status="completed", verification_status="verified",
+            verified=bool(win.get("foreground")),
+        )
+
+    if action == "scroll":
+        from core import desktop_control as _dc
+        direction = str(params.get("direction") or "down").lower().strip()
+        notches = max(1, min(15, int(params.get("amount", 4) or 4)))
+        if notches > 20:
+            notches = max(1, min(12, notches // 100))
+        res = screenact.scroll(direction, clicks=notches)
+        _dc.record_diagnostics(last_mouse_status=f"scroll:{direction}:{'ok' if res.ok else 'fail'}")
+        if not res.ok:
+            return outcome.failed(
+                "browser_control", f"scroll failed in {bname}: {res.error}",
+                action="scroll", browser=bname, target_hwnd=int(win.get("hwnd", 0) or 0),
+                target_pid=int(win.get("pid", 0) or 0),
+                dispatch_status="completed", input_status="failed", verification_status="unverified",
+            )
+        _registry.invalidate_sync(bname)
+        return outcome.done(
+            "browser_control", action="scroll", browser=bname, control_mode="native_windows",
+            cdp_available=False, direction=direction,
+            target_hwnd=int(win.get("hwnd", 0) or 0), target_pid=int(win.get("pid", 0) or 0),
+            foreground_hwnd=int(win.get("hwnd", 0) or 0),
+            dispatch_status="completed", input_status="completed", verification_status="verified",
+            verified=True,
+        )
+
+    if action in ("back", "forward", "reload", "press", "close_tab"):
+        keymap = {"back": "alt+left", "forward": "alt+right", "reload": "ctrl+r", "close_tab": "ctrl+w"}
+        key = str(params.get("key") or "enter") if action == "press" else keymap[action]
+        res = screenact.press(key)
+        if not res.ok:
+            return outcome.failed("browser_control", f"{action} failed in {bname}: {res.error}", browser=bname)
+        return outcome.done("browser_control", action=action, browser=bname, control_mode="native_windows", cdp_available=False, title=win.get("title", ""), verified=True)
+
+    return _unknown_action(action)
+
+
+def _is_search_bar_query(desc: str) -> bool:
+    cf = str(desc or "").strip().casefold()
+    return cf in {
+        "search", "search bar", "search box", "search field", "searchbox",
+        "youtube search", "youtube search bar", "youtube search box",
+        "youtube search field", "youtube search input",
+    } or ("search" in cf and any(k in cf for k in ("bar", "box", "field", "input", "youtube")))
+
+
+def _detect_youtube_masthead_search_box(monitor: dict | None = None) -> dict | None:
+    """Detect the centered rounded-pill YouTube masthead search box via OpenCV contours.
+
+    Uses DPI scaling ``px`` from ``screenview.capture`` so physical pixels translate
+    accurately to logical desktop cursor coordinates across multi-monitor setups.
+    """
+    try:
+        import cv2
+        import numpy as np
+        from core import screenview
+
+        image, mon, px = screenview.capture(monitor)
+        if image is None or mon is None:
+            return None
+        arr = np.array(image)
+        if arr.ndim < 2 or arr.shape[0] < 240 or arr.shape[1] < 400:
+            return None
+        img_h, img_w = int(arr.shape[0]), int(arr.shape[1])
+        px = float(px or 1.0)
+        # Band strictly below Chrome tabs/omnibox (~80..210 logical px) and central masthead
+        y0 = max(0, min(img_h - 40, int(round(78 * px))))
+        y1 = max(y0 + 40, min(img_h, int(round(210 * px))))
+        x0 = max(0, int(round(img_w * 0.18)))
+        x1 = min(img_w, int(round(img_w * 0.82)))
+        crop = arr[y0:y1, x0:x1]
+        if crop.size == 0:
+            return None
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+        edges = cv2.Canny(gray, 18, 70)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+        closed = cv2.dilate(edges, kernel, iterations=1)
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        best_score = -1.0
+        min_w = int(round(180 * px))
+        max_w = int(round(img_w * 0.58))
+        min_h = int(round(24 * px))
+        max_h = int(round(62 * px))
+        band_mid_x = (x1 - x0) / 2.0
+        for cnt in contours:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            if bw < min_w or bw > max_w or bh < min_h or bh > max_h:
+                continue
+            aspect = bw / max(1.0, float(bh))
+            if aspect < 3.5 or aspect > 28.0:
+                continue
+            cx_local = bx + bw / 2.0
+            center_penalty = abs(cx_local - band_mid_x) / max(1.0, band_mid_x)
+            if center_penalty > 0.45:
+                continue
+            score = bw * (1.2 - center_penalty)
+            if score > best_score:
+                best_score = score
+                best = (x0 + bx, y0 + by, bw, bh)
+        if best is None:
+            return None
+        bx, by, bw, bh = best
+        # Aim into the text input region slightly left of the trailing magnifying glass button
+        lx = int(round(mon["left"] + (bx + bw * 0.42) / px))
+        ly = int(round(mon["top"] + (by + bh * 0.50) / px))
+        return {
+            "x": lx,
+            "y": ly,
+            "label": "YouTube search bar (visual)",
+            "source": "visual_masthead_cv2",
+        }
+    except Exception:
+        return None
+
+
+def _locate_youtube_search_bar_native(sync: dict, bname: str, desc: str) -> dict | None:
+    """Locate the page-level YouTube search input via UIA -> OCR -> '/' probe -> visual masthead.
+
+    Explicitly excludes Chrome's address bar ("Address and search bar" / omnibox).
+    """
+    from core import screenact, screenview
+
+    title_url_cf = (str(sync.get("title") or "") + " " + str(sync.get("url") or "")).casefold()
+    v0 = sync.get("view")
+    v0_elts = list(getattr(v0, "elements", ()) or ()) if v0 is not None else []
+    is_youtube_surface = (
+        "youtube" in title_url_cf
+        or any("youtube" in str(getattr(e, "name", "") or "").casefold() for e in v0_elts)
+    )
+    if "youtube" in str(desc or "").casefold() and title_url_cf and not is_youtube_surface:
+        return None
+
+    def _search_in_view(view) -> dict | None:
+        if view is None:
+            return None
+        mon = getattr(view, "monitor", None) or {}
+        mon_top = int(mon.get("top", 0) or 0)
+        toolbar_floor = mon_top + 85  # Below Chrome tabs + omnibox (~0..82px)
+        header_ceil = mon_top + 240
+        elements = list(getattr(view, "elements", ()) or ())
+        # Pass 1: UIA combobox/edit/searchbox belonging to YouTube page (not Chrome omnibox)
+        for el in elements:
+            role_cf = str(getattr(el, "role", "") or "").casefold()
+            name_cf = str(getattr(el, "name", "") or getattr(el, "label", "") or "").casefold()
+            if "address" in name_cf or "omnibox" in name_cf or "url" in name_cf:
+                continue
+            top = int(getattr(el, "top", 0) or 0)
+            width = int(getattr(el, "width", 0) or 0)
+            if role_cf in {"edit", "combobox", "searchbox"} and top >= toolbar_floor and width >= 80:
+                if "search" in name_cf or getattr(el, "focused", False):
+                    cx, cy = getattr(el, "center", (int(el.left + el.width // 2), int(el.top + el.height // 2)))
+                    return {"x": int(cx), "y": int(cy), "label": el.name or "YouTube search bar", "source": "uia"}
+        # Pass 2: Local OCR "Search" inside YouTube page header band
+        view_src_cf = str(getattr(view, "source", "") or "").casefold()
+        for el in elements:
+            role_cf = str(getattr(el, "role", "") or "").casefold()
+            is_ocr = ("ocr" in role_cf) or (view_src_cf == "ocr" and role_cf in {"text", "ocr_text", ""})
+            name_cf = str(getattr(el, "name", "") or getattr(el, "label", "") or "").strip().casefold()
+            top = int(getattr(el, "top", 0) or 0)
+            width = int(getattr(el, "width", 0) or 0)
+            if is_ocr and toolbar_floor <= top <= header_ceil and name_cf in {"search", "search youtube"}:
+                cx, cy = getattr(el, "center", (int(el.left + max(width, 120) // 2), int(el.top + max(el.height, 24) // 2)))
+                return {"x": int(cx), "y": int(cy), "label": "YouTube search bar (OCR)", "source": "ocr"}
+        return None
+
+    def _record_sb(sb_dict: dict | None) -> dict | None:
+        if sb_dict:
+            try:
+                from core import desktop_control as _dc
+                _dc.set_active_target(
+                    target_type="search_bar",
+                    exact_target_name=str(sb_dict.get("label") or "YouTube search bar"),
+                    browser=bname,
+                    tab_title=str(sync.get("title") or ""),
+                    tab_url=str(sync.get("url") or ""),
+                    point=(int(sb_dict["x"]), int(sb_dict["y"])),
+                    confidence=("high" if "uia" in str(sb_dict.get("source") or "") else "medium"),
+                    extraction_source=str(sb_dict.get("source") or ""),
+                    auth_context=_dc.current_bound_auth_context(),
+                )
+            except Exception:
+                pass
+        return sb_dict
+
+    found = _search_in_view(sync.get("view"))
+    if found:
+        return _record_sb(found)
+    # Pass 3: Focus reveal using YouTube's '/' search shortcut on the verified YouTube Chrome window
+    if is_youtube_surface:
+        try:
+            screenact.press("/")
+            time.sleep(0.18)
+            fresh = screenview.look(budget_s=2.0, allow_ocr=True)
+            found = _search_in_view(fresh)
+            if found:
+                found["source"] = f"{found['source']}_focus_probe"
+                return _record_sb(found)
+        except Exception:
+            pass
+    # Pass 4: Visual screenshot masthead pill detector (OpenCV contours, DPI-scaled)
+    if is_youtube_surface:
+        mon = getattr(v0, "monitor", None) if v0 is not None else None
+        vis = _detect_youtube_masthead_search_box(monitor=mon)
+        if vis:
+            return _record_sb(vis)
+    return None
+
+
 def locate_control_screen_point(description: str, app_hint: str = "") -> dict | None:
     """Resolve desktop screen coordinates for a control in the active browser session."""
     app_cf = str(app_hint or "").casefold()
@@ -2091,6 +4262,37 @@ def locate_control_screen_point(description: str, app_hint: str = "") -> dict | 
             browser = b
             break
     if not _registry.has(browser):
+        bname = browser or _registry._active_browser or "chrome"
+        try:
+            from core import desktop_control as _dc
+            desc = str(description or "").strip()
+            if desc.casefold() in {"it", "that", "this", "that video", "this video", "open it", "click it", "click that", "second one", "the second one", "that field", "that bar"}:
+                ref = _dc.resolve_target_reference(desc, auth_context=_dc.current_bound_auth_context())
+                if ref and ref.get("point"):
+                    rx, ry = ref["point"]
+                    return {"x": int(rx), "y": int(ry), "label": ref.get("exact_target_name") or desc, "source": ref.get("extraction_source") or "active_target"}
+            sync = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
+            if _is_search_bar_query(desc):
+                sb = _locate_youtube_search_bar_native(sync, bname, desc)
+                if sb is not None:
+                    return sb
+            ord_idx = _parse_ordinal_index(desc)
+            videos = sync.get("videos") or []
+            if ord_idx is not None and videos:
+                idx = len(videos) - 1 if ord_idx == -1 else ord_idx
+                if 0 <= idx < len(videos):
+                    px, py = videos[idx]["point"]
+                    return {"x": px, "y": py, "label": videos[idx]["title"]}
+            view = sync.get("view")
+            if view is not None and desc:
+                needle = desc.casefold()
+                for el in getattr(view, "elements", ()) or ():
+                    name = str(getattr(el, "name", "") or getattr(el, "label", "") or "")
+                    if name and needle in name.casefold():
+                        pt = el.center
+                        return {"x": int(pt[0]), "y": int(pt[1]), "label": name}
+        except Exception:
+            pass
         return None
     try:
         sess = _registry.get(browser)
@@ -2098,12 +4300,15 @@ def locate_control_screen_point(description: str, app_hint: str = "") -> dict | 
     except Exception:
         return None
 
-# Every action this tool answers to. One list, used by the failure message and
-# by nothing else — it exists so that being told "that is not an action" also
-# tells you what the actions ARE.
+
 _ACTIONS = (
-    "go_to", "search", "new_tab", "switch_tab", "close_tab", "inspect",
-    "click", "smart_click", "type", "smart_type", "fill_form", "press",
+    "go_to", "search", "focus_search", "search_contact", "select_contact",
+    "compose_message", "update_draft",
+    "new_tab", "switch_tab", "close_tab", "inspect",
+    "click", "left_click", "right_click", "double_click", "smart_click", "type", "smart_type", "fill_form", "press",
+    "pause_video", "resume_video", "play_video", "replay_video",
+    "seek_forward", "seek_backward", "set_playback_position",
+    "volume_up", "volume_down", "mute", "unmute",
     "scroll", "get_text", "get_url", "screenshot",
     "back", "forward", "reload",
     "switch", "list_browsers", "close", "close_all",
@@ -2205,12 +4410,13 @@ def _browser_control_impl(
     # opens here. The only exception: if an automation flow is already running,
     # navigation continues in that window (so multi-step tasks aren't split).
     if action in ("go_to", "search", "new_tab"):
+        _registry.invalidate_sync(browser)
         if _registry.has(browser):
             sess = _registry.get(browser)
             try:
                 if action == "search":
                     result = sess.run(sess.search(params.get("query", ""),
-                                                  params.get("engine", "google")))
+                                                  params.get("engine", "")))
                 elif action == "new_tab":
                     result = sess.run(sess.new_tab(params.get("url", "")))
                 else:
@@ -2223,8 +4429,14 @@ def _browser_control_impl(
             return result
 
         if action == "search":
-            base    = _SEARCH_ENGINES.get(params.get("engine", "google").lower(),
-                                          _SEARCH_ENGINES["google"])
+            eng = str(params.get("engine") or "").lower().strip()
+            if not eng:
+                tabs_hint = " ".join(inspect_open_chrome_tabs_local(select_browser(browser))).casefold()
+                if "youtube" in tabs_hint or "youtube" in str(_registry._last_native_url or "").casefold():
+                    eng = "youtube"
+                else:
+                    eng = "google"
+            base    = _SEARCH_ENGINES.get(eng, _SEARCH_ENGINES["google"])
             nav_url = base + params.get("query", "").replace(" ", "+")
         else:
             nav_url = params.get("url", "").strip()
@@ -2247,7 +4459,11 @@ def _browser_control_impl(
 
     # Native read-only inspection or explicit tab close when no Playwright session is attached yet
     if action in ("get_url", "get_text", "inspect") and not _registry.has(browser):
-        bname = browser or _registry._active_browser or _detect_running_browser() or _detect_default_browser()
+        bname = select_browser(browser)
+        if not _discover_running_cdp_endpoint(bname):
+            result = _native_browser_action(action, params, bname, player=player)
+            _log(player, result)
+            return result
         tabs = inspect_open_chrome_tabs_local(bname)
         if tabs:
             result = outcome.done(
@@ -2265,7 +4481,7 @@ def _browser_control_impl(
         return result
 
     if action == "close_tab" and not _registry.has(browser):
-        bname = browser or _registry._active_browser or _detect_running_browser() or _detect_default_browser()
+        bname = select_browser(browser)
         try:
             from core import screenact, screenview
             act = screenact.focus_app(bname)
@@ -2274,6 +4490,7 @@ def _browser_control_impl(
                 if bname in str(fg_app or "").casefold() or (bname == "edge" and "msedge" in str(fg_app or "").casefold()):
                     key_act = screenact.press("ctrl+w")
                     if key_act.ok:
+                        _registry.invalidate_sync(bname)
                         result = outcome.done(
                             "browser_control", action="close_tab",
                             browser=bname, closed_title=fg_title, verified=True,
@@ -2290,12 +4507,24 @@ def _browser_control_impl(
         _log(player, result)
         return result
 
+    # When the user's real Chrome (or selected browser) is already running without CDP,
+    # operate on that actual visible window instead of spawning a blank REM profile.
+    selected_b = select_browser(browser)
+    if _should_use_native_window(selected_b):
+        result = _native_browser_action(action, params, selected_b, player=player)
+        _log(player, result)
+        return result
+
     # ── Interactive actions (click/type/read…) ───────────────────────────────
     # These require a physically controllable browser; the automation window
     # only opens here, and as soon as it opens it goes to the user's last
     # navigated page — it doesn't sit on a blank page.
     try:
         sess = _registry.get(browser)
+    except _SeparateProfileBlockedError:
+        result = _native_browser_action(action, params, selected_b, player=player)
+        _log(player, result)
+        return result
     except Exception as e:
         result = f"Could not start browser session: {e}"
         _log(player, result)
@@ -2315,8 +4544,31 @@ def _browser_control_impl(
                     safe_origin = "stored page"
                 print(f"[Browser] Could not resume {safe_origin} ({type(e).__name__})")
 
-        if action == "click":
+        if action in ("click", "left_click"):
             result = sess.run(sess.click(params.get("selector"), params.get("text")))
+            if _needs_visual_fallback(result):
+                fb = _try_ocr_click_fallback(browser, params.get("text") or params.get("description") or "")
+                if fb:
+                    result = fb
+        elif action in ("right_click", "double_click"):
+            desc = str(params.get("description") or params.get("text") or params.get("selector") or "").strip()
+            pt_info = sess.run(sess.locate_element_screen_rect(desc)) if desc else None
+            if pt_info and "x" in pt_info and "y" in pt_info:
+                from core import screenact
+                pt = screenact.Point(int(pt_info["x"]), int(pt_info["y"]), origin="element", label=desc)
+                mv = screenact.move_cursor(pt)
+                clk = screenact.right_click(pt) if action == "right_click" else screenact.double_click(pt)
+                if clk.ok:
+                    result = outcome.done(
+                        "browser_control", action=action, browser=browser or sess.browser_name,
+                        control_mode="cdp_plus_os_input", target=desc,
+                        x=int(pt_info["x"]), y=int(pt_info["y"]),
+                        cursor_moved=mv.ok, click_executed=True, verified=True,
+                    )
+                else:
+                    result = outcome.failed("browser_control", f"{action} on {desc!r} failed: {clk.error}")
+            else:
+                result = outcome.failed("browser_control", f"Could not locate {desc!r} for {action} in {browser or sess.browser_name}")
         elif action == "type":
             result = sess.run(sess.type_text(
                 params.get("selector"), params.get("text", ""), params.get("clear_first", True)))
@@ -2326,6 +4578,10 @@ def _browser_control_impl(
             result = sess.run(sess.fill_form(params.get("fields", {})))
         elif action == "smart_click":
             result = sess.run(sess.smart_click(params.get("description", "")))
+            if _needs_visual_fallback(result):
+                fb = _try_ocr_click_fallback(browser, params.get("description") or params.get("text") or "")
+                if fb:
+                    result = fb
         elif action == "smart_type":
             result = sess.run(sess.smart_type(params.get("description", ""), params.get("text", "")))
         elif action == "get_text":
@@ -2338,6 +4594,35 @@ def _browser_control_impl(
             result = sess.run(sess.switch_tab(params.get("target") or params.get("text") or ""))
         elif action == "press":
             result = sess.run(sess.press(params.get("key", "Enter")))
+        elif action == "focus_search":
+            result = sess.run(sess.focus_search_cdp())
+        elif action == "pause_video":
+            result = sess.run(sess.pause_video())
+        elif action == "resume_video":
+            result = sess.run(sess.resume_video())
+        elif action in ("seek_forward", "seek_backward", "set_playback_position"):
+            raw_v = params.get("seconds") or params.get("value") or params.get("position") or 10
+            try:
+                sec_v = float(raw_v)
+            except (TypeError, ValueError):
+                sec_v = 10.0
+            if action == "seek_backward":
+                sec_v = -abs(sec_v)
+            elif action == "seek_forward":
+                sec_v = abs(sec_v)
+            result = sess.run(sess.seek_video(sec_v))
+        elif action in ("volume_up", "volume_down", "mute", "unmute"):
+            key_map = {"volume_up": "ArrowUp", "volume_down": "ArrowDown", "mute": "m", "unmute": "m"}
+            result = sess.run(sess.press(key_map[action]))
+        elif action == "play_video":
+            desc = params.get("description") or params.get("text") or "first video"
+            result = sess.run(sess.smart_click(desc))
+            if _needs_visual_fallback(result):
+                fb = _try_ocr_click_fallback(browser, desc)
+                if fb:
+                    result = fb
+        elif action == "replay_video":
+            result = sess.run(sess.replay_video(params.get("description") or params.get("text") or ""))
         elif action == "close_tab":
             result = sess.run(sess.close_tab())
         elif action == "screenshot":
@@ -2348,6 +4633,8 @@ def _browser_control_impl(
             result = sess.run(sess.forward())
         elif action == "reload":
             result = sess.run(sess.reload())
+        elif action in ("search_contact", "select_contact", "compose_message", "update_draft"):
+            result = _native_browser_action(action, browser, params)
         else:
             result = _unknown_action(action)
 
@@ -2372,6 +4659,80 @@ def _browser_control_impl(
 
     _log(player, result)
     return result
+
+
+def _needs_visual_fallback(result: object) -> bool:
+    text = str(result or "").casefold()
+    return (
+        text.startswith("status=failed")
+        or "no matching" in text
+        or "no visible" in text
+        or "could not find" in text
+    )
+
+
+def _try_ocr_click_fallback(browser_name: str, target_desc: str) -> str | None:
+    """Level-2 visual OCR/UIA click fallback inside the selected browser window when DOM misses."""
+    target = str(target_desc or "").strip()
+    if not target:
+        return None
+    risky = ("send", "submit", "delete", "remove", "purchase", "buy",
+             "place order", "pay", "transfer", "install", "allow access")
+    if any(r in target.casefold() for r in risky):
+        return None
+    try:
+        from core import screenact, screenview
+        from memory import config_manager
+        if not config_manager.get_local_screen_observation_enabled():
+            return None
+        avail = screenact.available()
+        if not (avail[0] if isinstance(avail, tuple) else avail):
+            return None
+        bname = str(browser_name or "chrome").casefold()
+        fg_app, _, _, _ = screenview._foreground()
+        expected_proc = "msedge" if bname == "edge" else bname
+        if expected_proc not in str(fg_app or "").casefold():
+            act = screenact.focus_app(bname)
+            if not act.ok:
+                return None
+            fg_app, _, _, _ = screenview._foreground()
+            if expected_proc not in str(fg_app or "").casefold():
+                return None
+        view = screenview.look(allow_ocr=True)
+        elements = list(getattr(view, "elements", ()) or ())
+        if not elements:
+            return None
+        needle = target.casefold()
+        tokens = [t for t in re.findall(r"[a-z0-9]+", needle) if len(t) >= 2]
+        best = None
+        for el in elements:
+            label = str(getattr(el, "label", "") or "").strip()
+            if not label:
+                continue
+            low = label.casefold()
+            if needle == low or needle in low:
+                best = el
+                break
+            if best is None and tokens and all(tok in low for tok in tokens):
+                best = el
+        if best is None:
+            return None
+        click_res = screenact.click(best)
+        if not click_res.ok:
+            return None
+        pt = getattr(click_res, "point", None) or getattr(best, "center", (0, 0))
+        return outcome.done(
+            "browser_control",
+            action="click",
+            browser=bname,
+            target=best.label,
+            method="ocr_fallback",
+            x=int(pt[0]),
+            y=int(pt[1]),
+            verified=True,
+        )
+    except Exception:
+        return None
 
 
 def browser_control(parameters: dict = None, response=None, player=None,
@@ -2456,7 +4817,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | inspect | press | new_tab | switch_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | click | left_click | type | scroll | fill_form | smart_click | smart_type | pause_video | resume_video | play_video | replay_video | get_text | get_url | inspect | press | new_tab | switch_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
             },
             "browser": {
                 "type": "STRING",

@@ -615,6 +615,62 @@ def _is_reconnect_signal(exc: BaseException) -> bool:
     return False
 
 
+def _classify_live_error(exc: BaseException, *, closing: bool = False) -> dict:
+    """Safely classify Gemini Live receive/session failures without leaking secrets or API keys."""
+    if closing and isinstance(exc, asyncio.CancelledError):
+        return {
+            "category": "shutdown_cancel",
+            "code": "",
+            "reason": "application shutdown cancellation",
+            "temporary": False,
+            "fatal": True,
+            "drop_resume": False,
+        }
+    raw = str(exc or "")
+    # Scrub any API keys / bearer tokens from error summaries
+    safe_msg = re.sub(r"(?:AIza[0-9A-Za-z\-_]{10,}|key=[^&\s]+|Bearer\s+\S+)", "[redacted]", raw, flags=re.IGNORECASE)
+    low = safe_msg.casefold()
+    code = getattr(exc, "code", None)
+    if code is None:
+        m_code = re.search(r"\b(100[0-8]|101[0-5])\b", safe_msg)
+        code = m_code.group(1) if m_code else ""
+    code_str = str(code or "")
+
+    if _is_live_inactivity_close(exc) or code_str == "1008":
+        return {"category": "inactivity_close_1008", "code": code_str or "1008", "reason": safe_msg[:180], "temporary": True, "fatal": False, "drop_resume": True}
+    if any(k in low for k in ("resum", "handle", "invalid_argument", "not_found")):
+        return {"category": "resumption_rejected", "code": code_str, "reason": safe_msg[:180], "temporary": True, "fatal": False, "drop_resume": True}
+    if "api key not valid" in low or code_str == "1007" or "permission_denied" in low:
+        return {"category": "auth_invalid", "code": code_str, "reason": safe_msg[:180], "temporary": False, "fatal": True, "drop_resume": True}
+    if any(k in low for k in ("resource_exhausted", "quota", "429", "rate limit", "too many requests")):
+        return {"category": "quota_or_rate_limit", "code": code_str, "reason": safe_msg[:180], "temporary": True, "fatal": False, "drop_resume": False}
+    if any(k in low for k in ("timeout", "timed out", "getaddrinfo", "connectionrefused", "connectionreset", "oserror", "cannot connect", "1006", "1011", "goaway", "unavailable")):
+        return {"category": "network_or_ws_transient", "code": code_str, "reason": safe_msg[:180], "temporary": True, "fatal": False, "drop_resume": False}
+    if isinstance(exc, asyncio.CancelledError) or "cancellederror" in low or "apierror" in low:
+        return {"category": "transient_api_error", "code": code_str, "reason": safe_msg[:180], "temporary": True, "fatal": False, "drop_resume": False}
+    return {"category": "live_session_error", "code": code_str, "reason": safe_msg[:180], "temporary": True, "fatal": False, "drop_resume": False}
+
+
+_REM_LEADING_ASR_RE = re.compile(
+    r"^\s*ram\b(?:\s*[,:]\s*|\s+(?=(?:open|search|find|click|select|write|compose|translate|replace|remove|send|call|ring|play|pause|resume|scroll|close|check|look|tell|show|what|kholo|dekho|bhejo|likho|karo)\b))",
+    re.IGNORECASE,
+)
+
+
+def _normalize_rem_address(text: str) -> str:
+    """Normalize leading ASR mishearing 'Ram, open...' -> 'REM, open...' without touching mid-sentence RAM hardware talk."""
+    return _REM_LEADING_ASR_RE.sub("REM ", str(text or "")).strip()
+
+
+def _next_live_backoff(previous_s: float, *, attempt: int = 1) -> float:
+    """Bounded exponential backoff with deterministic jitter (prevents zero-second reconnect storms)."""
+    import random
+    base = 1.5 * (2 ** max(0, min(attempt - 1, 5)))
+    capped = max(float(previous_s or 0.0), base)
+    delay = min(45.0, max(1.0, capped))
+    return round(delay + random.uniform(0.25, 0.95), 2)
+
+
 def _is_live_inactivity_close(exc: BaseException) -> bool:
     """Identify Gemini Live's documented 1008 inactivity close, including
     the ExceptionGroup wrapper produced by asyncio.TaskGroup.
@@ -1052,13 +1108,20 @@ class RemLive:
                                   f"the tool raised an error ({type(e).__name__}); no success is confirmed")
         return outcome.failed(name, "no tool with this name is available")
 
-    def _record_user_request(self, text: str, source: str) -> None:
+    def _record_user_request(self, text: str, source: str, *, turn_task_id: str = "") -> None:
         """Record direct user input only; tool results never pass through here."""
         if source not in {"voice", "typed", "dashboard", "telegram", "ui"}:
             raise ValueError("invalid direct request source")
-        cleaned = str(text or "").strip()
+        cleaned = _normalize_rem_address(str(text or "").strip())
         session_id = ""
         ttl = None
+        browser = ""
+        browser_task_id = ""
+        parent_instruction = ""
+        stable_task_id = str(turn_task_id or "").strip() or (
+            str(getattr(self, "_current_voice_turn_task_id", "") or "").strip() if source == "voice" else ""
+        )
+        root_task_id = ""
         if source in {"voice", "typed", "dashboard", "ui"}:
             try:
                 from core import autonomous_mode
@@ -1072,13 +1135,141 @@ class RemLive:
                 pass
             if cleaned:
                 self._last_user_text_for_expr = cleaned
+                try:
+                    from core import desktop_control
+                    explicit_b = desktop_control.extract_browser_name(cleaned)
+                    low = cleaned.casefold()
+                    is_browser_turn = bool(explicit_b) or any(w in low for w in (
+                        "youtube", "google", "whatsapp", "browser", "website", "tab",
+                        "video", "result", "thumbnail", "pause", "resume", "replay", "again",
+                        "restart", "next", "scroll", "search", "cursor", "mouse", "pointer",
+                        "click", "double", "right", "left", "hold", "release", "here",
+                        "move", "hover", "center", "drag", "type", "enter", "return",
+                        "backspace", "escape", "delete", "select", "copy", "paste", "undo",
+                        "shortcut", "hotkey", "play", "watch", "open", "close",
+                        "back", "forward", "backward", "seek", "rewind", "skip",
+                        "reload", "refresh", "screenshot", "capture",
+                        "chat", "contact", "message", "compose", "draft", "write",
+                        "translate", "hindi", "english", "replace", "remove", "clear", "previous",
+                        "send", "deliver", "call", "ring", "dial", "try again", "continue",
+                        "shorter", "shorten", "natural", "rewrite", "rio",
+                        "first", "second", "third", "fourth", "fifth", "sixth", "last", "titled",
+                    ))
+                    unrelated_non_browser = any(w in low for w in (
+                        "volume", "brightness", "wifi", "mute", "unmute", "shutdown",
+                        "shut down", "restart computer", "lock screen", "sleep display",
+                        "weather", "what time", "alarm", "reminder", "camera", "webcam",
+                        "cancel task", "never mind", "forget it", "stop everything",
+                        "open notepad", "open calculator",
+                    ))
+                    pronoun_or_confirm_words = {
+                        "it", "that", "this", "one", "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "do",
+                    }
+                    hindi_desktop_phrases = (
+                        "स्क्रीन", "देखो", "वीडियो", "क्लिक", "टाइप", "सर्च", "खोलो", "चलाओ", "रोको",
+                        "आगे", "पीछे",
+                        "screen", "dekho", "kholo", "chalao", "chala", "roko", "video", "search karo",
+                        "click karo", "type karo", "aage", "peeche",
+                    )
+                    lang_detected = detect_language(cleaned)
+                    is_hindi_command = (lang_detected == "Hindi") and any(p in low for p in hindi_desktop_phrases)
+                    is_hindi_chatter = (lang_detected == "Hindi") and not is_browser_turn and not is_hindi_command
+                    req_tokens = set(re.findall(r"[a-z0-9]+", low))
+                    prev_bt = getattr(self, "_active_browser_task", None)
+                    last_q = str(getattr(self, "_last_assistant_question", "") or "").strip()
+                    word_count = len(cleaned.split())
+                    has_live_bt = (
+                        bool(prev_bt)
+                        and not desktop_control.should_stop()
+                        and float(prev_bt.get("expires_at", 0) or 0) > time.monotonic()
+                    )
+                    # Short direct answers (e.g. "short" after REM asks "What would you like me to type?"),
+                    # clarification confirmations ("Yes, click it."), and anaphoric target turns belong to
+                    # the active uninterrupted browser/desktop task rather than clearing it.
+                    is_short_followup = (
+                        has_live_bt
+                        and not unrelated_non_browser
+                        and not is_hindi_chatter
+                        and (word_count <= 5 or bool(last_q) or bool(req_tokens & {"it", "that", "this", "one"}))
+                    )
+                    now_m = time.monotonic()
+                    if desktop_control.should_stop():
+                        self._active_browser_task = None
+                        self._last_assistant_question = ""
+                        desktop_control.clear_task_targets()
+                    elif is_browser_turn or is_short_followup or is_hindi_command:
+                        if has_live_bt:
+                            browser = explicit_b or str(prev_bt.get("browser") or "")
+                            browser_task_id = str(prev_bt.get("task_id") or "")
+                            parent_instruction = str(prev_bt.get("last_instruction") or "").strip()
+                            prev_history = list(prev_bt.get("spoken_inputs") or ())
+                            if not is_browser_turn and parent_instruction:
+                                root_task_id = browser_task_id
+                        else:
+                            prev_history = []
+                        if not browser_task_id:
+                            import uuid as _uuid
+                            browser_task_id = _uuid.uuid4().hex
+                        if explicit_b:
+                            browser = explicit_b
+                        if browser_task_id:
+                            stable_task_id = browser_task_id
+                            root_task_id = browser_task_id
+                        if not prev_history or prev_history[-1] != cleaned:
+                            prev_history.append(cleaned)
+                        prev_history = prev_history[-8:]
+                        recorded_parent = (
+                            f"{parent_instruction} -> {cleaned}".strip()
+                            if (not is_browser_turn and parent_instruction and len(parent_instruction) < 200)
+                            else cleaned
+                        )
+                        if has_live_bt and last_q and word_count <= 5 and not (req_tokens & pronoun_or_confirm_words):
+                            desktop_control.set_active_typing_payload(
+                                cleaned, task_id=stable_task_id, browser_task_id=browser_task_id,
+                            )
+                        self._active_browser_task = {
+                            "task_id": browser_task_id,
+                            "browser": browser,
+                            "expires_at": now_m + 600.0,
+                            "last_instruction": recorded_parent,
+                            "spoken_inputs": tuple(prev_history),
+                        }
+                    elif is_hindi_chatter and has_live_bt:
+                        # An unrelated Hindi conversational remark must NOT authorize browser clicks on its
+                        # own turn, AND must NOT destroy the valid active browser task waiting underneath.
+                        self._active_browser_task["expires_at"] = now_m + 600.0
+                    else:
+                        # Explicitly unrelated request must not inherit browser task authorization
+                        if isinstance(prev_bt, dict) and prev_bt.get("task_id"):
+                            desktop_control.clear_task_targets(
+                                task_id=str(prev_bt.get("task_id") or ""),
+                                browser_task_id=str(prev_bt.get("task_id") or ""),
+                            )
+                        self._active_browser_task = None
+                        self._last_assistant_question = ""
+                except Exception:
+                    pass
+        spoken_hist = tuple((self._active_browser_task or {}).get("spoken_inputs") or ()) if browser_task_id else ()
         with self._request_context_lock:
             self._last_user_command = cleaned
             self._last_user_command_source = source
             self._request_context = RequestContext.create(
                 self._last_user_command, source,
                 ttl=ttl, autonomous_session_id=session_id,
+                task_id=stable_task_id,
+                browser=browser, browser_task_id=browser_task_id,
+                parent_instruction=parent_instruction,
+                root_task_id=root_task_id,
+                spoken_inputs=spoken_hist,
             )
+            try:
+                from core import desktop_control as _dc_v
+                _dc_v.record_diagnostics(
+                    voice_turn_id=self._request_context.task_id,
+                    auth_source=source,
+                )
+            except Exception:
+                pass
 
     def _current_user_request(self) -> tuple[str, str]:
         """Read the direct request and its trust source as one atomic snapshot."""
@@ -1112,6 +1303,8 @@ class RemLive:
         ContextVars isolate concurrent asyncio tasks and propagate into child
         tasks. Thread-local remains supported for older embedders and tests.
         """
+        from core import desktop_control
+        auth_tok = desktop_control.bind_auth_context(context)
         local = getattr(self, "_dispatch_context_local", None)
         if local is None:
             local = self._dispatch_context_local = contextvars.ContextVar(
@@ -1122,6 +1315,7 @@ class RemLive:
                 return fn()
             finally:
                 local.reset(token)
+                desktop_control.reset_auth_context(auth_tok)
         previous = getattr(local, "context", None)
         local.context = context
         try:
@@ -1134,6 +1328,7 @@ class RemLive:
                     pass
             else:
                 local.context = previous
+            desktop_control.reset_auth_context(auth_tok)
 
     def _bound_request_context(self):
         local = getattr(self, "_dispatch_context_local", None)
@@ -2035,6 +2230,10 @@ class RemLive:
             # by the Live batch. Never borrow a newer, unrelated global turn.
             request_context = None
         user_request, request_source = self._usable_request_context(request_context)
+        if name in {"browser_control", "youtube_video"} and not args.get("browser"):
+            ctx_browser = str(getattr(request_context, "browser", "") or "").strip() if request_context is not None else ""
+            if ctx_browser:
+                args["browser"] = ctx_browser
 
         from core.tool_security import tool_policy
         if tool_policy(name) is None:
@@ -2049,6 +2248,22 @@ class RemLive:
             allowed, reason = desktop_control.authorize_user_request(
                 user_request, name, args, source=request_source,
                 auth_context=request_context)
+            if not allowed and request_source in {"voice", ""} and (time.monotonic() - getattr(self, "_last_user_speech", 0.0)) < 1.5:
+                for _ in range(5):
+                    await asyncio.sleep(0.06)
+                    fresh_ctx = self._current_request_context()
+                    if fresh_ctx is not None and fresh_ctx is not request_context:
+                        request_context = fresh_ctx
+                        user_request, request_source = self._usable_request_context(request_context)
+                        if name in {"browser_control", "youtube_video"} and not args.get("browser"):
+                            _fb = str(getattr(request_context, "browser", "") or "").strip()
+                            if _fb:
+                                args["browser"] = _fb
+                        allowed, reason = desktop_control.authorize_user_request(
+                            user_request, name, args, source=request_source,
+                            auth_context=request_context)
+                        if allowed:
+                            break
             if not allowed:
                 task_id = getattr(request_context, "task_id", "missing")
                 age = (f"{request_context.age():.1f}s" if request_context else "unknown")
@@ -2056,8 +2271,10 @@ class RemLive:
                     category = "missing_or_unrelated_context"
                 elif request_context.is_expired():
                     category = "expired_authorization"
-                elif "revoked" in reason.lower() or "disabled" in reason.lower():
+                elif "revoked" in reason.lower():
                     category = "revoked_authorization"
+                elif "disabled" in reason.lower():
+                    category = "observation_disabled"
                 elif "outside" in reason.lower() or "scope" in reason.lower():
                     category = "outside_task_scope"
                 else:
@@ -2770,8 +2987,11 @@ class RemLive:
                                 self._voice_state.set(VoicePhase.THINKING)
                                 # A fresh direct voice turn invalidates any
                                 # prior typed/dashboard request before its own
-                                # transcript is complete.
+                                # transcript is complete, while keeping one task_id
+                                # across incremental tokens in this turn.
                                 if not in_buf:
+                                    import uuid as _uuid
+                                    self._current_voice_turn_task_id = _uuid.uuid4().hex
                                     self._record_user_request("", "voice")
                                 in_buf.append(txt)
                                 # Bind partial direct speech before a tool-call
@@ -2790,6 +3010,7 @@ class RemLive:
                                 self._voice_state.set(VoicePhase.LISTENING)
                                 in_buf  = []
                                 out_buf = []
+                                self._current_voice_turn_task_id = ""
                                 self._visemes.reset()
                                 _vision_id = self._vision_waiting_generation
                                 _close_camera = self._vision_waiting_angle == "camera"
@@ -2814,6 +3035,7 @@ class RemLive:
                                         "ts": datetime.now().isoformat(),
                                     }))
                             in_buf = []
+                            self._current_voice_turn_task_id = ""
 
                             full_out = " ".join(out_buf).strip()
                             # Second line of defence: even if a repeat slips
@@ -2824,6 +3046,7 @@ class RemLive:
                                     full_out = ""
                             if full_out:
                                 self._last_out_logged = full_out
+                                self._last_assistant_question = (full_out if "?" in full_out else "")
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
                                 if self._dashboard:
@@ -2870,9 +3093,20 @@ class RemLive:
                             self._keep_task(asyncio.create_task(
                                 self._handle_tool_call_batch(unique_calls, request_context)))
         except Exception as e:
-            from core.error_reporting import report_error
-            report_error("gemini_live_receive", "receive", e,
-                         final_status="failed")
+            info = _classify_live_error(e, closing=bool(getattr(self, "_closing", False)))
+            try:
+                from core import desktop_control
+                desktop_control.record_diagnostics(
+                    gemini_live_status=("closing" if info["category"] == "shutdown_cancel" else "error_reconnecting"),
+                    gemini_last_error_category=info["category"],
+                )
+            except Exception:
+                pass
+            if info["category"] != "shutdown_cancel":
+                from core.error_reporting import report_error
+                report_error("gemini_live_receive", "receive", e,
+                             recovery=f"classified:{info['category']}",
+                             final_status="reconnecting")
             raise
 
     async def _handle_tool_call_batch(self, function_calls, request_context) -> None:
@@ -3864,6 +4098,18 @@ class RemLive:
                         self._routines.session_started(self._awake)
                     if self._awake and not self._startup_greeting_sent:
                         tg.create_task(self._send_startup_greeting())
+                    self._live_fast_failures = 0
+                    self._live_session_count = int(getattr(self, "_live_session_count", 0) or 0) + 1
+                    try:
+                        from core import desktop_control as _dc_live
+                        _dc_live.record_diagnostics(
+                            gemini_live_status="connected",
+                            gemini_last_error_category="none",
+                            live_retry_delay=0.0,
+                            live_session_count=self._live_session_count,
+                        )
+                    except Exception:
+                        pass
 
             except KeyboardInterrupt:
                 raise
@@ -3872,60 +4118,61 @@ class RemLive:
             except BaseException as e:
                 # Catches both Exception and BaseExceptionGroup (Python 3.11+
                 # TaskGroup raises BaseExceptionGroup when tasks are cancelled
-                # externally, which `except Exception` would miss, letting the
-                # exception escape the while-loop and causing asyncio.run() to
-                # start shutdown — resulting in "executor after shutdown" errors).
-                # Voluntary reconnect (voice change) — not an error. Rebuild the
-                # session immediately with no backoff and no scary logs.
+                # externally, which `except Exception` would miss).
+                # Voluntary reconnect (voice change) — rebuild cleanly.
                 if _is_reconnect_signal(e):
                     print("[REM] Voluntary reconnect requested.")
                     if not _keep_context_of(e):
-                        # A deliberate clean slate (voice change) — drop the
-                        # handle so the next connect really does start empty.
                         self._resume_handle = None
                     self._conn_backoff = 0
+                    self._live_fast_failures = 0
                     continue
 
                 if self._closing:
                     print("[REM] Session tasks cancelled for application shutdown")
                     return
 
+                err_info = _classify_live_error(e, closing=False)
+                fast_fails = int(getattr(self, "_live_fast_failures", 0) or 0) + 1
+                self._live_fast_failures = fast_fails
+                reconn_count = int(getattr(self, "_live_reconnect_count", 0) or 0) + 1
+                self._live_reconnect_count = reconn_count
+                try:
+                    from core import desktop_control as _dc_live
+                    _dc_live.record_diagnostics(
+                        gemini_live_status="reconnecting",
+                        gemini_last_error_category=err_info["category"],
+                        gemini_reconnect_count=reconn_count,
+                    )
+                except Exception:
+                    pass
+
                 if _is_live_inactivity_close(e) and _resumed_with:
-                    # A resumed session itself closed with 1008 inactivity.
-                    # Do not replay the same handle indefinitely; TaskGroup
-                    # has already cancelled its sibling send/receive/audio
-                    # tasks. Start one clean session, then back off if that
-                    # also closes before becoming resumable.
+                    # A resumed session closed with 1008 inactivity. Drop dead handle and
+                    # wait a small jittered pause (longer if repeating) so we never tight-loop 0s!
                     self._resume_handle = None
-                    self._conn_backoff = 0
+                    delay = 0.8 if fast_fails <= 1 else _next_live_backoff(getattr(self, "_conn_backoff", 1.5), attempt=fast_fails)
+                    self._conn_backoff = delay
                     self.ui.write_log(
-                        "SYS: Live session closed after inactivity; reconnecting with a fresh session.")
-                    print("[REM] Live 1008 inactivity close — dropping resumed handle")
+                        f"SYS: Live session closed after inactivity (1008); reconnecting fresh in {delay:.1f}s.")
+                    print(f"[REM] Live 1008 inactivity close — dropping resumed handle (wait {delay:.1f}s)")
+                    await asyncio.sleep(delay)
                     continue
 
-                # A resumption handle the server will not accept — expired, or
-                # belonging to a session it has since dropped. Without this, the
-                # same dead handle would be replayed on every retry and the
-                # assistant would never come back at all: the feature meant to
-                # survive a reconnect would be the thing preventing one. Drop it
-                # once and let the next attempt start clean.
-                if _resumed_with and (
-                    "resum" in str(e).lower()
-                    or "handle" in str(e).lower()
-                    or "INVALID_ARGUMENT" in str(e)
-                    or "NOT_FOUND" in str(e)
-                ):
-                    print("[REM] 🔗 Resumption handle rejected — starting a fresh session")
+                if _resumed_with and err_info["category"] == "resumption_rejected":
+                    delay = 1.0 if fast_fails <= 1 else _next_live_backoff(getattr(self, "_conn_backoff", 1.5), attempt=fast_fails)
+                    self._conn_backoff = delay
+                    print(f"[REM] 🔗 Resumption handle rejected — starting a fresh session in {delay:.1f}s")
                     self.ui.write_log("SYS: Could not restore the conversation — starting fresh.")
                     self._resume_handle = None
-                    self._conn_backoff = 0
+                    await asyncio.sleep(delay)
                     continue
 
-                err_str = str(e)
+                err_str = err_info["reason"] or str(e)
                 from core.error_reporting import report_error
                 report_error("gemini_live_session", "connect_or_run", e,
-                             recovery="classified for existing reconnect policy",
-                             final_status="reconnecting_or_stopping")
+                             recovery=f"backoff_retry:{err_info['category']}",
+                             final_status="reconnecting")
 
                 # Out of quota, or this model is not available to this key —
                 # step down the ladder and reconnect straight away. This is the
@@ -3939,9 +4186,8 @@ class RemLive:
                         f"model is out of quota."
                         if nxt != live_model else
                         "SYS: Every live model is rate-limited — retrying.")
-                    self._conn_backoff = 0 if nxt != live_model else 15
-                    if nxt == live_model:
-                        await asyncio.sleep(self._conn_backoff)
+                    self._conn_backoff = 1.0 if nxt != live_model else 15.0
+                    await asyncio.sleep(self._conn_backoff)
                     continue
 
                 # Turn-taking / media / thinking knobs rejected by the server
@@ -3958,6 +4204,7 @@ class RemLive:
                 ):
                     self._tuned_live = False
                     print("[REM] Live tuning rejected — reconnecting without it.")
+                    await asyncio.sleep(1.0)
                     continue
 
                 # Proactive audio rejected by the server (preview API drift) —
@@ -3972,39 +4219,49 @@ class RemLive:
                     self.ui.write_log(
                         "SYS: Proactive audio unavailable — reconnecting without it."
                     )
+                    await asyncio.sleep(1.0)
                     continue
 
                 # Invalid API key — stop hammering the API, prompt re-configuration
-                if "API key not valid" in err_str or "1007" in err_str:
+                if err_info["category"] == "auth_invalid":
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
                     self.ui.set_state("SLEEPING")
                     self.ui.prompt_reconfig()
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
                     print("[REM] New API key saved — reconnecting...")
-                    self._conn_backoff = 3
+                    self._conn_backoff = 3.0
+                    self._live_fast_failures = 0
                     continue
 
-                # Network / timeout errors — log clearly and back off
-                is_net_err = any(k in err_str for k in (
-                    "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
-                    "ConnectionRefusedError", "OSError", "Cannot connect",
-                )) or _is_live_inactivity_close(e)
-                if is_net_err:
-                    _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
-                    self._conn_backoff = _conn_backoff
-                    if _is_live_inactivity_close(e):
-                        self.ui.write_log(
-                            f"SYS: Live session closed after inactivity — retrying in {_conn_backoff}s.")
-                    else:
-                        self.ui.write_log(
-                            f"NET: Connection failed — retrying in {_conn_backoff}s. "
-                            "(a VPN may be required)"
-                        )
+                # Transient API / WebSocket / network failures — bounded exponential backoff + jitter
+                _conn_backoff = _next_live_backoff(getattr(self, "_conn_backoff", 1.5), attempt=fast_fails)
+                if fast_fails >= 12:
+                    _conn_backoff = 60.0
+                self._conn_backoff = _conn_backoff
+                try:
+                    from core import desktop_control as _dc_live
+                    _dc_live.record_diagnostics(live_retry_delay=_conn_backoff)
+                except Exception:
+                    pass
+                if err_info["category"] == "inactivity_close_1008":
+                    self.ui.write_log(
+                        f"SYS: Live session closed after inactivity — retrying in {_conn_backoff:.1f}s.")
+                elif err_info["category"] == "transient_api_error":
+                    self.ui.write_log(
+                        f"SYS: Temporary Live API interruption — reconnecting in {_conn_backoff:.1f}s.")
                 else:
-                    self._conn_backoff = 3
+                    self.ui.write_log(
+                        f"NET: Connection failed ({err_info['category']}) — retrying in {_conn_backoff:.1f}s."
+                    )
             finally:
                 self.session = None
+                self._live_session_count = max(0, int(getattr(self, "_live_session_count", 0) or 0) - 1)
+                try:
+                    from core import desktop_control as _dc_live
+                    _dc_live.record_diagnostics(live_session_count=self._live_session_count)
+                except Exception:
+                    pass
                 # Only save if there was a real conversation (≥3 turns)
                 if len(self._session_log) >= 3 and not self._closing:
                     self._keep_task(asyncio.create_task(self._save_session_summary()))

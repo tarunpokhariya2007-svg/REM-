@@ -104,7 +104,15 @@ class RemUI:
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)
-        self._win.show()
+        try:
+            from memory.config_manager import get_floating_companion_settings
+            _fc = get_floating_companion_settings()
+            if (_fc.get("enabled", True) and _fc.get("start_minimized", False)) or "--minimized" in sys.argv:
+                self._win._enter_floating_companion_mode()
+            else:
+                self._win.show()
+        except Exception:
+            self._win.show()
 
     @property
     def muted(self) -> bool:

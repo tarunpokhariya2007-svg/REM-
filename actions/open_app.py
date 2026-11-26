@@ -268,7 +268,24 @@ def _launch_and_verify_impl(player, spoken: str, launcher_name: str,
         )
         if appeared is not None:
             _log(player, f"REM: {appeared.label} is open.")
+            try:
+                desktop_control.record_diagnostics(active_application=str(appeared.label or spoken))
+            except Exception:
+                pass
             return
+
+        if "whatsapp" in spoken.casefold():
+            try:
+                from actions.browser_control import browser_control
+                res = browser_control(
+                    {"action": "go_to", "browser": "chrome", "url": "https://web.whatsapp.com"},
+                    player=player,
+                )
+                desktop_control.record_diagnostics(active_application="WhatsApp (Chrome)")
+                _log(player, f"REM: WhatsApp Web opened in Chrome ({res}).")
+                return
+            except Exception as _wa_exc:
+                _log(player, f"REM: WhatsApp Web fallback failed: {_wa_exc}")
 
         if not requested:
             trouble = (f"{spoken} could not be started - nothing on this system "
@@ -366,6 +383,10 @@ def open_app(parameters=None, response=None, player=None,
                     if desktop_control.should_stop():
                         return "Computer control is paused; the application was not focused."
                     if appidentity.focus(candidate):
+                        try:
+                            desktop_control.record_diagnostics(active_application=str(candidate.label or spoken))
+                        except Exception:
+                            pass
                         _log(player, f"REM: {candidate.label} brought to the front.")
                         return outcome.done(
                             "open_app", app=spoken, matched=candidate.label,
@@ -376,6 +397,17 @@ def open_app(parameters=None, response=None, player=None,
         print(f"[open_app] {best.label} is running but no window could be "
               f"raised — launching it instead, which is what brings back an "
               f"app that is only in the tray.")
+
+    if "whatsapp" in spoken.casefold():
+        try:
+            from core import desktop_control
+            desktop_control.record_diagnostics(active_application="WhatsApp")
+            from actions import browser_control
+            cwin = browser_control._find_browser_window("chrome")
+            if cwin.get("found") and "whatsapp" in str(cwin.get("title") or "").casefold():
+                return browser_control._native_browser_action("inspect", {}, "chrome", player=player)
+        except Exception:
+            pass
 
     launcher_name = appidentity.launcher_name(spoken)
     before = appidentity.snapshot()

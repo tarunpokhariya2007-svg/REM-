@@ -414,6 +414,9 @@ def _win32_set_cursor_pos(x: int, y: int) -> bool:
 def _move_to(point: Point) -> tuple[tuple[int, int] | None, bool]:
     """Move the real OS cursor to `point` and verify the pointer position."""
     tx, ty = int(point.x), int(point.y)
+    cur0 = get_cursor_pos()
+    if cur0 == (0, 0) and (tx != 0 or ty != 0):
+        _win32_set_cursor_pos(tx, ty)
     moved = False
     last_err = None
     try:
@@ -438,6 +441,60 @@ def _move_to(point: Point) -> tuple[tuple[int, int] | None, bool]:
         verified = abs(pos[0] - tx) <= 6 and abs(pos[1] - ty) <= 6
         return pos, verified
     return (tx, ty), True
+
+
+def click_current(*, button: str = "left", clicks: int = 1) -> Act:
+    """Click at the current Windows cursor location without requiring a named element."""
+    action = {1: "left_click" if button == "left" else "click",
+              2: "double_click"}.get(clicks, "click")
+    if button == "right":
+        action = "right_click"
+    ok, why = available()
+    if not ok:
+        return _fail(action, why)
+    pos = get_cursor_pos()
+    if pos is not None and _lands_on_self(pos[0], pos[1]):
+        return _fail(action, SELF_POINT, point=pos)
+    try:
+        pyautogui.click(button=button, clicks=max(1, clicks),
+                        interval=0.06 if clicks > 1 else 0.0)
+        time.sleep(AFTER_CLICK_S)
+    except Exception as e:
+        if type(e).__name__ == "FailSafeException":
+            return _fail(action, "aborted by the mouse-corner failsafe", point=pos or (0, 0))
+        return _fail(action, f"the click could not be delivered: {e}", point=pos or (0, 0))
+    return Act(ok=True, action=action, origin="user", point=pos or (0, 0),
+               detail=f"clicked at {pos}" if pos else "clicked at current cursor")
+
+
+def mouse_down(*, button: str = "left") -> Act:
+    """Press and hold the requested mouse button at the current cursor position."""
+    ok, why = available()
+    if not ok:
+        return _fail("mouse_down", why)
+    pos = get_cursor_pos()
+    if pos is not None and _lands_on_self(pos[0], pos[1]):
+        return _fail("mouse_down", SELF_POINT, point=pos)
+    try:
+        pyautogui.mouseDown(button=button)
+    except Exception as e:
+        return _fail("mouse_down", f"mouse down failed: {e}", point=pos or (0, 0))
+    return Act(ok=True, action="mouse_down", origin="user", point=pos or (0, 0),
+               detail=f"{button} button held at {pos}")
+
+
+def mouse_up(*, button: str = "left") -> Act:
+    """Release the requested mouse button."""
+    ok, why = available()
+    if not ok:
+        return _fail("mouse_up", why)
+    pos = get_cursor_pos()
+    try:
+        pyautogui.mouseUp(button=button)
+    except Exception as e:
+        return _fail("mouse_up", f"mouse up failed: {e}", point=pos or (0, 0))
+    return Act(ok=True, action="mouse_up", origin="user", point=pos or (0, 0),
+               detail=f"{button} button released")
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +545,12 @@ def click(target: Target, *, button: str = "left", clicks: int = 1,
     assert point is not None
 
     warnings: list[str] = _aim_warnings(target)
+    cursor_before = get_cursor_pos()
+    if isinstance(target, Element):
+        rect = (int(target.left), int(target.top), int(target.width), int(target.height))
+        in_bounds = (rect[0] <= point.x <= rect[0] + rect[2]) and (rect[1] <= point.y <= rect[1] + rect[3])
+    else:
+        in_bounds = True
     try:
         move_res = _move_to(point)
         if isinstance(move_res, tuple) and len(move_res) == 2:
@@ -519,6 +582,7 @@ def click(target: Target, *, button: str = "left", clicks: int = 1,
         pyautogui.click(button=button, clicks=max(1, clicks),
                         interval=0.06 if clicks > 1 else 0.0)
         time.sleep(AFTER_CLICK_S)
+        cursor_after = get_cursor_pos()
     except Exception as e:
         if type(e).__name__ == "FailSafeException":
             return _fail(action, "aborted by the mouse-corner failsafe",
@@ -528,9 +592,23 @@ def click(target: Target, *, button: str = "left", clicks: int = 1,
                      target=point.label, origin=point.origin,
                      point=(point.x, point.y))
 
+    pos_verified = (
+        cursor_after is None
+        or (abs(int(cursor_after[0]) - int(point.x)) <= 8 and abs(int(cursor_after[1]) - int(point.y)) <= 8)
+    )
+    if not pos_verified:
+        return _fail(
+            action,
+            f"physical cursor ended at {cursor_after} instead of intended target {(point.x, point.y)}",
+            target=point.label, origin=point.origin, point=cursor_after,
+        )
+
     return Act(ok=True, action=action, target=point.label, origin=point.origin,
                point=(point.x, point.y), warnings=warnings,
-               detail=f"at {point.x},{point.y}")
+               detail=(
+                   f"at {point.x},{point.y} before={cursor_before} "
+                   f"after={cursor_after} in_bounds={str(in_bounds).lower()}"
+               ))
 
 
 def double_click(target: Target, **kw) -> Act:

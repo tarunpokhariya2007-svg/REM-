@@ -208,11 +208,15 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
 def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
     _ensure_control_active()
     _require_pyautogui()
+    from core import screenact
     if x is not None and y is not None:
-        pyautogui.click(x, y, button=button, clicks=clicks)
-        return f"{'Double-c' if clicks == 2 else 'C'}licked ({x}, {y}) [{button}]"
-    pyautogui.click(button=button, clicks=clicks)
-    return f"Clicked at current position [{button}]"
+        act = screenact.click(screenact.Point(int(x), int(y), origin="user", label=f"({x},{y})"),
+                              button=button, clicks=clicks)
+    else:
+        act = screenact.click_current(button=button, clicks=clicks)
+    if not act.ok:
+        raise RuntimeError(act.error)
+    return str(act)
 
 
 def _hotkey(*keys) -> str:
@@ -605,16 +609,65 @@ def _computer_control_impl(
             )
 
         if action in ("click", "left_click"):
-            return _click(params.get("x"), params.get("y"), "left", 1)
+            cx, cy = params.get("x"), params.get("y")
+            if (cx is None or cy is None) and params.get("target"):
+                import re as _re
+                m = _re.fullmatch(r"\(?\s*(-?\d+)\s*[, ]\s*(-?\d+)\s*\)?", str(params.get("target", "")).strip())
+                if m:
+                    cx, cy = int(m.group(1)), int(m.group(2))
+            return _click(cx, cy, "left", 1)
 
         if action == "double_click":
-            return _click(params.get("x"), params.get("y"), "left", 2)
+            cx, cy = params.get("x"), params.get("y")
+            if (cx is None or cy is None) and params.get("target"):
+                import re as _re
+                m = _re.fullmatch(r"\(?\s*(-?\d+)\s*[, ]\s*(-?\d+)\s*\)?", str(params.get("target", "")).strip())
+                if m:
+                    cx, cy = int(m.group(1)), int(m.group(2))
+            return _click(cx, cy, "left", 2)
 
         if action == "right_click":
-            return _click(params.get("x"), params.get("y"), "right", 1)
+            cx, cy = params.get("x"), params.get("y")
+            if (cx is None or cy is None) and params.get("target"):
+                import re as _re
+                m = _re.fullmatch(r"\(?\s*(-?\d+)\s*[, ]\s*(-?\d+)\s*\)?", str(params.get("target", "")).strip())
+                if m:
+                    cx, cy = int(m.group(1)), int(m.group(2))
+            return _click(cx, cy, "right", 1)
+
+        if action == "mouse_down":
+            from core import screenact
+            act = screenact.mouse_down(button=str(params.get("button") or "left"))
+            if not act.ok:
+                raise RuntimeError(act.error)
+            return str(act)
+
+        if action == "mouse_up":
+            from core import screenact
+            act = screenact.mouse_up(button=str(params.get("button") or "left"))
+            if not act.ok:
+                raise RuntimeError(act.error)
+            return str(act)
 
         if action == "move":
-            return _move(int(params.get("x", 0)), int(params.get("y", 0)))
+            pos_arg = params.get("position")
+            if not pos_arg and params.get("target"):
+                t_cf = str(params.get("target", "")).strip().casefold().replace(" ", "_")
+                if t_cf in {"center", "middle", "top_left", "top_right", "bottom_left", "bottom_right"}:
+                    pos_arg = t_cf
+            if pos_arg and params.get("x") is None:
+                from core import screenact
+                act = screenact.move_to_screen_position(pos_arg)
+                if not act.ok:
+                    raise RuntimeError(act.error)
+                return str(act)
+            mx, my = params.get("x"), params.get("y")
+            if (mx is None or my is None) and params.get("target"):
+                import re as _re
+                m = _re.fullmatch(r"\(?\s*(-?\d+)\s*[, ]\s*(-?\d+)\s*\)?", str(params.get("target", "")).strip())
+                if m:
+                    mx, my = int(m.group(1)), int(m.group(2))
+            return _move(int(mx if mx is not None else 0), int(my if my is not None else 0))
 
         if action == "drag":
             return _drag(
@@ -747,7 +800,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | close_app | screen_find | screen_click | random_data | user_data"
+                "description": "type | smart_type | click | left_click | double_click | right_click | mouse_down | mouse_up | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | close_app | screen_find | screen_click | random_data | user_data"
             },
             "app_name": {
                 "type": "STRING",

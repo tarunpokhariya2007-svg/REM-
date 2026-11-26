@@ -1146,10 +1146,32 @@ def _computer_settings_impl(
                 "computer at all", wanted=action, asked=target)
         return outcome.done("computer_settings", wanted=action, brightness=now, verified=True)
 
+    if action in ("focus_search", "search_bar"):
+        try:
+            from actions import browser_control
+            win = browser_control._find_browser_window("chrome")
+            if win.get("found") and "youtube" in str(win.get("title") or "").casefold():
+                return browser_control._native_browser_action("focus_search", params, "chrome", player=player)
+        except Exception:
+            pass
+        focus_search()
+        return outcome.done("computer_settings", wanted="focus_search", verified=False)
+
     if action in ("seek_forward", "seek_backward", "fast_forward", "rewind"):
         seconds = _number(value)
         seconds = 10 if seconds is None else max(1, abs(seconds))
         forward = action in ("seek_forward", "fast_forward")
+        try:
+            from actions import browser_control
+            win = browser_control._find_browser_window("chrome")
+            if win.get("found"):
+                b_action = "seek_forward" if forward else "seek_backward"
+                return browser_control._browser_control_impl(
+                    {"action": b_action, "seconds": seconds, "value": seconds, "browser": "chrome"},
+                    player=player,
+                )
+        except Exception:
+            pass
         if _OS == "Linux" and shutil.which("playerctl"):
             before = _playerctl_position()
             r = subprocess.run(["playerctl", "position", f"{seconds}{'+' if forward else '-'}"],

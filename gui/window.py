@@ -17,7 +17,7 @@ from pathlib import Path
 import psutil
 
 from PyQt6.QtCore import (
-    QEasingCurve, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
+    QEasingCurve, QEvent, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
     QPoint, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, Qt, QTimer,
     QUrl, pyqtSignal,
 )
@@ -55,6 +55,13 @@ from gui.theme import (
     apply_ui_accent,
     current_palette,
     retheme_all_widgets,
+)
+from gui.floating_companion import (
+    FloatingCompanionSettingsOverlay,
+    FloatingCompanionWindow,
+    WINDOW_STATE_EXITING,
+    WINDOW_STATE_FLOATING_VISIBLE,
+    WINDOW_STATE_MAIN_VISIBLE,
 )
 from gui.metrics import (
     _metrics,
@@ -409,6 +416,19 @@ class MainWindow(QMainWindow):
         self._audio_level_sig.connect(self._apply_audio_level)
         self._avatar_reset_sig.connect(self.hud.reset_avatar_motion)
         self._expression_sig.connect(self.hud.set_expression)
+        self._app_window_state = WINDOW_STATE_MAIN_VISIBLE
+        self._suppress_next_minimize = False
+        self._saved_normal_geometry = self.geometry()
+        self._saved_was_maximized = False
+        self._floating_settings_overlay = None
+        self._floating_companion = FloatingCompanionWindow()
+        self._floating_companion.restore_requested.connect(self._restore_from_floating_companion)
+        self._floating_companion.temp_hide_requested.connect(self._temp_hide_floating_companion)
+        self._floating_companion.exit_requested.connect(self._exit_from_floating_companion)
+        self._floating_companion.position_committed.connect(self._on_floating_position_committed)
+        self._expression_sig.connect(
+            lambda expr, _hold, _src: self._floating_companion.set_expression_hint(expr)
+        )
         self._content_sig.connect(self._show_content)
         self._codejob_sig.connect(self._show_code_job)
         self._reconfig_sig.connect(self._show_setup)
@@ -1386,7 +1406,7 @@ class MainWindow(QMainWindow):
         # remains available while a worker is performing a computer action.
         self._computer_panel = HoloPanel("COMPUTER USE", "ON-DEMAND")
         self._computer_rows = {}
-        for label in ("SCREEN", "UI AUTOMATION", "OCR", "BROWSER", "MEMORY",
+        for label in ("SCREEN", "AUTHORIZATION", "CLOUD VISION", "UI AUTOMATION", "OCR", "BROWSER", "MEMORY",
                       "ACTIVE APP", "ACTION", "LAST ACTION", "INPUT", "VERIFICATION"):
             row = DataRow(label, "OFF" if label == "SCREEN" else "—")
             self._computer_rows[label] = row
@@ -1406,7 +1426,20 @@ class MainWindow(QMainWindow):
         from memory.config_manager import (
             get_persistent_desktop_observation_enabled, get_cloud_screen_vision_enabled,
             get_local_screen_observation_enabled, get_desktop_observation_exclusions,
+            get_local_autonomy_mode,
         )
+        self._local_autonomy_combo = QComboBox()
+        self._local_autonomy_combo.addItems(["AUTONOMY: TRUSTED", "AUTONOMY: STANDARD"])
+        self._local_autonomy_combo.setToolTip(
+            "TRUSTED authorizes routine local screen, cursor, keyboard, Chrome, and media actions "
+            "from your direct requests while preserving sensitive-action and revocation protections.")
+        self._local_autonomy_combo.setFont(px_font(9, QFont.Weight.DemiBold))
+        self._local_autonomy_combo.setStyleSheet(
+            f"QComboBox {{ color: {C.TEXT}; background: {C.PANEL}; "
+            f"border: 1px solid {C.BORDER}; padding: 4px; }}")
+        self._local_autonomy_combo.setCurrentIndex(0 if get_local_autonomy_mode() == "trusted" else 1)
+        self._local_autonomy_combo.currentIndexChanged.connect(self._on_local_autonomy_changed)
+        self._computer_panel.body.addWidget(self._local_autonomy_combo)
         self._local_screen_obs = QCheckBox("LOCAL SCREEN OBSERVATION")
         self._local_screen_obs.setToolTip(
             "Persistent permission for on-request local screen capture, UIA, and OCR. "
@@ -1453,6 +1486,22 @@ class MainWindow(QMainWindow):
 
         self._autonomous_row = DataRow("AUTONOMOUS", "DISABLED")
         self._computer_panel.body.addWidget(self._autonomous_row)
+
+        self._diag_rows = {}
+        for d_label in (
+            "AUTONOMY PROFILE", "REVOCATION STATUS", "ACTIVE APP", "FOREGROUND APP",
+            "VOICE TURN", "DETECTED INTENT", "ACTIVE TASK ID", "ROOT TASK ID",
+            "ACTIVE CONTACT", "ACTIVE CHAT ID", "CHROME DETECTED", "CHROME FOREGROUND",
+            "BROWSER TASK ID", "ACTIVE TARGET", "OBS SOURCE", "OCR / UIA COUNT",
+            "UNIQUE CONTACTS", "CHAT VERIFIED", "COMPOSITION", "DRAFT HASH",
+            "TYPING STATUS", "SENDING STATUS", "CALL STATUS", "CURSOR POS",
+            "MOUSE STATUS", "KEYBOARD STATUS", "MEDIA STATUS", "LAST AUTH",
+            "GUI CONFIRM REQ", "LIVE STATUS", "LIVE ERROR CAT", "RECONNECT COUNT",
+            "LIVE RETRY DELAY", "LIVE SESSIONS",
+        ):
+            d_row = DataRow(d_label, "—")
+            self._diag_rows[d_label] = d_row
+            self._computer_panel.body.addWidget(d_row)
         auto_buttons = QHBoxLayout()
         auto_buttons.setSpacing(4)
         self._autonomous_toggle = QPushButton("AUTONOMOUS: OFF")
@@ -1563,6 +1612,18 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log.append_log(f"SYS: Could not change computer-use mode: {exc}")
 
+    def _on_local_autonomy_changed(self, idx: int) -> None:
+        try:
+            from memory.config_manager import save_local_autonomy_mode
+            from core import desktop_control
+            mode = "trusted" if int(idx) == 0 else "standard"
+            saved = save_local_autonomy_mode(mode)
+            desktop_control.record_diagnostics(local_autonomy_profile=saved)
+            self._set_desktop_control_status(desktop_control.snapshot())
+            self._log.append_log(f"SYS: Local autonomy profile set to {saved.upper()}.")
+        except Exception as exc:
+            self._log.append_log(f"SYS: Could not update local autonomy profile ({type(exc).__name__}).")
+
     def _on_local_screen_observation_toggled(self, enabled: bool) -> None:
         try:
             from memory.config_manager import save_local_screen_observation_enabled
@@ -1579,8 +1640,20 @@ class MainWindow(QMainWindow):
 
     def _revoke_screen_access(self) -> None:
         try:
-            from memory.config_manager import revoke_screen_access
+            from memory.config_manager import (
+                get_local_screen_observation_enabled,
+                revoke_screen_access,
+                save_local_screen_observation_enabled,
+            )
             from core import desktop_control
+            if not get_local_screen_observation_enabled():
+                save_local_screen_observation_enabled(True)
+                self._local_screen_obs.blockSignals(True)
+                self._local_screen_obs.setChecked(True)
+                self._local_screen_obs.blockSignals(False)
+                self._set_desktop_control_status(desktop_control.snapshot())
+                self._log.append_log("SYS: Local screen observation re-enabled (cloud sharing remains OFF).")
+                return
             revoke_screen_access()
             desktop_control.set_persistent_observation(False)
             for box in (self._local_screen_obs, self._persistent_observation, self._cloud_screen_vision):
@@ -1590,7 +1663,7 @@ class MainWindow(QMainWindow):
             self._set_desktop_control_status(desktop_control.snapshot())
             self._log.append_log("SYS: Screen access revoked immediately (local & cloud OFF).")
         except Exception as exc:
-            self._log.append_log(f"ERR: Could not revoke screen access: {exc}")
+            self._log.append_log(f"ERR: Could not update screen access: {exc}")
 
     def _on_persistent_observation_toggled(self, enabled: bool) -> None:
         if enabled:
@@ -1743,22 +1816,43 @@ class MainWindow(QMainWindow):
             from memory.config_manager import (
                 get_local_screen_observation_enabled,
                 get_cloud_screen_vision_enabled,
+                is_screen_access_revoked,
             )
             local_ok = get_local_screen_observation_enabled()
             cloud_ok = get_cloud_screen_vision_enabled()
+            revoked = is_screen_access_revoked()
         except Exception:
-            local_ok, cloud_ok = True, False
-        if status.get("persistent_observation"):
+            local_ok, cloud_ok, revoked = True, False, False
+        if not local_ok or revoked:
+            screen_txt, screen_tone = "REVOKED / OFF", "DIM"
+            auth_txt, auth_tone = ("REVOKED BY USER" if revoked else "DISABLED (OFF)"), "ACC2"
+        elif status.get("paused") or status.get("stopped"):
+            screen_txt, screen_tone = "LOCAL READY (PAUSED)", "ACC2"
+            auth_txt, auth_tone = "PAUSED / STOPPED", "ACC2"
+        elif status.get("persistent_observation"):
             screen_txt, screen_tone = "LOCAL UIA ACTIVE", "GREEN"
+            auth_txt, auth_tone = "GRANTED (LOCAL)", "GREEN"
         elif status.get("screen_access"):
             screen_txt, screen_tone = "ACCESS ACTIVE", "GREEN"
-        elif local_ok and cloud_ok:
+            auth_txt, auth_tone = "GRANTED (LOCAL)", "GREEN"
+        elif cloud_ok:
             screen_txt, screen_tone = "LOCAL + CLOUD", "GREEN"
-        elif local_ok:
-            screen_txt, screen_tone = "LOCAL READY", "GREEN"
+            auth_txt, auth_tone = "GRANTED (LOCAL + CLOUD)", "GREEN"
         else:
-            screen_txt, screen_tone = "REVOKED / OFF", "DIM"
+            screen_txt, screen_tone = "LOCAL READY", "GREEN"
+            auth_txt, auth_tone = "GRANTED (LOCAL)", "GREEN"
         self._computer_rows["SCREEN"].set_value(screen_txt, screen_tone)
+        if "AUTHORIZATION" in self._computer_rows:
+            self._computer_rows["AUTHORIZATION"].set_value(auth_txt, auth_tone)
+        if "CLOUD VISION" in self._computer_rows:
+            self._computer_rows["CLOUD VISION"].set_value(
+                "ENABLED" if cloud_ok else "DISABLED (LOCAL)",
+                "ACC2" if cloud_ok else "DIM",
+            )
+        if hasattr(self, "_revoke_screen_btn"):
+            self._revoke_screen_btn.setText(
+                "RE-ENABLE LOCAL SCREEN" if (revoked or not local_ok) else "REVOKE SCREEN ACCESS"
+            )
         if hasattr(self, "_local_screen_obs") and self._local_screen_obs.isChecked() != local_ok:
             self._local_screen_obs.blockSignals(True)
             self._local_screen_obs.setChecked(local_ok)
@@ -1785,6 +1879,67 @@ class MainWindow(QMainWindow):
                 "GREEN" if caps.get("ocr_available") else "DIM")
         except Exception:
             pass
+        if hasattr(self, "_diag_rows") and self._diag_rows:
+            from memory.config_manager import get_local_autonomy_mode
+            profile = str(status.get("local_autonomy_profile") or get_local_autonomy_mode() or "trusted")
+            if hasattr(self, "_local_autonomy_combo"):
+                want_idx = 0 if profile == "trusted" else 1
+                if self._local_autonomy_combo.currentIndex() != want_idx:
+                    self._local_autonomy_combo.blockSignals(True)
+                    self._local_autonomy_combo.setCurrentIndex(want_idx)
+                    self._local_autonomy_combo.blockSignals(False)
+            self._diag_rows["AUTONOMY PROFILE"].set_value(profile.upper(), "GREEN" if profile == "trusted" else "DIM")
+            self._diag_rows["REVOCATION STATUS"].set_value("REVOKED" if revoked else "NONE", "ACC2" if revoked else "GREEN")
+            self._diag_rows["ACTIVE APP"].set_value(str(status.get("active_application") or status.get("active_app") or "—")[:22])
+            self._diag_rows["FOREGROUND APP"].set_value(str(status.get("foreground_app") or status.get("active_app") or "—")[:22])
+            vtid = str(status.get("voice_turn_id") or "")
+            self._diag_rows["VOICE TURN"].set_value((vtid[:12] + "…" if len(vtid) > 12 else vtid) or "—")
+            self._diag_rows["DETECTED INTENT"].set_value(str(status.get("detected_intent") or "—")[:22])
+            atid = str(status.get("active_task_id") or "")
+            rtid = str(status.get("root_task_id") or "")
+            self._diag_rows["ACTIVE TASK ID"].set_value((atid[:12] + "…" if len(atid) > 12 else atid) or "—")
+            self._diag_rows["ROOT TASK ID"].set_value((rtid[:12] + "…" if len(rtid) > 12 else rtid) or "—")
+            self._diag_rows["ACTIVE CONTACT"].set_value(str(status.get("active_contact") or "—")[:22])
+            self._diag_rows["ACTIVE CHAT ID"].set_value(str(status.get("active_chat_id") or "—")[:22])
+            ch_det = bool(status.get("chrome_detected"))
+            ch_fg = bool(status.get("chrome_foreground"))
+            self._diag_rows["CHROME DETECTED"].set_value("YES" if ch_det else "NO", "GREEN" if ch_det else "DIM")
+            self._diag_rows["CHROME FOREGROUND"].set_value("YES" if ch_fg else "NO", "GREEN" if ch_fg else "DIM")
+            btid = str(status.get("browser_task_id") or "")
+            self._diag_rows["BROWSER TASK ID"].set_value((btid[:12] + "…" if len(btid) > 12 else btid) or "—")
+            self._diag_rows["ACTIVE TARGET"].set_value(str(status.get("active_target") or "—")[:22])
+            self._diag_rows["OBS SOURCE"].set_value(str(status.get("last_obs_source") or "none")[:22])
+            self._diag_rows["OCR / UIA COUNT"].set_value(
+                f"{int(status.get('ocr_count', 0) or 0)} / {int(status.get('uia_count', 0) or 0)}"
+            )
+            self._diag_rows["UNIQUE CONTACTS"].set_value(str(int(status.get("unique_contact_count", 0) or 0)))
+            chat_v = bool(status.get("selected_chat_verified"))
+            self._diag_rows["CHAT VERIFIED"].set_value("YES" if chat_v else "NO", "GREEN" if chat_v else "DIM")
+            self._diag_rows["COMPOSITION"].set_value(str(status.get("composition_status") or "idle")[:22])
+            self._diag_rows["DRAFT HASH"].set_value(str(status.get("draft_hash") or "—")[:16])
+            self._diag_rows["TYPING STATUS"].set_value(str(status.get("typing_status") or "idle")[:22])
+            self._diag_rows["SENDING STATUS"].set_value(str(status.get("sending_status") or "not_sent")[:22])
+            self._diag_rows["CALL STATUS"].set_value(str(status.get("call_status") or "idle")[:22])
+            cur_pos = str(status.get("cursor_pos") or "(0, 0)")
+            try:
+                from core import screenact
+                live_pos = screenact.get_cursor_pos()
+                if live_pos is not None:
+                    cur_pos = f"({live_pos[0]}, {live_pos[1]})"
+            except Exception:
+                pass
+            self._diag_rows["CURSOR POS"].set_value(cur_pos[:22])
+            self._diag_rows["MOUSE STATUS"].set_value(str(status.get("last_mouse_status") or "idle")[:22])
+            self._diag_rows["KEYBOARD STATUS"].set_value(str(status.get("last_keyboard_status") or "idle")[:22])
+            self._diag_rows["MEDIA STATUS"].set_value(str(status.get("last_media_status") or "idle")[:22])
+            self._diag_rows["LAST AUTH"].set_value(str(status.get("last_auth_decision") or "—")[:24])
+            g_req = bool(status.get("gui_confirm_required"))
+            self._diag_rows["GUI CONFIRM REQ"].set_value("YES" if g_req else "NO", "ACC2" if g_req else "GREEN")
+            self._diag_rows["LIVE STATUS"].set_value(str(status.get("gemini_live_status") or "disconnected")[:22])
+            self._diag_rows["LIVE ERROR CAT"].set_value(str(status.get("gemini_last_error_category") or "none")[:22])
+            self._diag_rows["RECONNECT COUNT"].set_value(str(int(status.get("gemini_reconnect_count", 0) or 0)))
+            self._diag_rows["LIVE RETRY DELAY"].set_value(f"{float(status.get('live_retry_delay', 0.0) or 0.0):.1f}s")
+            self._diag_rows["LIVE SESSIONS"].set_value(str(int(status.get("live_session_count", 0) or 0)))
         try:
             from actions.browser_control import _registry
             browser_active = _registry.has()
@@ -1998,6 +2153,7 @@ class MainWindow(QMainWindow):
         _btn("◉  REMOTE CONTROL", self._open_remote, self._BTN_PRI)
         _btn("⊞  CREATE DESKTOP SHORTCUT", self._create_desktop_shortcut)
         self._autostart_btn = _btn("◉  AUTO-START: OFF", self._toggle_autostart)
+        _btn("◈  FLOATING COMPANION", self._open_floating_settings)
         _btn("⚙  CUSTOMISE ASSISTANT", self._open_customize)
         _btn("🎧  AUDIO DEVICES", self._open_audio_devices)
         _btn("🧠  MEMORY", self._open_memory_panel)
@@ -3341,5 +3497,129 @@ class MainWindow(QMainWindow):
         self._apply_state("LISTENING")
         self._assistant_name = _read_full_config().get("assistant_name", "REM") or "REM"
         self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
+
+    # ── Floating Chibi Companion & Explicit Window State Machine ──────────────
+
+    def _enter_floating_companion_mode(self):
+        if self._app_window_state == WINDOW_STATE_EXITING:
+            return
+        from memory.config_manager import get_floating_companion_settings
+        cfg = get_floating_companion_settings()
+        if not cfg.get("enabled", True):
+            return
+        self._saved_was_maximized = bool(self.isMaximized())
+        if not self._saved_was_maximized and not self.isMinimized():
+            self._saved_normal_geometry = self.geometry()
+        elif self.normalGeometry().isValid():
+            self._saved_normal_geometry = self.normalGeometry()
+        self.hide()
+        self._floating_companion.position_for_show(cfg)
+        self._floating_companion.show()
+        self._floating_companion.raise_()
+        self._app_window_state = WINDOW_STATE_FLOATING_VISIBLE
+
+    def _restore_from_floating_companion(self):
+        if self._app_window_state == WINDOW_STATE_EXITING:
+            return
+        from memory.config_manager import get_floating_companion_settings, save_floating_companion_settings
+        cfg = get_floating_companion_settings()
+        if self._floating_companion.isVisible() and cfg.get("remember_position", True):
+            save_floating_companion_settings(
+                last_x=self._floating_companion.x(),
+                last_y=self._floating_companion.y(),
+            )
+        self._floating_companion.hide()
+        self._app_window_state = WINDOW_STATE_MAIN_VISIBLE
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        if self._saved_was_maximized:
+            self.showMaximized()
+        else:
+            if getattr(self, "_saved_normal_geometry", None) and self._saved_normal_geometry.isValid():
+                self.setGeometry(self._saved_normal_geometry)
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _temp_hide_floating_companion(self):
+        if self._app_window_state == WINDOW_STATE_EXITING:
+            return
+        self._floating_companion.hide()
+        self._suppress_next_minimize = True
+        self._app_window_state = WINDOW_STATE_MAIN_VISIBLE
+        self.showMinimized()
+
+    def _exit_from_floating_companion(self):
+        self._app_window_state = WINDOW_STATE_EXITING
+        try:
+            self._floating_companion.hide()
+            self._floating_companion.close()
+        except Exception:
+            pass
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _on_floating_position_committed(self, x: int, y: int):
+        from memory.config_manager import save_floating_companion_settings
+        save_floating_companion_settings(last_x=int(x), last_y=int(y))
+
+    def _set_autostart_enabled(self, want: bool) -> bool:
+        if bool(want) != self._check_autostart():
+            self._toggle_autostart()
+        return self._check_autostart()
+
+    def _open_floating_settings(self):
+        from memory.config_manager import get_floating_companion_settings
+        if self._quick_drawer.isVisible():
+            self._quick_drawer.hide()
+        if self._floating_settings_overlay:
+            self._floating_settings_overlay.hide()
+        cw = self.centralWidget()
+        ov = FloatingCompanionSettingsOverlay(
+            get_floating_companion_settings(),
+            self._check_autostart(),
+            on_toggle_autostart=self._set_autostart_enabled,
+            parent=cw,
+        )
+        ow = FloatingCompanionSettingsOverlay._OW
+        oh = min(FloatingCompanionSettingsOverlay._OH, cw.height() - 16)
+        ov.setGeometry((cw.width() - ow) // 2, (cw.height() - oh) // 2, ow, oh)
+        ov.saved.connect(self._on_floating_settings_saved)
+        ov.show()
+        ov.raise_()
+        self._floating_settings_overlay = ov
+
+    def _on_floating_settings_saved(self, new_cfg: dict):
+        from memory.config_manager import save_floating_companion_settings
+        saved = save_floating_companion_settings(new_cfg)
+        self._floating_companion.apply_settings(saved)
+        self._log.append_log(
+            f"SYS: Floating companion saved (enabled={saved['enabled']}, size={saved['size']}px, on_top={saved['always_on_top']})."
+        )
+
+    def changeEvent(self, event):
+        if (event is not None
+                and event.type() == QEvent.Type.WindowStateChange
+                and self.isMinimized()
+                and self._app_window_state != WINDOW_STATE_EXITING):
+            if self._suppress_next_minimize:
+                self._suppress_next_minimize = False
+            else:
+                from memory.config_manager import get_floating_companion_settings
+                cfg = get_floating_companion_settings()
+                if cfg.get("enabled", True) and cfg.get("show_on_minimize", True):
+                    QTimer.singleShot(0, self._enter_floating_companion_mode)
+        super().changeEvent(event)
+
+    def closeEvent(self, event):
+        self._app_window_state = WINDOW_STATE_EXITING
+        try:
+            self._floating_companion.hide()
+            self._floating_companion.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 

@@ -875,79 +875,179 @@ def _hwnds_for(pid: int) -> list[int]:
         return []
 
 
-def focus(match: "Match") -> bool:
-    """Bring an already-running application to the front. -> did it work.
+def _activate_hwnd_windows(hwnd: int) -> dict:
+    """Restore if minimized, raise to foreground on Windows, and verify activation."""
+    import ctypes
+    from ctypes import wintypes
 
-    WHY OPENING SOMETHING THAT IS ALREADY OPEN IS NOT A NO-OP
-        "Open WhatsApp" when WhatsApp is running behind three other windows is
-        still a request to SEE WhatsApp. Reporting "it was already open" and
-        doing nothing is technically true and completely useless: nothing
-        changes on screen, and from the user's chair the assistant did not open
-        anything. That is exactly how this read when it shipped.
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    SW_RESTORE = 9
+    VK_MENU = 0x12
+    KEYEVENTF_KEYUP = 0x0002
 
-        So the running case raises the window instead of reporting at it. This
-        is also what the operating system itself does when you click a taskbar
-        icon for a running app, which is the behaviour people already expect.
+    fore_before = int(user32.GetForegroundWindow() or 0)
+    rect = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    win_rect = (int(rect.left), int(rect.top), int(rect.right - rect.left), int(rect.bottom - rect.top))
+    length = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    title = str(buf.value or "")
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
 
-    A process with no visible window — a background service, a tray-only app —
-    returns False rather than pretending, and the caller falls through to
-    launching it, which is what brings a tray app back.
-    """
-    if _OS == "Windows":
-        hwnds = _hwnds_for(match.pid)
-        if not hwnds:
-            return False
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.08)
+
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    if int(user32.GetForegroundWindow() or 0) != int(hwnd):
+        fore = user32.GetForegroundWindow()
+        their = user32.GetWindowThreadProcessId(fore, None) if fore else 0
+        ours = kernel32.GetCurrentThreadId()
+        if their and their != ours and user32.AttachThreadInput(ours, their, True):
+            try:
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+                user32.SetFocus(hwnd)
+            finally:
+                user32.AttachThreadInput(ours, their, False)
+
+    if int(user32.GetForegroundWindow() or 0) != int(hwnd):
+        # Benign Alt-key unlock satisfies Windows foreground-lock rule across processes
         try:
-            import ctypes
-            from ctypes import wintypes
+            user32.keybd_event(VK_MENU, 0, 0, 0)
+            user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
 
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            SW_RESTORE = 9
+    deadline = time.monotonic() + 0.45
+    fore_after = int(user32.GetForegroundWindow() or 0)
+    while fore_after != int(hwnd) and time.monotonic() < deadline:
+        time.sleep(0.04)
+        fore_after = int(user32.GetForegroundWindow() or 0)
 
-            # WINDOWS REFUSES TO LET A BACKGROUND PROCESS STEAL FOCUS.
-            #
-            # SetForegroundWindow only succeeds when the calling process
-            # already owns the foreground — a rule that exists so a background
-            # program cannot yank the screen away mid-sentence. It is also
-            # exactly our situation: the user says "open WhatsApp" while
-            # working in something else, so the assistant is NOT in front and
-            # the call is refused. Seen directly in testing — the same code
-            # succeeded twelve times in a row with the HUD in front, and failed
-            # every time with another window focused.
-            #
-            # The documented way through is to borrow the foreground thread's
-            # input queue for the length of the call: while two threads share
-            # one queue, Windows treats them as the same context and allows the
-            # change. Attach, raise, detach.
-            def _raise(hwnd) -> bool:
-                if user32.IsIconic(hwnd):
-                    user32.ShowWindow(hwnd, SW_RESTORE)
-                if user32.SetForegroundWindow(hwnd):
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    win_rect = (int(rect.left), int(rect.top), int(rect.right - rect.left), int(rect.bottom - rect.top))
+    activated = (fore_after == int(hwnd))
+    print(
+        f"[Focus] target_hwnd={hwnd} target_pid={int(pid.value)} "
+        f"target_window_title={title[:60]!r} target_window_rect={win_rect} "
+        f"foreground_hwnd_before={fore_before} foreground_hwnd_after={fore_after} activated={activated}"
+    )
+    return {
+        "activated": activated,
+        "target_hwnd": int(hwnd),
+        "target_pid": int(pid.value),
+        "target_window_title": title,
+        "target_window_rect": win_rect,
+        "foreground_hwnd_before": fore_before,
+        "foreground_hwnd_after": fore_after,
+    }
+
+
+def focus_window_by_app(app_hint: str, title_hint: str = "") -> dict:
+    """Locate the real top-level non-assistant window for ``app_hint`` and bring it foreground."""
+    if _OS != "Windows":
+        matches = running(app_hint)
+        ok = bool(matches and focus(matches[0]))
+        return {"activated": ok, "target_hwnd": 0, "target_pid": (matches[0].pid if matches else 0),
+                "target_window_title": (matches[0].titles[0] if matches and matches[0].titles else ""),
+                "target_window_rect": (0, 0, 0, 0), "foreground_hwnd_before": 0, "foreground_hwnd_after": 0}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        own = _ancestor_pids()
+        me = os.getpid()
+        own.add(me)
+        hint_cf = fold(app_hint)
+        alias_exe = fold(ALIASES.get(str(app_hint or "").casefold(), {}).get("Windows", app_hint))
+        title_cf = str(title_hint or "").casefold().strip()
+        candidates: list[tuple[int, int, str, int, tuple[int, int, int, int]]] = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _enum(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
                     return True
-
-                fore = user32.GetForegroundWindow()
-                if not fore:
-                    return False
-                their = user32.GetWindowThreadProcessId(fore, None)
-                ours = kernel32.GetCurrentThreadId()
-                if their == ours:
-                    return False
-                if not user32.AttachThreadInput(ours, their, True):
-                    return False
-                try:
-                    user32.BringWindowToTop(hwnd)
-                    return bool(user32.SetForegroundWindow(hwnd))
-                finally:
-                    user32.AttachThreadInput(ours, their, False)
-
-            for hwnd in hwnds:
-                if _raise(hwnd):
+                pid = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                p = int(pid.value)
+                if not p or p in own:
                     return True
-            return False
-        except Exception as exc:
-            print(f"[appidentity] focus failed: {exc}")
-            return False
+                proc_name = ""
+                if _PSUTIL:
+                    try:
+                        proc_name = psutil.Process(p).name()
+                    except Exception:
+                        proc_name = ""
+                pn_fold = fold(proc_name)
+                if hint_cf and hint_cf not in pn_fold and (not alias_exe or alias_exe not in pn_fold):
+                    return True
+                rect = wintypes.RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return True
+                w, h = int(rect.right - rect.left), int(rect.bottom - rect.top)
+                if (w < 180 or h < 120) and not user32.IsIconic(hwnd):
+                    return True
+                ln = user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(ln + 1)
+                user32.GetWindowTextW(hwnd, buf, ln + 1)
+                title = str(buf.value or "").strip()
+                if not title:
+                    return True
+                t_cf = title.casefold()
+                score = (w * max(1, h)) // 1000
+                if title_cf and title_cf in t_cf:
+                    score += 1_000_000
+                if "youtube" in t_cf:
+                    score += 200_000
+                if not user32.IsIconic(hwnd):
+                    score += 50_000
+                candidates.append((score, int(hwnd), title, p, (int(rect.left), int(rect.top), w, h)))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_enum), 0)
+        if not candidates:
+            return {"activated": False, "target_hwnd": 0, "target_pid": 0, "target_window_title": "",
+                    "target_window_rect": (0, 0, 0, 0), "foreground_hwnd_before": int(user32.GetForegroundWindow() or 0),
+                    "foreground_hwnd_after": int(user32.GetForegroundWindow() or 0), "reason": "no_matching_window"}
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for _score, hwnd, _title, _pid, _rect in candidates[:4]:
+            res = _activate_hwnd_windows(hwnd)
+            if res.get("activated"):
+                return res
+        # Return best attempt diagnostics even if Windows denied SetForegroundWindow
+        return res
+    except Exception as exc:
+        print(f"[appidentity] focus_window_by_app failed: {exc}")
+        return {"activated": False, "target_hwnd": 0, "target_pid": 0, "target_window_title": "",
+                "target_window_rect": (0, 0, 0, 0), "foreground_hwnd_before": 0, "foreground_hwnd_after": 0,
+                "reason": str(exc)}
+
+
+def focus(match: "Match") -> bool:
+    """Bring an already-running application to the front. -> did it work."""
+    if _OS == "Windows":
+        res = focus_window_by_app(getattr(match, "label", "") or getattr(match, "name", "") or "")
+        if res.get("activated"):
+            return True
+        hwnds = _hwnds_for(match.pid)
+        for hwnd in hwnds:
+            try:
+                if _activate_hwnd_windows(hwnd).get("activated"):
+                    return True
+            except Exception:
+                continue
+        return False
 
     if _OS == "Darwin":
         try:

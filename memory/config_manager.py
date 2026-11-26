@@ -191,12 +191,14 @@ def get_wake_word_enabled() -> bool:
 def get_persistent_desktop_observation_enabled() -> bool:
     """User's saved consent for low-frequency local UIA observation only.
 
-    ``local_screen_observation_enabled`` is the canonical key. The two older
-    names remain readable for compatibility with existing REM settings files.
+    Background periodic UIA polling requires both that local screen observation
+    is not disabled/revoked and explicit opt-in for persistent observation.
     """
     data = load_api_keys()
-    if "local_screen_observation_enabled" in data:
-        return bool(data["local_screen_observation_enabled"])
+    if data.get("screen_access_revoked") or (
+        "local_screen_observation_enabled" in data and not data["local_screen_observation_enabled"]
+    ):
+        return False
     if "persistent_local_observation_enabled" in data:
         return bool(data["persistent_local_observation_enabled"])
     return bool(data.get("persistent_desktop_observation_enabled", False))
@@ -204,12 +206,42 @@ def get_persistent_desktop_observation_enabled() -> bool:
 
 @_locked
 def save_persistent_desktop_observation_enabled(enabled: bool) -> None:
+    """Persist background periodic UIA polling opt-in without revoking on-demand local observation."""
     data = _read_for_write()
-    data["local_screen_observation_enabled"] = bool(enabled)
-    data["persistent_local_observation_enabled"] = bool(enabled)
-    # Retain the established key for older REM builds and external readers.
-    data["persistent_desktop_observation_enabled"] = bool(enabled)
+    val = bool(enabled)
+    data["persistent_local_observation_enabled"] = val
+    data["persistent_desktop_observation_enabled"] = val
+    if val:
+        data["local_screen_observation_enabled"] = True
+        data["screen_access_revoked"] = False
     _write_config(data)
+
+
+LOCAL_AUTONOMY_MODES = ("trusted", "standard")
+
+
+def get_local_autonomy_mode() -> str:
+    """Return persistent local autonomy profile ('trusted' or 'standard').
+
+    'trusted' authorizes routine local desktop/browser/media operations on direct
+    user requests without repeated confirmations, while keeping explicit
+    revocation and sensitive/irreversible protections intact.
+    """
+    data = load_api_keys()
+    val = str(data.get("local_autonomy_mode", "trusted") or "trusted").strip().casefold()
+    return val if val in LOCAL_AUTONOMY_MODES else "trusted"
+
+
+@_locked
+def save_local_autonomy_mode(mode: str) -> str:
+    """Persist the user's local autonomy profile cleanly across restarts."""
+    val = str(mode or "trusted").strip().casefold()
+    if val not in LOCAL_AUTONOMY_MODES:
+        val = "trusted"
+    data = _read_for_write()
+    data["local_autonomy_mode"] = val
+    _write_config(data)
+    return val
 
 
 def get_local_screen_observation_enabled() -> bool:
@@ -220,16 +252,27 @@ def get_local_screen_observation_enabled() -> bool:
     screenshots to remote cloud models.
     """
     data = load_api_keys()
+    if data.get("screen_access_revoked"):
+        return False
     if "local_screen_observation_enabled" in data:
         return bool(data["local_screen_observation_enabled"])
     return True
+
+
+def is_screen_access_revoked() -> bool:
+    """True only when the user explicitly clicked/invoked revoke_screen_access."""
+    data = load_api_keys()
+    return bool(data.get("screen_access_revoked", False))
 
 
 @_locked
 def save_local_screen_observation_enabled(enabled: bool) -> None:
     """Persist local-only screen observation permission without altering cloud vision."""
     data = _read_for_write()
-    data["local_screen_observation_enabled"] = bool(enabled)
+    val = bool(enabled)
+    data["local_screen_observation_enabled"] = val
+    if val:
+        data["screen_access_revoked"] = False
     _write_config(data)
 
 
@@ -237,6 +280,7 @@ def save_local_screen_observation_enabled(enabled: bool) -> None:
 def revoke_screen_access() -> None:
     """Immediately revoke both local and cloud screen observation permissions."""
     data = _read_for_write()
+    data["screen_access_revoked"] = True
     data["local_screen_observation_enabled"] = False
     data["cloud_screen_vision_enabled"] = False
     data["persistent_local_observation_enabled"] = False
@@ -515,6 +559,70 @@ def update_config(**fields) -> None:
     """Set one or more top-level settings, leaving every other one as it is.
     For code outside this file that used to rewrite api_keys.json itself."""
     _patch_config(**fields)
+
+
+FLOATING_COMPANION_DEFAULTS: dict = {
+    "enabled": True,
+    "size": 190,
+    "always_on_top": True,
+    "remember_position": True,
+    "show_on_minimize": True,
+    "start_minimized": False,
+    "last_x": None,
+    "last_y": None,
+}
+
+
+def get_floating_companion_settings() -> dict:
+    """Return persisted Floating Chibi Companion preferences with safe defaults."""
+    raw = load_api_keys().get("floating_companion")
+    cfg = dict(FLOATING_COMPANION_DEFAULTS)
+    if isinstance(raw, dict):
+        for k in ("enabled", "always_on_top", "remember_position",
+                  "show_on_minimize", "start_minimized"):
+            if k in raw:
+                cfg[k] = bool(raw[k])
+        if "size" in raw:
+            try:
+                cfg["size"] = max(120, min(320, int(raw["size"])))
+            except (TypeError, ValueError):
+                pass
+        for pos_k in ("last_x", "last_y"):
+            val = raw.get(pos_k)
+            if val is not None:
+                try:
+                    cfg[pos_k] = int(val)
+                except (TypeError, ValueError):
+                    cfg[pos_k] = None
+    return cfg
+
+
+def save_floating_companion_settings(updates: dict | None = None, **kwargs) -> dict:
+    """Persist one or more Floating Companion preferences atomically."""
+    merged = get_floating_companion_settings()
+    patch = dict(updates or {})
+    patch.update(kwargs)
+    for k in ("enabled", "always_on_top", "remember_position",
+              "show_on_minimize", "start_minimized"):
+        if k in patch:
+            merged[k] = bool(patch[k])
+    if "size" in patch:
+        try:
+            merged["size"] = max(120, min(320, int(patch["size"])))
+        except (TypeError, ValueError):
+            pass
+    for pos_k in ("last_x", "last_y"):
+        if pos_k in patch:
+            val = patch[pos_k]
+            if val is None:
+                merged[pos_k] = None
+            else:
+                try:
+                    merged[pos_k] = int(val)
+                except (TypeError, ValueError):
+                    pass
+    _patch_config(floating_companion=merged)
+    return dict(merged)
 
 
 def get_input_device() -> str:

@@ -62,7 +62,13 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
 
 
-def _open_url(url: str) -> None:
+def _open_url(url: str, browser: str | None = None) -> None:
+    try:
+        from actions import browser_control
+        browser_control.open_in_selected_browser(url, browser=browser)
+        return
+    except Exception:
+        pass
     try:
         if is_mac():
             subprocess.Popen(["open", url])
@@ -283,6 +289,7 @@ def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
 
 def _handle_play(parameters: dict, player) -> str:
     query = parameters.get("query", "").strip()
+    browser = str(parameters.get("browser") or "").strip() or None
     if not query:
         return "Please tell me what you'd like to watch, sir."
 
@@ -295,7 +302,7 @@ def _handle_play(parameters: dict, player) -> str:
 
     if video_url:
         print(f"[YouTube] ▶️ Opening: {video_url}")
-        _open_url(video_url)
+        _open_url(video_url, browser=browser)
         return f"Playing: {query}"
 
     print(f"[YouTube] ⚠️ Scrape failed, opening filtered search page")
@@ -304,7 +311,7 @@ def _handle_play(parameters: dict, player) -> str:
         f"?search_query={quote_plus(query)}"
         f"&sp={_YT_VIDEO_FILTER}"
     )
-    _open_url(fallback_url)
+    _open_url(fallback_url, browser=browser)
     return f"Opened YouTube search for: {query} (manual selection required)"
 
 

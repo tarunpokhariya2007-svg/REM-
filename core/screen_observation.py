@@ -151,40 +151,47 @@ def _detect_page_state(text: str, title: str = "", url: str = "") -> str:
 def inspect_local_screen(question: str = "") -> str:
     """Perform local-only screen observation (UIA + local OCR + open windows).
 
-    Never uploads screenshots or image bytes to any cloud service.
+    Never uploads screenshots or image bytes to any cloud service, and never
+    reports high confidence unless actual UI controls or OCR/DOM text were read.
     """
     assert_local_observation_allowed()
+    import time as _time
     from core import screenview
 
-    view = screenview.look(budget_s=1.5, allow_ocr=True)
+    obs_ts = round(_time.time(), 3)
+    view = screenview.look(budget_s=2.0, allow_ocr=True)
     summary = describe_view(view)
     ocr_lines: list[str] = []
 
-    # If the foreground window was REM's own HUD ("self") or UIA returned few
-    # readable elements, run a strictly local OCR pass on the primary monitor so
-    # visible side-by-side windows (e.g. Chrome) can still be read locally.
-    if view.source in {"self", "none"} or (view.degraded and view.source != "ocr"):
+    if view.source == "ocr":
+        for el in list(getattr(view, "elements", ()) or ())[:60]:
+            t = str(getattr(el, "name", "") or "").strip()
+            if t:
+                ocr_lines.append(t)
+    elif view.source in {"self", "none"} or view.degraded:
         try:
             if screenview._HAS_OCR:
                 rect = screenview.monitor_rect(view)
-                ocr_els = screenview._scan_ocr(rect, __import__("time").monotonic() + 2.0)
-                for el in ocr_els[:40]:
+                ocr_els = screenview._scan_ocr(rect, _time.monotonic() + 4.0)
+                for el in ocr_els[:60]:
                     t = str(getattr(el, "name", "") or "").strip()
                     if t:
                         ocr_lines.append(t)
         except Exception:
             pass
 
-    if ocr_lines:
-        summary += "\nLocal OCR text:\n" + "\n".join(f"- {line}" for line in ocr_lines[:30])
+    if ocr_lines and view.source != "ocr":
+        summary += "\nLocal OCR text:\n" + "\n".join(f"- {line}" for line in ocr_lines[:35])
 
     # Include locally inspected Chrome/browser tab info if an automation/CDP session exists
     browser_notes: list[str] = []
+    cdp_dom_read = False
     try:
         from actions.browser_control import inspect_open_chrome_tabs_local
         tabs = inspect_open_chrome_tabs_local()
         if tabs:
             browser_notes.extend(tabs[:6])
+            cdp_dom_read = any(str(t).startswith("CDP tab:") for t in tabs)
     except Exception:
         pass
     if browser_notes:
@@ -194,24 +201,36 @@ def inspect_local_screen(question: str = "") -> str:
         summary, title=str(getattr(view, "title", "") or ""),
     )
     uia_items = len(getattr(view, "elements", ()) or ()) if view.source in ("uia", "ax", "atspi") else 0
-    useful_signals = uia_items + len(ocr_lines) + len(browser_notes)
-    if useful_signals == 0 or (view.source in ("ocr", "none") and len(ocr_lines) == 0 and not browser_notes):
+    ocr_items = len(ocr_lines)
+    extracted_text_count = uia_items + ocr_items
+
+    if extracted_text_count == 0 and not cdp_dom_read:
         confidence = "uncertain"
         if page_state == "loaded":
             page_state = "unverified"
         summary += (
             "\nObservation uncertainty: No UI controls or OCR text were extracted from "
-            "the visible content (confidence=uncertain)."
+            "the visible content (confidence=uncertain). Do not invent video titles, "
+            "buttons, or search results; say plainly that the page contents could not be read reliably."
         )
-    elif uia_items > 0 or browser_notes:
+    elif uia_items > 0 or cdp_dom_read:
         confidence = "high"
     else:
         confidence = "medium"
 
+    summary += (
+        f"\nObservation metadata: window_app={view.app or 'unknown'}; "
+        f"window_title={view.title or 'untitled'}; source={view.source}; "
+        f"timestamp={obs_ts}; uia_items={uia_items}; ocr_items={ocr_items}; "
+        f"extracted_text_count={extracted_text_count}; page_state={page_state}; "
+        f"confidence={confidence}; target_identified={extracted_text_count > 0}"
+    )
+
     print(
         f"[Vision] Local screen observation source={view.source} "
-        f"app={view.app or 'unknown'} uia_items={uia_items} ocr_items={len(ocr_lines)} "
-        f"page_state={page_state} confidence={confidence} cloud_upload=false"
+        f"app={view.app or 'unknown'} uia_items={uia_items} ocr_items={ocr_items} "
+        f"extracted_text={extracted_text_count} page_state={page_state} "
+        f"confidence={confidence} cloud_upload=false"
     )
     return summary
 
