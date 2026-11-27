@@ -263,6 +263,313 @@ _active_composition_by_task: dict[str, dict] = {}
 _sent_attempts_lock = threading.RLock()
 _sent_attempt_records: dict[tuple[str, str], float] = {}
 
+# Strict WhatsApp / Messaging Lifecycle States:
+# NOT_STARTED -> COMPOSING -> DRAFT_VERIFIED -> AWAITING_CONFIRMATION ->
+# SEND_AUTHORIZED -> SEND_ATTEMPTED -> SEND_VERIFIED (or SEND_UNVERIFIED / CANCELLED)
+MSG_NOT_STARTED = "NOT_STARTED"
+MSG_COMPOSING = "COMPOSING"
+MSG_DRAFT_VERIFIED = "DRAFT_VERIFIED"
+MSG_AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
+MSG_SEND_AUTHORIZED = "SEND_AUTHORIZED"
+MSG_SEND_ATTEMPTED = "SEND_ATTEMPTED"
+MSG_SEND_VERIFIED = "SEND_VERIFIED"
+MSG_SEND_UNVERIFIED = "SEND_UNVERIFIED"
+MSG_CANCELLED = "CANCELLED"
+
+_pending_send_confirmation_by_task: dict[str, dict] = {}
+_message_lifecycle_by_task: dict[str, dict] = {}
+DEFAULT_SEND_CONFIRM_TTL_S = 45.0
+
+
+def transition_message_lifecycle(
+    state: str,
+    *,
+    receiver: str = "",
+    draft_hash: str = "",
+    reason: str = "",
+    auth_context=None,
+    task_id: str = "",
+    browser_task_id: str = "",
+) -> dict:
+    """Update explicit message lifecycle state scoped cleanly to the current task."""
+    keys = _task_keys(auth_context, task_id, browser_task_id) or ["_default_session_target"]
+    rec = {
+        "state": str(state or MSG_NOT_STARTED),
+        "receiver": str(receiver or "").strip(),
+        "draft_hash": str(draft_hash or "").strip(),
+        "reason": str(reason or "").strip(),
+        "updated_at": time.monotonic(),
+    }
+    with _active_target_lock:
+        for k in keys:
+            _message_lifecycle_by_task[k] = dict(rec)
+    record_diagnostics(sending_status=f"{rec['state']}".lower()[:32])
+    return rec
+
+
+def get_message_lifecycle(auth_context=None, *, task_id: str = "", browser_task_id: str = "") -> dict:
+    keys = _task_keys(auth_context, task_id, browser_task_id) or ["_default_session_target"]
+    with _active_target_lock:
+        for k in keys:
+            rec = _message_lifecycle_by_task.get(k)
+            if rec:
+                return dict(rec)
+    return {"state": MSG_NOT_STARTED, "receiver": "", "draft_hash": "", "reason": "", "updated_at": 0.0}
+
+
+def invalidate_send_confirmations(reason: str = "invalidated", *, auth_context=None, all_tasks: bool = False) -> None:
+    """Invalidate pending/authorized send confirmation without erasing recorded sent attempts."""
+    with _active_target_lock:
+        if all_tasks:
+            _pending_send_confirmation_by_task.clear()
+        else:
+            keys = _task_keys(auth_context) or ["_default_session_target"]
+            for k in keys:
+                _pending_send_confirmation_by_task.pop(k, None)
+
+
+def on_live_reconnect() -> dict:
+    """On Gemini Live interruption/reconnect: preserve draft/recipient, expire confirmations, require recheck."""
+    now_m = time.monotonic()
+    with _active_target_lock:
+        for k, conf in list(_pending_send_confirmation_by_task.items()):
+            if float(conf.get("expires_at", 0.0)) <= now_m or not conf.get("authorized"):
+                _pending_send_confirmation_by_task.pop(k, None)
+            else:
+                # Require fresh re-confirmation after a reconnect rather than reusing stale pre-reconnect YES
+                _pending_send_confirmation_by_task.pop(k, None)
+        for rec in _active_composition_by_task.values():
+            rec["needs_reverify"] = True
+    return {"preserved_drafts": len(_active_composition_by_task), "confirmations_cleared": True}
+
+
+def arm_send_confirmation(
+    *,
+    recipient: str = "",
+    draft: str = "",
+    draft_hash: str = "",
+    composition_task_id: str = "",
+    confirm_request_id: str = "",
+    ttl_s: float = DEFAULT_SEND_CONFIRM_TTL_S,
+    auth_context=None,
+) -> dict:
+    """Bind pending send confirmation to exact recipient, draft hash, task ID, request ID, and short expiry."""
+    import hashlib
+    import uuid as _uuid
+
+    comp = get_active_composition_state(auth_context) or {}
+    rec_name = str(recipient or comp.get("selected_contact") or _state.get("active_contact") or "").strip()
+    if rec_name == "—":
+        rec_name = ""
+    draft_str = str(draft or comp.get("generated_content") or "")
+    d_hash = str(draft_hash or comp.get("generated_content_hash") or (
+        hashlib.sha256(draft_str.encode("utf-8", errors="ignore")).hexdigest()[:16] if draft_str else ""
+    ))
+    comp_tid = str(composition_task_id or comp.get("composition_task_id") or "").strip()
+    if not comp_tid and auth_context is not None:
+        comp_tid = str(getattr(auth_context, "browser_task_id", "") or getattr(auth_context, "task_id", "") or "").strip()
+    req_id = str(confirm_request_id or "").strip() or f"conf_{_uuid.uuid4().hex[:10]}"
+    now_m = time.monotonic()
+    rec = {
+        "confirm_request_id": req_id,
+        "recipient": rec_name,
+        "recipient_fold": rec_name.casefold(),
+        "draft_hash": d_hash,
+        "composition_task_id": comp_tid,
+        "armed_at": now_m,
+        "expires_at": now_m + max(5.0, float(ttl_s or DEFAULT_SEND_CONFIRM_TTL_S)),
+        "authorized": False,
+        "authorized_at": 0.0,
+        "authorized_by_utterance": "",
+        "lifecycle": MSG_AWAITING_CONFIRMATION,
+    }
+    keys = _task_keys(auth_context, task_id=comp_tid) or ["_default_session_target"]
+    with _active_target_lock:
+        for k in keys:
+            _pending_send_confirmation_by_task[k] = rec
+            _message_lifecycle_by_task[k] = {
+                "state": MSG_AWAITING_CONFIRMATION,
+                "receiver": rec_name,
+                "draft_hash": d_hash,
+                "reason": "awaiting_user_send_confirmation",
+                "updated_at": now_m,
+            }
+    record_diagnostics(sending_status="awaiting_confirmation")
+    return dict(rec)
+
+
+def get_pending_send_confirmation(auth_context=None, *, now: float | None = None) -> dict | None:
+    keys = _task_keys(auth_context) or ["_default_session_target"]
+    cur = time.monotonic() if now is None else float(now)
+    with _active_target_lock:
+        for k in keys:
+            conf = _pending_send_confirmation_by_task.get(k)
+            if not conf:
+                continue
+            if cur >= float(conf.get("expires_at", 0.0)):
+                _pending_send_confirmation_by_task.pop(k, None)
+                return None
+            return dict(conf)
+    return None
+
+
+def evaluate_send_confirmation_utterance(
+    utterance: str,
+    *,
+    auth_context=None,
+    now: float | None = None,
+) -> dict:
+    """Strictly decide whether current user utterance authorizes a pending message send.
+
+    - 'Yes, send it' / 'Send the message' (clear reference to pending draft) -> authorizes ONLY exact bound recipient/draft/task/request.
+    - Bare confirm ('yes', 'ok', 'go ahead') -> authorizes ONLY when AWAITING_CONFIRMATION is armed, fresh, and unchanged.
+    - 'No' / 'Cancel' -> cancels confirmation cleanly.
+    - Unrelated speech ('Sandy'), silence, or uncertain ASR -> NEVER authorizes send.
+    """
+    from core import task_control as _tc
+
+    cur = time.monotonic() if now is None else float(now)
+    text = str(utterance or "").strip()
+    conf = get_pending_send_confirmation(auth_context, now=cur)
+    comp = get_active_composition_state(auth_context)
+
+    if not text:
+        return {"authorized": False, "cancelled": False, "reason": "silence_or_empty"}
+
+    cls = _tc.classify_utterance(text)
+    if cls == "cancel" or re.fullmatch(r"\s*(?:no|nope|nah|nahi|nahin|don't|do\s+not|mat\s+bhejo)\s*[.!?]*\s*", text, flags=re.IGNORECASE):
+        invalidate_send_confirmations("user_declined", auth_context=auth_context)
+        transition_message_lifecycle(
+            MSG_CANCELLED,
+            receiver=str((comp or {}).get("selected_contact") or (conf or {}).get("recipient") or ""),
+            draft_hash=str((comp or {}).get("generated_content_hash") or ""),
+            reason="user_cancelled_send",
+            auth_context=auth_context,
+        )
+        return {"authorized": False, "cancelled": True, "reason": "user_declined"}
+
+    if conf is not None:
+        # Reject immediately if recipient or draft changed since confirmation was asked.
+        if comp:
+            comp_rec = str(comp.get("selected_contact") or "").strip().casefold()
+            comp_hash = str(comp.get("generated_content_hash") or "").strip()
+            if (conf.get("recipient_fold") and comp_rec != conf["recipient_fold"]) or (
+                conf.get("draft_hash") and comp_hash != conf["draft_hash"]
+            ):
+                invalidate_send_confirmations("draft_or_recipient_changed", auth_context=auth_context)
+                return {"authorized": False, "cancelled": False, "reason": "draft_or_recipient_changed"}
+
+    has_send = _tc.has_send_command(text)
+    is_bare_yes = (cls == "confirm") and (conf is not None)
+    # Require clear send confirmation words when answering send confirmation; random names like "Sandy" fail both!
+    if not (has_send or is_bare_yes):
+        return {"authorized": False, "cancelled": False, "reason": "ambiguous_or_unrelated_utterance"}
+
+    # Check if utterance explicitly names a different contact than the pending one
+    if conf is not None and conf.get("recipient"):
+        words = _tokens(text)
+        generic_send = {
+            "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "haan", "ha", "please",
+            "send", "it", "the", "message", "draft", "this", "that", "now", "go", "ahead", "do",
+            "whatsapp", "him", "her", "them", "to",
+        }
+        extra_names = {w for w in words if len(w) > 2 and w not in generic_send}
+        rec_tokens = _tokens(conf["recipient"])
+        if extra_names and rec_tokens and not (extra_names & rec_tokens):
+            invalidate_send_confirmations("recipient_mismatch_in_utterance", auth_context=auth_context)
+            return {"authorized": False, "cancelled": False, "reason": "recipient_mismatch"}
+
+    if conf is None:
+        # No pre-armed confirmation existed; explicit send command ("Send it to Rio") still needs matching comp/chat in is_send_authorized
+        if not has_send:
+            return {"authorized": False, "cancelled": False, "reason": "no_pending_confirmation"}
+        rec_name = str((comp or {}).get("selected_contact") or _state.get("active_contact") or "").strip()
+        if rec_name == "—":
+            rec_name = ""
+        d_hash = str((comp or {}).get("generated_content_hash") or "")
+        comp_tid = str((comp or {}).get("composition_task_id") or "")
+        conf = arm_send_confirmation(
+            recipient=rec_name,
+            draft_hash=d_hash,
+            composition_task_id=comp_tid,
+            ttl_s=DEFAULT_SEND_CONFIRM_TTL_S,
+            auth_context=auth_context,
+        )
+
+    conf["authorized"] = True
+    conf["authorized_at"] = cur
+    conf["authorized_by_utterance"] = text[:160]
+    conf["lifecycle"] = MSG_SEND_AUTHORIZED
+    keys = _task_keys(auth_context, task_id=str(conf.get("composition_task_id") or "")) or ["_default_session_target"]
+    with _active_target_lock:
+        for k in keys:
+            _pending_send_confirmation_by_task[k] = conf
+            _message_lifecycle_by_task[k] = {
+                "state": MSG_SEND_AUTHORIZED,
+                "receiver": conf.get("recipient", ""),
+                "draft_hash": conf.get("draft_hash", ""),
+                "reason": "explicit_user_confirmation",
+                "updated_at": cur,
+            }
+    record_diagnostics(sending_status="send_authorized")
+    return {"authorized": True, "cancelled": False, "confirmation": dict(conf)}
+
+
+def is_send_authorized(
+    *,
+    receiver: str = "",
+    draft_hash: str = "",
+    composition_task_id: str = "",
+    utterance: str = "",
+    auth_context=None,
+    now: float | None = None,
+    check_duplicate: bool = True,
+) -> tuple[bool, str, dict]:
+    """Final gate before pressing Enter / calling send_message on an active WhatsApp draft."""
+    from core import task_control as _tc
+
+    cur = time.monotonic() if now is None else float(now)
+    if should_stop():
+        return False, "computer control is paused or stopped", {}
+    if auth_context is not None and auth_context.is_expired(now=cur):
+        return False, "authorization context has expired", {}
+    if auth_context is not None:
+        _cgen = int(getattr(auth_context, "cancel_gen", -1))
+        _cancelled = (_cgen < _tc.cancel_generation()) if _cgen >= 0 else (_tc.last_cancel()[0] > float(getattr(auth_context, "created_at", 0.0) or 0.0))
+        if _cancelled:
+            return False, "request was cancelled by the user", {}
+
+    rec_clean = str(receiver or "").strip()
+    dhash_clean = str(draft_hash or "").strip()
+    if check_duplicate and rec_clean and dhash_clean and has_sent_attempt(receiver=rec_clean, draft_hash=dhash_clean, task_id=composition_task_id):
+        return False, "duplicate send blocked after previous send attempt; never retry automatically", {}
+
+    conf = get_pending_send_confirmation(auth_context, now=cur)
+    if conf is not None:
+        if rec_clean and conf.get("recipient_fold") and rec_clean.casefold() != conf["recipient_fold"]:
+            invalidate_send_confirmations("recipient_changed", auth_context=auth_context)
+            return False, f"send confirmation was for {conf.get('recipient')!r}, not {rec_clean!r}", {}
+        if dhash_clean and conf.get("draft_hash") and dhash_clean != conf["draft_hash"]:
+            invalidate_send_confirmations("draft_changed", auth_context=auth_context)
+            return False, "draft text changed after confirmation was requested; re-confirm before sending", {}
+        if composition_task_id and conf.get("composition_task_id") and composition_task_id != conf["composition_task_id"]:
+            return False, "composition task ID does not match active send confirmation", {}
+        if conf.get("authorized"):
+            return True, "", dict(conf)
+
+    # Fallback when user explicitly gave a direct current send command (no pre-armed ambiguity)
+    utt = str(utterance or (getattr(auth_context, "instruction", "") if auth_context else "") or "").strip()
+    if not utt or not _tc.has_send_command(utt):
+        return False, "sending requires clear confirmation ('Yes, send it' or 'Send the message')", {}
+    if rec_clean:
+        words = _tokens(utt)
+        rec_toks = _tokens(rec_clean)
+        active_c_fold = "".join(sorted(_tokens(str(_state.get("active_contact") or ""))))
+        rec_fold = "".join(sorted(rec_toks))
+        if not (rec_toks & words) and not (active_c_fold and rec_fold == active_c_fold and bool(words & {"it", "that", "message", "draft"})):
+            return False, f"recipient {rec_clean!r} was not confirmed in the current send command", {}
+    return True, "", {"authorized": True, "lifecycle": MSG_SEND_AUTHORIZED}
+
 
 def has_sent_attempt(*, receiver: str, draft_hash: str, task_id: str = "", window_s: float = 120.0) -> bool:
     """Idempotency check preventing duplicate sends of the same draft to the same contact."""
@@ -290,13 +597,18 @@ def mark_composition_sent(*, receiver: str = "", draft_hash: str = "") -> None:
         for rec in _active_composition_by_task.values():
             if not draft_hash or rec.get("generated_content_hash") == draft_hash:
                 rec["message_sent"] = True
+        for k, lc in list(_message_lifecycle_by_task.items()):
+            if not draft_hash or lc.get("draft_hash") == draft_hash:
+                lc["state"] = MSG_SEND_VERIFIED
+                lc["updated_at"] = time.monotonic()
+        _pending_send_confirmation_by_task.clear()
     record_diagnostics(sending_status=(f"sent:{receiver[:20]}" if receiver else "sent"))
 
 
 def set_active_composition_state(*, composition_requested: bool, composition_task_id: str = "",
                                  selected_contact: str = "", generated_content: str = "",
                                  typing_authorized: bool = True, message_sent: bool = False,
-                                 language: str = "",
+                                 language: str = "", draft_verified: bool = False,
                                  auth_context=None, task_id: str = "", browser_task_id: str = "") -> dict:
     """Record explicit autonomous draft authorization scoped to an active task without authorizing send."""
     import hashlib
@@ -304,21 +616,45 @@ def set_active_composition_state(*, composition_requested: bool, composition_tas
     content_str = str(generated_content or "")
     d_hash = hashlib.sha256(content_str.encode("utf-8", errors="ignore")).hexdigest()[:16] if content_str else ""
     comp_id = f"cmp_{d_hash[:8]}" if d_hash else f"cmp_{int(time.monotonic())}"
+    sel_clean = str(selected_contact or "").strip()
+    now_m = time.monotonic()
     rec = {
         "composition_id": comp_id,
         "composition_requested": bool(composition_requested),
         "composition_task_id": str(composition_task_id or (keys[0] if keys else "")),
-        "selected_contact": str(selected_contact or "").strip(),
+        "selected_contact": sel_clean,
         "language": str(language or "").strip(),
         "generated_content": content_str,
         "generated_content_hash": d_hash,
         "typing_authorized": bool(typing_authorized),
         "message_sent": bool(message_sent),
-        "observed_at": time.monotonic(),
+        "draft_verified": bool(draft_verified),
+        "needs_reverify": False,
+        "observed_at": now_m,
     }
+    changed_conf_binding = False
     with _active_target_lock:
         for k in keys:
+            prev_c = _active_composition_by_task.get(k)
+            if prev_c:
+                if (
+                    str(prev_c.get("selected_contact") or "").casefold() != sel_clean.casefold()
+                    or str(prev_c.get("generated_content_hash") or "") != d_hash
+                ):
+                    changed_conf_binding = True
             _active_composition_by_task[k] = rec
+            if changed_conf_binding:
+                _pending_send_confirmation_by_task.pop(k, None)
+            _message_lifecycle_by_task[k] = {
+                "state": (
+                    MSG_SEND_VERIFIED if message_sent
+                    else (MSG_DRAFT_VERIFIED if (content_str and draft_verified) else (MSG_COMPOSING if content_str or composition_requested else MSG_NOT_STARTED))
+                ),
+                "receiver": sel_clean,
+                "draft_hash": d_hash,
+                "reason": ("draft_or_recipient_changed" if changed_conf_binding else "composition_updated"),
+                "updated_at": now_m,
+            }
     record_diagnostics(
         composition_id=comp_id,
         draft_hash=d_hash,
@@ -380,11 +716,15 @@ def clear_task_targets(*, task_id: str = "", browser_task_id: str = "") -> None:
             _active_targets_by_task.clear()
             _active_typing_by_task.clear()
             _active_composition_by_task.clear()
+            _pending_send_confirmation_by_task.clear()
+            _message_lifecycle_by_task.clear()
             return
         for k in keys:
             _active_targets_by_task.pop(k, None)
             _active_typing_by_task.pop(k, None)
             _active_composition_by_task.pop(k, None)
+            _pending_send_confirmation_by_task.pop(k, None)
+            _message_lifecycle_by_task.pop(k, None)
 
 
 def clear_all_task_state() -> None:
@@ -397,6 +737,8 @@ def clear_all_task_state() -> None:
         _active_targets_by_task.clear()
         _active_typing_by_task.clear()
         _active_composition_by_task.clear()
+        _pending_send_confirmation_by_task.clear()
+        _message_lifecycle_by_task.clear()
 
 
 def _tokens(value) -> set[str]:
@@ -438,6 +780,9 @@ def _negates_action(request: str, action: str) -> bool:
         "scroll": r"scroll", "drag": r"drag", "close": r"close|quit|exit",
         "close_app": r"close|quit|exit", "send_message": r"send|message",
         "screen_click": r"click", "screen_find": r"find|locate",
+        "reload": r"reload|refresh|retry|reopen",
+        "refresh_page": r"reload|refresh|retry|reopen",
+        "go_to": r"open|go|navigate|visit",
     }
     verbs = aliases.get(action)
     if not verbs:
@@ -459,7 +804,9 @@ def _is_screen_observation_request(value: str) -> bool:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
     english_phrases = (
         "screen", "screenshot", "display", "desktop", "visible", "what is on", "what's on",
-        "look at", "check my", "describe", "which application", "which app",
+        "look at", "check my", "check the window", "check this window", "window directly",
+        "check directly", "chrome window", "whatsapp window", "youtube window",
+        "describe", "which application", "which app",
         "what application", "what app", "current window", "current test window",
         "read the current window", "read current window", "read the error",
         "terminal", "editor", "react project", "what is written",
@@ -726,8 +1073,13 @@ def _authorize_screen_observation(request: str, words: set[str], *, tool_label: 
         "button", "link", "karo", "batao", "chala", "chalao", "kholo", "roko",
         "first", "second", "third", "fourth", "last", "play", "pause", "resume",
         "seek", "forward", "backward", "click", "type", "focus",
+        "window", "check", "directly", "active", "status", "loaded", "open", "verify", "confirm",
     }
-    allowed = _is_screen_observation_request(request) or (
+    followup_obs = bool(
+        has_live_task_chain
+        and (words & {"check", "window", "directly", "verify", "confirm", "see", "open", "status", "that", "it"})
+    )
+    allowed = _is_screen_observation_request(request) or followup_obs or (
         profile == "trusted" and (has_live_task_chain or bool(words & routine_desktop_hints))
     )
     print(f"[Auth] {'ALLOW' if allowed else 'DENY'} tool={tool_label} action={action_label} source={source}")
@@ -841,7 +1193,13 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
     if auth_context is not None:
         try:
             from core import task_control as _tc
-            if _tc.last_cancel()[0] > float(getattr(auth_context, "created_at", 0.0) or 0.0):
+            _cgen = int(getattr(auth_context, "cancel_gen", -1))
+            _was_cancelled = (
+                (_cgen < _tc.cancel_generation())
+                if _cgen >= 0
+                else (_tc.last_cancel()[0] > float(getattr(auth_context, "created_at", 0.0) or 0.0))
+            )
+            if _was_cancelled:
                 _log_auth_decision("DENY", tool=str(tool), action=str((args or {}).get("action") or ""), source=source,
                                    auth_context=auth_context, category="cancelled", reason="cancelled_by_user")
                 return False, "That request was cancelled; nothing was done."
@@ -999,7 +1357,7 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
             "emergency_stop": {"stop", "halt", "emergency"},
         },
         "browser_control": {
-            "go_to": {"open", "go", "visit", "navigate", "website", "url", "browser", "chrome", "edge", "firefox", "youtube", "google"},
+            "go_to": {"open", "go", "visit", "navigate", "website", "url", "browser", "chrome", "edge", "firefox", "youtube", "google", "whatsapp", "web", "tab", "switch", "instead", "actually", "try"},
             "search": {"search", "find", "look", "google", "bing", "web", "youtube", "query", "play"},
             "focus_search": {"search", "bar", "box", "field", "focus", "open", "click", "youtube", "ab", "karo"},
             "new_tab": {"tab", "open", "new"},
@@ -1037,8 +1395,9 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
             "scroll": {"scroll", "down", "up", "page", "more", "results", "list", "video", "videos", "chat", "chats", "top", "bottom", "niche", "upar"},
             "press": {"press", "enter", "keyboard", "key", "search", "submit", "go", "play", "pause", "replay", "space"},
             "back": {"back", "previous"}, "forward": {"forward", "next"},
-            "close_tab": {"close", "tab", "shut", "dismiss"}, "reload": {"reload", "refresh"},
-            "switch": {"switch", "use", "chrome", "edge", "firefox", "browser"},
+            "close_tab": {"close", "tab", "shut", "dismiss"},
+            "reload": {"reload", "refresh", "retry", "reopen", "f5", "again", "opening", "load", "loading", "stuck"},
+            "switch": {"switch", "use", "chrome", "edge", "firefox", "browser", "whatsapp", "youtube", "tab", "window", "open"},
             "close": {"close", "quit", "exit"},
             "close_all": {"close", "quit", "exit", "all"},
         },
@@ -1128,6 +1487,7 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
         return False, f"Unrecognized computer tool {t!r}; authorization was denied."
     intent_words = intents[t].get(action, set())
     routine_followup_actions = {
+        "go_to", "new_tab", "switch", "switch_tab",
         "click", "left_click", "double_click", "hover", "move", "move_relative",
         "scroll", "screenshot", "type", "smart_type", "clear_field", "press", "focus_window", "focus_search",
         "search_contact", "select_contact", "compose_message", "update_draft",
@@ -1139,11 +1499,50 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
         "enter", "type_text", "hotkey", "reload",
     }
     intent_tokens = context_words if (has_live_task_chain and action in routine_followup_actions) else words
+    try:
+        from core import task_control as _tc_rej
+        if action in {"reload", "refresh_page"} and _tc_rej.has_rejection(request):
+            _log_auth_decision("DENY", tool=t, action=action, source=source, auth_context=auth_context, category="rejected_by_user", reason="user_declined_reload")
+            return False, "You declined refreshing the page; nothing was reloaded."
+    except Exception:
+        pass
     comp_intent_ok = (
         action in {"smart_type", "type", "type_text", "compose_message", "update_draft"}
         and (_is_composition_request(request, spoken_hist) or bool((args or {}).get("composition_requested")))
     )
-    if not (intent_tokens & intent_words) and not comp_intent_ok:
+    # Bounded WhatsApp search workflow ("Open the chat with Rio", "Find Rio"):
+    # Authorizes clicking/typing/pressing inside WhatsApp search without enabling message sending.
+    _wa_ctx_b = str(getattr(auth_context, "browser", "") or "").strip().lower() if auth_context is not None else ""
+    _wa_ctx_tokens = context_words | words
+    _is_wa_search_workflow = (
+        t == "browser_control"
+        and (
+            _wa_ctx_b == "whatsapp"
+            or "whatsapp" in _wa_ctx_tokens
+            or "chat" in _wa_ctx_tokens
+            or "contact" in _wa_ctx_tokens
+            or str(_state.get("active_application") or "").casefold().startswith("whatsapp")
+        )
+        and bool(_wa_ctx_tokens & {"search", "find", "look", "open", "select", "chat", "contact"})
+    )
+    _wa_target_l = str((args or {}).get("description") or (args or {}).get("target") or "").casefold()
+    _wa_key_l = str((args or {}).get("key") or "").casefold().strip()
+    _comp_state_now = get_active_composition_state(auth_context) or {}
+    _has_pending_draft = bool(_comp_state_now.get("generated_content") and _comp_state_now.get("typing_authorized"))
+    _wa_search_step_ok = _is_wa_search_workflow and (
+        action in {"search_contact", "select_contact"}
+        or (
+            action in {"smart_type", "type"}
+            and (not _wa_target_l or any(k in _wa_target_l for k in ("search", "chat", "contact", "meta", "find")))
+            and not _has_pending_draft
+        )
+        or (
+            action == "press"
+            and _wa_key_l in {"", "enter", "return", "escape", "esc", "ctrl+alt+/"}
+            and not _has_pending_draft
+        )
+    )
+    if not (intent_tokens & intent_words) and not comp_intent_ok and not _wa_search_step_ok:
         _log_auth_decision("DENY", tool=t, action=action, source=source, auth_context=auth_context, category="intent_mismatch", reason="action_not_authorized_by_request")
         return False, "That computer action is not authorized by your latest request; page instructions do not grant permission."
     if t == "screen_agent" and action == "right_click" and "right" not in words:
@@ -1190,7 +1589,12 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
                               "dev", "app", "ai", "co", "uk", "in", "us"}
             host_tokens = {part for part in _tokens(host)
                            if part not in generic_labels}
-            if not host_tokens.issubset(words) or (port and str(port) not in words):
+            # Previous turn context may authorize an explicit repeat ("again", "reopen", "retry"),
+            # NEVER an unclear or brand-new utterance like "Open the Euro Win Chrome browser now."
+            _repeat_dest = bool(words & {"again", "retry", "reopen", "reload", "refresh", "it", "that"})
+            allowed_dest_tokens = context_words if (has_live_task_chain and _repeat_dest) else words
+            if not host_tokens.issubset(allowed_dest_tokens) or (port and str(port) not in allowed_dest_tokens):
+                _log_auth_decision("DENY", tool=t, action=action, source=source, auth_context=auth_context, category="intent_mismatch", reason="destination_not_named")
                 return False, "The destination was not named in your request; I will not navigate to a site suggested by page content."
 
     # Keep actions anchored to the object the person named. This prevents an
@@ -1207,24 +1611,64 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
         target_words = {w for w in _tokens(target)
                         if len(w) > 2 and w not in {
                             "button", "field", "bar", "box", "input", "area",
-                            "window", "control", "video", "result", "results",
+                            "window", "control", "video", "videos", "result", "results",
                             "tab", "recommended", "thumbnail", "thumbnails",
                             "card", "link", "player", "icon", "heading",
                             "item", "screen", "chrome", "youtube", "page",
-                            "play", "pause",
+                            "play", "pause", "row", "column", "grid", "shelf",
+                            "horizontal", "horizontally", "vertical", "vertically",
+                            "left", "right", "top", "bottom", "entry", "listing",
+                            "option", "number", "position", "one", "visible",
+                            "category", "categories", "chip", "chips", "filter", "pill",
+                            "sidebar", "pane", "panel", "textbox", "editable",
+                            "chats", "contacts", "named", "called",
                         }}
-        if action in {"smart_type", "type", "clear_field", "smart_click"} and target.casefold() in {
-            "search", "search box", "search bar", "search input", "search field",
-            "youtube search", "youtube search bar", "youtube search box", "youtube search field",
-            "message", "message bar", "message box", "message input", "message field",
-            "composer", "chat box", "chat input", "type a message", "text box",
-            "focused", "active", "current",
-        }:
-            target_words -= {"search", "youtube", "focused", "active", "current", "message", "composer", "chat", "type", "text"}
+        _tl_cf = target.casefold()
+        _is_composer_target = any(k in _tl_cf for k in ("composer", "type a message", "write a message", "message box", "message bar", "message field", "message input", "footer"))
+        _is_wa_search_desc = (
+            not _is_composer_target
+            and (
+                _tl_cf in {
+                    "search", "search box", "search bar", "search input", "search field",
+                    "youtube search", "youtube search bar", "youtube search box", "youtube search field",
+                    "whatsapp search", "whatsapp search bar", "whatsapp search box", "whatsapp search field",
+                    "search or start new chat", "search or start a new chat", "ask meta ai or search",
+                    "sidebar search", "chat list search", "contact search", "new chat search",
+                    "message", "message bar", "message box", "message input", "message field",
+                    "composer", "chat box", "chat input", "type a message", "text box",
+                    "focused", "active", "current",
+                }
+                or ("search" in _tl_cf and any(k in _tl_cf for k in ("chat", "whatsapp", "meta", "contact", "sidebar", "left", "pane", "filter", "find", "new")))
+            )
+        )
+        if action in {"smart_type", "type", "clear_field", "smart_click"} and _is_wa_search_desc:
+            target_words -= {"search", "youtube", "whatsapp", "meta", "new", "chat", "start", "ask", "focused", "active", "current", "message", "composer", "chat", "type", "text", "contact", "filter", "find"}
+        # Bounded WhatsApp contact search intent ("Chat named Rio" / search bar) inside WhatsApp chat-open request
+        _req_and_hist = context_words if has_live_task_chain else words
+        _wa_ctx_ok = (
+            t == "browser_control"
+            and (
+                "whatsapp" in (_req_and_hist | words)
+                or "chat" in (_req_and_hist | words)
+                or "contact" in (_req_and_hist | words)
+                or str(_state.get("active_application") or "").casefold().startswith("whatsapp")
+            )
+            and bool((_req_and_hist | words) & {"search", "find", "look", "open", "select", "chat", "contact"})
+        )
+        _wa_search_target_ok = bool(
+            _wa_ctx_ok
+            and (
+                (action in {"smart_type", "type", "smart_click", "click", "left_click"} and "search" in _tl_cf and not _is_composer_target)
+                or (action in {"smart_click", "click", "left_click", "select_contact"} and target_words and target_words.issubset(_req_and_hist))
+            )
+        )
         is_coord_target = bool(re.fullmatch(r"\(?\s*-?\d+\s*[, ]\s*-?\d+\s*\)?", target))
         target_match_tokens = context_words if has_live_task_chain else words
+        target_ord = _ordinal_from_ref(target)
+        req_ord = _ordinal_from_ref(request) or (_ordinal_from_ref(" ".join(spoken_hist)) if has_live_task_chain else None)
+        ordinal_match_ok = bool(target_ord is not None and req_ord is not None and target_ord == req_ord)
         resolved_active = None
-        if target_words and not is_coord_target and not (target_words & target_match_tokens):
+        if target_words and not is_coord_target and not ordinal_match_ok and not _wa_search_target_ok and not (target_words & target_match_tokens):
             if (auth_context is None or not auth_context.is_expired()) and not should_stop():
                 resolved_active = resolve_target_reference(
                     target, auth_context=auth_context, request_text=request,
@@ -1252,7 +1696,10 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
         host = urllib.parse.urlparse(url if "://" in url else "https://" + url).hostname or ""
         host_words = {w for w in _tokens(host)
                       if len(w) > 2 and w not in {"www", "web", "m", "com", "org", "net", "co"}}
-        if host_words and not (host_words & words):
+        _repeat_dest = bool(words & {"again", "retry", "reopen", "reload", "refresh", "it", "that"})
+        allowed_host_tokens = context_words if (has_live_task_chain and _repeat_dest) else words
+        if host_words and not (host_words & allowed_host_tokens):
+            _log_auth_decision("DENY", tool=t, action=action, source=source, auth_context=auth_context, category="intent_mismatch", reason="destination_not_named")
             return False, "The destination was not named in your request. I will not navigate to a site suggested by page content."
 
     # Never let a page cause arbitrary text to be typed or sent. Every content
@@ -1357,12 +1804,22 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
             if t == "send_message"
             else bool(words & {"call", "ring", "dial", "voice", "video", "phone"})
         )
+        pending_conf = get_pending_send_confirmation(auth_context) if t == "send_message" else None
+        confirmed_by_pending = bool(
+            t == "send_message"
+            and pending_conf
+            and pending_conf.get("authorized")
+            and pending_conf.get("recipient_fold") == recipient.casefold()
+        )
         matches_verified_contact = bool(
-            has_live_task_chain
-            and active_c_fold
-            and (rec_fold == active_c_fold or rec_fold in {"him", "her", "them", "it"})
-            and action_verb_ok
-            and (words & {"it", "that", "him", "her", "them", "message", "draft", "call"} or _tokens(recipient).issubset(context_words))
+            confirmed_by_pending
+            or (
+                has_live_task_chain
+                and active_c_fold
+                and (rec_fold == active_c_fold or rec_fold in {"him", "her", "them", "it"})
+                and action_verb_ok
+                and (words & {"it", "that", "him", "her", "them", "message", "draft", "call"} or _tokens(recipient).issubset(context_words))
+            )
         )
         if rec_words and not rec_words.issubset(words) and not matches_verified_contact:
             return False, (
@@ -1370,6 +1827,11 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
                 if t == "whatsapp_call"
                 else "The intended recipient was not named in your request. No message was sent."
             )
+    if t == "send_message":
+        pending_conf = get_pending_send_confirmation(auth_context)
+        if pending_conf is not None and not pending_conf.get("authorized"):
+            _log_auth_decision("DENY", tool=t, action=action, source=source, auth_context=auth_context, category="send_confirmation_required", reason="awaiting_explicit_send_confirmation")
+            return False, "A pending message draft requires clear send confirmation ('Yes, send it' or 'Send the message')."
     return True, ""
 
 

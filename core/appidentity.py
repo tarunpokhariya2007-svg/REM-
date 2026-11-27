@@ -950,6 +950,29 @@ def _activate_hwnd_windows(hwnd: int) -> dict:
     }
 
 
+def focus_hwnd(hwnd: int) -> dict:
+    """Restore and foreground a specific external top-level HWND on Windows."""
+    h = int(hwnd or 0)
+    if _OS != "Windows" or h <= 0:
+        return {"activated": False, "target_hwnd": h, "reason": "invalid_or_non_windows"}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        if not user32.IsWindow(h) or not user32.IsWindowVisible(h):
+            return {"activated": False, "target_hwnd": h, "reason": "window_not_visible"}
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        own = _ancestor_pids()
+        own.add(os.getpid())
+        if int(pid.value or 0) in own:
+            return {"activated": False, "target_hwnd": h, "target_pid": int(pid.value or 0), "reason": "refused_own_window"}
+        return _activate_hwnd_windows(h)
+    except Exception as exc:
+        return {"activated": False, "target_hwnd": h, "reason": str(exc)}
+
+
 def focus_window_by_app(app_hint: str, title_hint: str = "") -> dict:
     """Locate the real top-level non-assistant window for ``app_hint`` and bring it foreground."""
     if _OS != "Windows":

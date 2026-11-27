@@ -191,8 +191,58 @@ def invalidate_active_chat(reason: str = "") -> None:
         pass
 
 
-def _strip_composite_contact_name(raw_name: str) -> str:
-    display_name = raw_name.splitlines()[0].strip()
+def parse_whatsapp_intent_target(description: str) -> dict:
+    """Distinguish a WhatsApp chat intent phrase ('Chat named Rio') from a literal UI label.
+
+    Returns ``{"is_intent": bool, "contact": str, "raw": str}``.
+    Never pass an intent phrase directly to a generic UIA text lookup.
+    """
+    raw = " ".join(str(description or "").split()).strip()
+    if not raw:
+        return {"is_intent": False, "contact": "", "raw": ""}
+    norm = re.sub(
+        r"^(?:(?:hey|ok|okay)\s+)?(?:rem\s+)?(?:please\s+|now\s+|just\s+|can\s+you\s+|could\s+you\s+)*",
+        "", raw, flags=re.IGNORECASE,
+    ).strip()
+    cf = norm.casefold()
+    # Explicit intent phrasings that describe a desired contact rather than a literal screen control
+    patterns = (
+        r"^(?:open\s+)?(?:the\s+)?(?:chat|conversation|contact|thread|shed)\s+(?:named|called|with|for)\s+(.+)$",
+        r"^(?:open|select|find|search(?:\s+for)?)\s+(?:the\s+)?(?:chat|contact|shed)\s+(?:with\s+|for\s+|named\s+)?(.+)$",
+        r"^(.+?)(?:'s|’s)\s+(?:chat|conversation|contact)$",
+        r"^(?:find|search\s+for|open\s+chat)\s+(.+)$",
+    )
+    for rx in patterns:
+        m = re.match(rx, norm, flags=re.IGNORECASE)
+        if m:
+            cand = str(m.group(1) or "").strip(" .,!?'\"-")
+            cand = re.sub(r"^(?:the|a|an)\s+", "", cand, flags=re.IGNORECASE).strip(" .,!?'\"-")
+            # Strip trailing boilerplate ("in whatsapp", "chat", "please")
+            cand = re.sub(r"\b(?:in\s+whatsapp|on\s+whatsapp|chat|contact|please|now)\b$", "", cand, flags=re.IGNORECASE).strip(" .,!?'\"-")
+            if cand and cand.casefold() not in {"search", "search bar", "search box", "composer", "message", "message box", "it", "that", "this"}:
+                return {"is_intent": True, "contact": cand, "raw": raw}
+    # Even without regex match, "chat named X" / "with X" / "shed with X" shouldn't hit raw UIA
+    if any(k in cf for k in ("chat named", "contact named", "conversation with", "chat with", "shed with")):
+        cleaned = re.sub(
+            r"\b(?:open|select|click|chat|conversation|contact|named|called|with|for|the|one|now|shed|in|whatsapp)\b",
+            " ", norm, flags=re.IGNORECASE,
+        )
+        cleaned = " ".join(cleaned.split()).strip(" .,!?'\"-")
+        return {"is_intent": True, "contact": cleaned, "raw": raw}
+    return {"is_intent": False, "contact": "", "raw": raw}
+
+
+def _strip_composite_contact_name(raw_name: Any) -> str:
+    if raw_name is None:
+        return ""
+    try:
+        text = raw_name if isinstance(raw_name, str) else str(raw_name)
+    except Exception:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
+    if not lines:
+        return ""
+    display_name = lines[0]
     if " , " in display_name:
         display_name = display_name.split(" , ", 1)[0].strip()
     ts_cut = re.split(r"\s+\d{1,2}[:;.]\d{2}(?:\s*[AP]M)?\b", display_name, maxsplit=1, flags=re.IGNORECASE)
@@ -355,18 +405,25 @@ def extract_whatsapp_contacts(view, query: str = "", *, source_override: str = "
         role = str(getattr(el, "role", "") or "").casefold()
         if role == "button":
             continue
-        name = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or "").split())
+        try:
+            name_raw = getattr(el, "name", None) or getattr(el, "label", None) or ""
+            name = " ".join(str(name_raw).split())
+        except Exception:
+            continue
         if not name or len(name) < 2:
             continue
-        top = int(getattr(el, "top", 0) or 0)
-        left = int(getattr(el, "left", 0) or 0)
-        width = int(getattr(el, "width", 0) or 0)
-        height = int(getattr(el, "height", 0) or 0)
+        try:
+            top = int(getattr(el, "top", 0) or 0)
+            left = int(getattr(el, "left", 0) or 0)
+            width = int(getattr(el, "width", 0) or 0)
+            height = int(getattr(el, "height", 0) or 0)
+        except Exception:
+            continue
         # Skip far-right small timestamp column unless paired inside card container
         if left > w_left + int(w_w * 0.36) and width < 80 and _TIME_RE.match(name):
             continue
         display_name = _strip_composite_contact_name(name)
-        if not is_valid_contact_label(display_name):
+        if not display_name or not is_valid_contact_label(display_name):
             continue
         phone_m = _PHONE_RE.search(name)
         phone = phone_m.group(0).strip() if phone_m else None
@@ -450,46 +507,209 @@ def extract_whatsapp_contacts(view, query: str = "", *, source_override: str = "
     return deduped
 
 
-def locate_whatsapp_search_bar(view) -> dict | None:
-    """Identify WhatsApp's chat search input while excluding Chrome's address bar and composer."""
+async def dom_locate_whatsapp_search_bar(page) -> dict:
+    """Locate & verify WhatsApp Web's chat search input strictly inside `#side` via Playwright DOM."""
+    try:
+        meta = await page.evaluate(
+            """() => {
+                const urlOk = String(location.href || '').toLowerCase().includes('web.whatsapp.com');
+                if (!urlOk) return {found: false, reason: 'not_whatsapp_web', is_whatsapp_web: false};
+                const selectors = [
+                    '#side div[contenteditable="true"][role="textbox"][data-tab="3"]',
+                    '#side [data-testid="chat-list-search"]',
+                    '#side [contenteditable="true"][aria-label*="Search" i]',
+                    '#side [aria-label*="Search input" i]',
+                    '#side [title*="Search input" i]',
+                    '[role="textbox"][aria-label*="Search input" i]',
+                ];
+                let el = null;
+                let matchedSel = '';
+                for (const sel of selectors) {
+                    const cand = document.querySelector(sel);
+                    if (!cand) continue;
+                    if (cand.closest('#main footer')) continue;
+                    const r = cand.getBoundingClientRect();
+                    const s = getComputedStyle(cand);
+                    if (r.width > 40 && r.height > 12 && s.display !== 'none' && s.visibility !== 'hidden') {
+                        el = cand;
+                        matchedSel = sel;
+                        break;
+                    }
+                }
+                if (!el) return {found: false, reason: 'search_input_not_found', is_whatsapp_web: true};
+                const r = el.getBoundingClientRect();
+                const label = el.getAttribute('aria-label') || el.getAttribute('title') || 'WhatsApp search field';
+                const val = (el.innerText || el.textContent || el.value || '').trim();
+                const sx = window.screenX || 0;
+                const sy = window.screenY || 0;
+                const cx = Math.round(sx + Math.max(0, (window.outerWidth - window.innerWidth) / 2) + r.left + r.width / 2);
+                const cy = Math.round(sy + Math.max(0, window.outerHeight - window.innerHeight - 8) + r.top + r.height / 2);
+                return {
+                    found: true,
+                    is_whatsapp_web: true,
+                    selector: matchedSel,
+                    label: label,
+                    value: val,
+                    enabled: !el.hasAttribute('disabled') && el.getAttribute('aria-disabled') !== 'true',
+                    focused: document.activeElement === el || el.contains(document.activeElement),
+                    rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+                    x: cx,
+                    y: cy,
+                };
+            }"""
+        )
+    except Exception:
+        meta = {}
+    if not (meta or {}).get("found"):
+        return {
+            "found": False,
+            "source": "dom",
+            "method": "whatsapp_dom",
+            "is_whatsapp_web": bool((meta or {}).get("is_whatsapp_web")),
+            "visible": False,
+            "enabled": False,
+            "reason": str((meta or {}).get("reason") or "search_input_not_found"),
+            "x": 0,
+            "y": 0,
+            "label": "",
+            "element": None,
+        }
+    return {
+        "found": True,
+        "source": "dom",
+        "method": f"whatsapp_dom:{meta.get('selector', '')}",
+        "is_whatsapp_web": True,
+        "visible": True,
+        "enabled": bool(meta.get("enabled", True)),
+        "focus_verified": bool(meta.get("focused")),
+        "value": str(meta.get("value") or ""),
+        "rect": tuple(meta.get("rect") or (0, 0, 0, 0)),
+        "x": int(meta.get("x", 0) or 0),
+        "y": int(meta.get("y", 0) or 0),
+        "label": str(meta.get("label") or "WhatsApp search field"),
+        "element": None,
+    }
+
+
+def resolve_whatsapp_search_field(
+    view=None,
+    *,
+    cdp_result: dict | None = None,
+    target_hwnd: int = 0,
+    foreground_hwnd: int = 0,
+) -> dict:
+    """Single shared deterministic WhatsApp search-field resolver.
+
+    Resolution order:
+    1. WhatsApp DOM locator (when ``cdp_result`` confirms a visible enabled field).
+    2. Chrome / Desktop UI Automation inside the left chat-list pane.
+    3. OCR inside the validated left-pane search band when foreground HWND matches.
+    Never returns Chrome's address bar or WhatsApp's bottom message composer.
+    """
+    if cdp_result and cdp_result.get("found") and cdp_result.get("visible") and cdp_result.get("enabled"):
+        return dict(cdp_result)
+
+    not_found = {
+        "found": False,
+        "source": "none",
+        "method": "none",
+        "visible": False,
+        "enabled": False,
+        "x": 0,
+        "y": 0,
+        "label": "",
+        "element": None,
+        "reason": "no_verified_search_field",
+    }
     if view is None:
-        return None
+        return not_found
+
     elements = list(getattr(view, "elements", ()) or ())
     w_left, w_top, w_w, w_h = _window_geometry(view)
     is_browser_chrome = "chrome" in fold(getattr(view, "app", "") or "")
-    toolbar_floor = w_top + (85 if is_browser_chrome else 40)
+    toolbar_floor = w_top + (80 if is_browser_chrome else 40)
     composer_floor = w_top + int(w_h * 0.65)
+    search_band_ceil = w_top + max(260, int(w_h * 0.34))
     left_pane_ceil = w_left + int(w_w * 0.48)
     view_src = str(getattr(view, "source", "") or "").casefold()
 
+    # Pass 2: UIA search input strictly below Chrome omnibox & above composer, in left pane
     for el in elements:
+        if not getattr(el, "enabled", True):
+            continue
         role = str(getattr(el, "role", "") or "").casefold()
         label_cf = str(getattr(el, "name", "") or getattr(el, "label", "") or "").casefold()
-        if any(x in label_cf for x in ("address", "omnibox", "url", "type a message", "write a message")):
+        if any(x in label_cf for x in ("address", "omnibox", "url", "type a message", "write a message", "composer")):
             continue
         top = int(getattr(el, "top", 0) or 0)
         left = int(getattr(el, "left", 0) or 0)
         width = int(getattr(el, "width", 0) or 0)
         no_coords = (top == 0 and left == 0 and width == 0)
-        if role in {"edit", "combobox", "searchbox"} and (
-            (toolbar_floor <= top <= composer_floor and left <= left_pane_ceil)
-            or (no_coords and "search" in label_cf)
+        is_search_role = role in {"edit", "combobox", "searchbox", "textbox", "document", "group"}
+        has_search_hint = any(k in label_cf for k in ("search", "filter", "meta", "new chat", "खोज"))
+        if (
+            (is_search_role or (has_search_hint and role in {"text", "paragraph", "button"}))
+            and (
+                (toolbar_floor <= top <= composer_floor and left <= left_pane_ceil)
+                or (no_coords and "search" in label_cf)
+            )
         ):
-            if "search" in label_cf or "filter" in label_cf or "meta" in label_cf or top <= w_top + 230:
+            if has_search_hint or (role in {"edit", "combobox", "searchbox"} and top <= search_band_ceil):
                 cx, cy = getattr(el, "center", (left + 80, top + 16))
-                return {"x": int(cx), "y": int(cy), "label": getattr(el, "name", "") or getattr(el, "label", "") or "WhatsApp search field", "source": "uia", "element": el}
+                return {
+                    "found": True,
+                    "source": "uia",
+                    "method": "uia_search_control",
+                    "visible": True,
+                    "enabled": True,
+                    "focus_verified": bool(getattr(el, "focused", False)),
+                    "value": str(getattr(el, "value", "") or ""),
+                    "x": int(cx),
+                    "y": int(cy),
+                    "label": getattr(el, "name", "") or getattr(el, "label", "") or "WhatsApp search field",
+                    "element": el,
+                    "reason": "",
+                }
+
+    # Pass 3: OCR fallback only with valid foreground window alignment & left-pane band
+    if target_hwnd and foreground_hwnd and int(target_hwnd) != int(foreground_hwnd):
+        return {**not_found, "reason": "foreground_hwnd_mismatch_for_ocr_search"}
 
     for el in elements:
         role = str(getattr(el, "role", "") or "").casefold()
         is_ocr = ("ocr" in role) or (view_src == "ocr" and role in {"text", "ocr_text", ""}) or role == "text"
         label_cf = str(getattr(el, "name", "") or getattr(el, "label", "") or "").strip().casefold()
+        if any(x in label_cf for x in ("address", "omnibox", "url", "type a message", "write a message")):
+            continue
         top = int(getattr(el, "top", 0) or 0)
         left = int(getattr(el, "left", 0) or 0)
-        if is_ocr and toolbar_floor <= top <= w_top + 230 and left <= left_pane_ceil:
-            if "search" in label_cf or "new chat" in label_cf:
+        if is_ocr and toolbar_floor <= top <= search_band_ceil and left <= left_pane_ceil:
+            if any(k in label_cf for k in ("search", "meta ai", "new chat", "filter", "खोज")):
                 cx, cy = getattr(el, "center", (left + 100, top + 14))
-                return {"x": int(cx), "y": int(cy), "label": "WhatsApp search field (OCR)", "source": "ocr", "element": el}
-    return None
+                return {
+                    "found": True,
+                    "source": "ocr",
+                    "method": "ocr_left_pane_band",
+                    "visible": True,
+                    "enabled": True,
+                    "focus_verified": False,
+                    "value": "",
+                    "x": int(cx),
+                    "y": int(cy),
+                    "label": "WhatsApp search field (OCR)",
+                    "element": el,
+                    "reason": "",
+                }
+    return not_found
+
+
+def locate_whatsapp_search_bar(view, *, cdp_result: dict | None = None,
+                               target_hwnd: int = 0, foreground_hwnd: int = 0) -> dict | None:
+    """Identify WhatsApp's chat search input while excluding Chrome's address bar and composer."""
+    res = resolve_whatsapp_search_field(
+        view, cdp_result=cdp_result, target_hwnd=target_hwnd, foreground_hwnd=foreground_hwnd,
+    )
+    return res if res.get("found") else None
 
 
 def locate_whatsapp_composer(view, *, active_chat: dict | None = None) -> dict:
@@ -906,27 +1126,75 @@ def _bubble_count(view, snippet: str) -> int:
     return n
 
 
-def verify_outgoing_message(after_view, draft: str, before_view=None) -> bool:
-    """True only with POSITIVE evidence the message left the composer.
+def verify_outgoing_message_detailed(
+    after_view,
+    draft: str,
+    before_view=None,
+    *,
+    expected_contact: str = "",
+    tab_title: str = "",
+    tab_url: str = "",
+) -> dict:
+    """Verify outgoing send with positive application bubble evidence inside the verified chat.
 
-    Required: a message bubble containing the draft that was not there before
-    (count increased), AND the composer is not still holding that draft. An
-    unreadable composer is never evidence of "sent".
+    Never relies solely on pressing Enter or even on the composer emptying alone.
+    Requires:
+    1. New outgoing message bubble containing the exact draft snippet above composer (`after_n > before_n`).
+    2. Composer does not still contain the unsent draft (and reports empty/cleared when readable).
+    3. If ``expected_contact`` is supplied, active conversation header matches ``expected_contact``.
     """
+    base = {
+        "verified": False,
+        "bubble_found": False,
+        "after_bubbles": 0,
+        "before_bubbles": 0,
+        "composer_status": "unknown",
+        "composer_cleared": False,
+        "chat_verified": True,
+        "reason": "",
+    }
     if after_view is None:
-        return False
+        base["reason"] = "no post-send observation available"
+        return base
     snippet = fold(normalize_composer_text(draft))[:40]
     if not snippet:
-        return False
+        base["reason"] = "empty message snippet"
+        return base
+    if expected_contact:
+        hdr = verify_whatsapp_active_chat(
+            after_view, expected_contact=expected_contact, tab_title=tab_title, tab_url=tab_url,
+        )
+        base["chat_verified"] = bool(hdr.get("verified"))
+        if not base["chat_verified"]:
+            base["reason"] = str(hdr.get("reason") or f"active chat header did not confirm {expected_contact!r}")
+            return base
     after_n = _bubble_count(after_view, snippet)
     before_n = _bubble_count(before_view, snippet) if before_view is not None else 0
     state = read_composer(after_view)
-    still_in_composer = state["status"] == "has_text" and snippet in fold(state["text"])
-    # The draft sitting in the composer is not a bubble; read_composer's own
-    # element is excluded by role, but OCR may surface it as plain text.
-    if still_in_composer:
-        return False
-    return after_n > before_n
+    comp_status = str(state.get("status") or "unreadable")
+    still_in_composer = comp_status == "has_text" and snippet in fold(state.get("text", ""))
+    composer_cleared = (comp_status == "empty") and not still_in_composer
+    bubble_added = after_n > before_n
+    verified = bool(bubble_added and not still_in_composer and base["chat_verified"])
+    base.update({
+        "verified": verified,
+        "bubble_found": bubble_added,
+        "after_bubbles": after_n,
+        "before_bubbles": before_n,
+        "composer_status": comp_status,
+        "composer_cleared": composer_cleared,
+        "reason": (
+            "" if verified else
+            ("draft text is still in composer" if still_in_composer else
+             "no new outgoing message bubble containing the draft was observed")
+        ),
+    })
+    return base
+
+
+def verify_outgoing_message(after_view, draft: str, before_view=None) -> bool:
+    """True only with POSITIVE evidence the message left the composer."""
+    return bool(verify_outgoing_message_detailed(after_view, draft, before_view=before_view).get("verified"))
 
 
 def generate_autonomous_draft(
@@ -1138,6 +1406,80 @@ async def dom_verify_active_chat(page, expected_contact: str = "") -> dict:
     }
 
 
+async def dom_locate_whatsapp_search_field(page) -> dict:
+    """Locate WhatsApp Web's left-pane editable search field strictly inside `#side` via Playwright DOM."""
+    try:
+        meta = await page.evaluate(
+            """() => {
+                const side = document.querySelector('#side') || document;
+                const selectors = [
+                    '#side div[contenteditable="true"][data-tab="3"]',
+                    '#side [role="textbox"][contenteditable="true"]',
+                    '#side [data-testid="chat-list-search"] [contenteditable="true"]',
+                    '#side [data-testid="chat-list-search"] input',
+                    '#side input[type="search"]',
+                    '#side input[type="text"]',
+                    '#side [aria-label*="Search" i][contenteditable="true"]',
+                    '#side [aria-label*="Search" i][role="textbox"]',
+                    '#side [aria-placeholder*="Search" i]',
+                    '[data-testid="chat-list-search"]',
+                    '[contenteditable="true"][data-tab="3"]',
+                    '[role="textbox"][aria-label*="Search" i]',
+                ];
+                let sb = null;
+                for (const sel of selectors) {
+                    const cand = document.querySelector(sel) || side.querySelector(sel);
+                    if (!cand || cand.closest('#main footer')) continue;
+                    const r = cand.getBoundingClientRect();
+                    if (r.width >= 40 && r.height >= 14 && r.left < window.innerWidth * 0.52) {
+                        sb = cand;
+                        break;
+                    }
+                }
+                if (!sb) return {found: false};
+                const r = sb.getBoundingClientRect();
+                const s = getComputedStyle(sb);
+                const visible = r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                const editable = (sb.tagName === 'INPUT' || sb.tagName === 'TEXTAREA' || sb.isContentEditable || sb.getAttribute('contenteditable') === 'true');
+                return {
+                    found: visible,
+                    visible,
+                    editable,
+                    enabled: !sb.hasAttribute('disabled') && sb.getAttribute('aria-disabled') !== 'true',
+                    focused: document.activeElement === sb || sb.contains(document.activeElement),
+                    value: (sb.value !== undefined ? sb.value : (sb.innerText || sb.textContent || '')),
+                    label: sb.getAttribute('aria-label') || sb.getAttribute('aria-placeholder') || sb.getAttribute('title') || 'WhatsApp search field',
+                    rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+                    x: Math.round(r.left + r.width / 2),
+                    y: Math.round(r.top + r.height / 2),
+                };
+            }"""
+        )
+    except Exception:
+        meta = {}
+    if not (meta or {}).get("found"):
+        return {
+            "found": False, "source": "dom", "method": "dom_side_search",
+            "visible": False, "enabled": False, "x": 0, "y": 0, "label": "",
+            "reason": "no_verified_dom_search_field",
+        }
+    return {
+        "found": True,
+        "source": "dom",
+        "method": "dom_side_search",
+        "visible": bool(meta.get("visible")),
+        "editable": bool(meta.get("editable", True)),
+        "enabled": bool(meta.get("enabled", True)),
+        "focus_verified": bool(meta.get("focused")),
+        "value": str(meta.get("value") or ""),
+        "x": int(meta.get("x") or 0),
+        "y": int(meta.get("y") or 0),
+        "rect": tuple(meta.get("rect") or (0, 0, 0, 0)),
+        "label": str(meta.get("label") or "WhatsApp search field"),
+        "reason": "",
+    }
+
+
 async def dom_locate_whatsapp_composer(page) -> dict:
     """Locate & verify WhatsApp Web composer element strictly inside `#main footer` via Playwright DOM."""
     try:
@@ -1288,15 +1630,28 @@ class WhatsAppDriver:
 
         # Enter may succeed even if we cannot SEE it succeed, so the attempt is recorded
         # first: an unconfirmed send must never be retried into a duplicate.
+        desktop_control.transition_message_lifecycle(
+            desktop_control.MSG_SEND_ATTEMPTED,
+            receiver=receiver, draft_hash=dhash, reason="pressing_enter_after_draft_readback", task_id=task_id,
+        )
         desktop_control.record_sent_attempt(receiver=receiver, draft_hash=dhash, task_id=task_id)
         sent = screenact.press("enter")
         if not sent.ok:
+            desktop_control.transition_message_lifecycle(
+                desktop_control.MSG_SEND_UNVERIFIED,
+                receiver=receiver, draft_hash=dhash, reason=f"enter_failed:{sent.error}", task_id=task_id,
+            )
             return False, f"message submission failed: {sent.error}"
         time.sleep(0.30)
         after = self._view()
-        if not verify_outgoing_message(after, message, before_view=staged):
-            return False, ("unverified: Enter was pressed but the message was not confirmed in the chat; it may "
-                           "have been sent, so I will not send it again")
+        det = verify_outgoing_message_detailed(after, message, before_view=staged, expected_contact=receiver)
+        if not det.get("verified"):
+            desktop_control.transition_message_lifecycle(
+                desktop_control.MSG_SEND_UNVERIFIED,
+                receiver=receiver, draft_hash=dhash, reason=str(det.get("reason") or "bubble_not_confirmed"), task_id=task_id,
+            )
+            return False, ("unverified: I attempted to send the message, but WhatsApp has not confirmed that it was sent, "
+                           "so I will not send it again.")
         desktop_control.mark_composition_sent(receiver=receiver, draft_hash=dhash)
         return True, "exact chat matched, draft read back, message submitted, and outgoing bubble verified"
 

@@ -105,6 +105,10 @@ class RemUI:
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)
         try:
+            self._app.aboutToQuit.connect(self._win.shutdown_qt_resources)
+        except Exception:
+            pass
+        try:
             from memory.config_manager import get_floating_companion_settings
             _fc = get_floating_companion_settings()
             if (_fc.get("enabled", True) and _fc.get("start_minimized", False)) or "--minimized" in sys.argv:

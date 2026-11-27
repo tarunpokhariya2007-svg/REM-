@@ -426,9 +426,11 @@ TOOL_DECLARATIONS = [
     {
         "name": "system_status",
         "description": (
-            "Returns real-time system metrics: CPU usage, RAM, GPU load, CPU temperature, "
-            "uptime, and process count. Use when the user asks about computer performance, "
-            "temperature, memory, or resource usage."
+            "Returns real-time hardware telemetry: CPU usage, RAM, GPU load, CPU temperature, "
+            "uptime, and process count. Use ONLY when the user asks about computer hardware "
+            "performance, temperature, battery, memory, or resource usage. NEVER call this "
+            "tool to check open applications, Chrome windows, browser tabs, WhatsApp, or "
+            "YouTube — use screen_process, desktop_ui, or browser_control instead."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -1167,10 +1169,29 @@ class RemLive:
                         self._last_assistant_question = ""
                         stable_task_id = ""
                     elif utter_class == "correction" and isinstance(getattr(self, "_active_browser_task", None), dict):
-                        # A correction REPLACES the previous intent: earlier wording must not
-                        # keep authorizing actions on top of the new instruction.
-                        self._active_browser_task = dict(self._active_browser_task,
-                                                         spoken_inputs=(), last_instruction="")
+                        # A correction REPLACES the previous target/site intent: drop stale
+                        # targets and earlier site tokens while preserving the active browser
+                        # task chain if the user is redirecting it (e.g. YouTube -> WhatsApp).
+                        old_bt = dict(self._active_browser_task)
+                        try:
+                            from core import desktop_control as _dc_corr
+                            _dc_corr.clear_task_targets(
+                                task_id=str(old_bt.get("task_id") or ""),
+                                browser_task_id=str(old_bt.get("task_id") or ""),
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            from actions.browser_control import _registry as _breg
+                            _breg.clear_site_targets()
+                        except Exception:
+                            pass
+                        self._active_browser_task = dict(
+                            old_bt,
+                            spoken_inputs=(cleaned,),
+                            last_instruction=cleaned,
+                        )
+                        self._last_assistant_question = ""
                 except Exception:
                     pass
             if cleaned and utter_class != "cancel":
@@ -1188,10 +1209,10 @@ class RemLive:
                         "backspace", "escape", "delete", "select", "copy", "paste", "undo",
                         "shortcut", "hotkey", "play", "watch", "open", "close",
                         "back", "forward", "backward", "seek", "rewind", "skip",
-                        "reload", "refresh", "screenshot", "capture",
+                        "reload", "refresh", "reopen", "opening", "loading", "screenshot", "capture",
                         "chat", "contact", "message", "compose", "draft", "write", "text",
                         "clear", "empty", "erase", "field", "bar", "box", "is there",
-                        "translate", "hindi", "english", "replace", "remove", "previous",
+                        "translate", "hindi", "english", "language", "replace", "remove", "previous",
                         "send", "deliver", "call", "ring", "dial", "try again", "continue",
                         "shorter", "shorten", "natural", "rewrite",
                         "first", "second", "third", "fourth", "fifth", "sixth", "last", "titled",
@@ -1202,7 +1223,17 @@ class RemLive:
                         "weather", "what time", "alarm", "reminder", "camera", "webcam",
                         "cancel task", "never mind", "forget it", "stop everything",
                         "open notepad", "open calculator",
+                        "cpu", "ram", "gpu", "battery", "temperature", "disk", "resource usage",
                     ))
+                    explicit_window_obs = (
+                        not unrelated_non_browser
+                        and any(w in low for w in (
+                            "check my window", "window directly", "chrome window",
+                            "whatsapp window", "youtube window", "active window",
+                            "what is open", "what's open", "check whether", "see whether",
+                        ))
+                    )
+                    is_browser_turn = is_browser_turn or explicit_window_obs
                     pronoun_or_confirm_words = {
                         "it", "that", "this", "one", "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "do",
                     }
@@ -1247,6 +1278,14 @@ class RemLive:
                             browser_task_id = str(prev_bt.get("task_id") or "")
                             parent_instruction = str(prev_bt.get("last_instruction") or "").strip()
                             prev_history = list(prev_bt.get("spoken_inputs") or ())
+                            # Clear stale site keywords if user starts an unclear/unrelated open request
+                            # ("Open the Euro Win Chrome browser now.") so previous YouTube/WhatsApp is NOT inherited.
+                            _has_open_verb = bool(req_tokens & {"open", "visit", "launch", "browse"})
+                            _names_known_site = bool(req_tokens & {"youtube", "whatsapp", "google", "facebook", "instagram", "twitter", "github", "gmail"})
+                            _is_open_followup = bool(req_tokens & {"it", "that", "this", "chat", "contact", "video", "result", "second", "third", "first", "again", "all"})
+                            if _has_open_verb and not _names_known_site and not _is_open_followup:
+                                prev_history = []
+                                parent_instruction = ""
                             if not is_browser_turn and parent_instruction:
                                 root_task_id = browser_task_id
                         else:
@@ -1267,7 +1306,34 @@ class RemLive:
                             if (not is_browser_turn and parent_instruction and len(parent_instruction) < 200)
                             else cleaned
                         )
-                        if has_live_bt and last_q and word_count <= 5 and not (req_tokens & pronoun_or_confirm_words):
+                        is_send_confirm_q = bool(
+                            last_q and "?" in last_q and any(
+                                w in last_q.casefold() for w in ("send", "deliver", "bhejo")
+                            )
+                        )
+                        is_suggest_reject = bool(
+                            has_live_bt and last_q and "?" in last_q and any(
+                                w in last_q.casefold() for w in ("refresh", "reload", "reopen")
+                            )
+                        )
+                        if is_suggest_reject:
+                            try:
+                                from core import task_control as _tc_r
+                                if _tc_r.has_rejection(cleaned):
+                                    # User explicitly declined a suggested reload/refresh: never pass prior suggestion onward.
+                                    prev_history = [h for h in prev_history if not any(w in h.casefold() for w in ("refresh", "reload"))]
+                                    recorded_parent = cleaned
+                                    self._last_assistant_question = ""
+                            except Exception:
+                                pass
+                        if has_live_bt and (is_send_confirm_q or desktop_control.get_pending_send_confirmation(getattr(self, "_request_context", None))):
+                            send_eval = desktop_control.evaluate_send_confirmation_utterance(
+                                cleaned, auth_context=getattr(self, "_request_context", None),
+                            )
+                            if not send_eval.get("authorized"):
+                                # Never promote ambiguous replies like "Sandy" into a typing payload or send authority.
+                                pass
+                        elif has_live_bt and last_q and word_count <= 5 and not (req_tokens & pronoun_or_confirm_words):
                             desktop_control.set_active_typing_payload(
                                 cleaned, task_id=stable_task_id, browser_task_id=browser_task_id,
                             )
@@ -2383,7 +2449,10 @@ class RemLive:
                               "observation is unavailable. No screenshot was captured or sent.")
                 else:
                     _ctx = {"player": self.ui,
-                            "session_memory": {"user_request": user_request}}
+                            "session_memory": {
+                                "user_request": user_request,
+                                "observation_question": str(args.get("text") or user_request or "").strip(),
+                            }}
                     result = await loop.run_in_executor(
                         None,
                         lambda: self._run_with_request_context(
@@ -3092,6 +3161,23 @@ class RemLive:
                             if full_out:
                                 self._last_out_logged = full_out
                                 self._last_assistant_question = (full_out if "?" in full_out else "")
+                                if self._last_assistant_question and any(
+                                    k in self._last_assistant_question.casefold()
+                                    for k in ("send", "deliver", "bhejo")
+                                ):
+                                    try:
+                                        from core import desktop_control as _dc_arm
+                                        _ctx_arm = self._current_request_context()
+                                        _comp_arm = _dc_arm.get_active_composition_state(_ctx_arm)
+                                        if _comp_arm and (_comp_arm.get("generated_content") or _comp_arm.get("selected_contact")):
+                                            _dc_arm.arm_send_confirmation(
+                                                recipient=str(_comp_arm.get("selected_contact") or ""),
+                                                draft=str(_comp_arm.get("generated_content") or ""),
+                                                composition_task_id=str(_comp_arm.get("composition_task_id") or ""),
+                                                auth_context=_ctx_arm,
+                                            )
+                                    except Exception:
+                                        pass
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
                                 if self._dashboard:
@@ -4194,6 +4280,7 @@ class RemLive:
                 self._live_reconnect_count = reconn_count
                 try:
                     from core import desktop_control as _dc_live
+                    _dc_live.on_live_reconnect()
                     _dc_live.record_diagnostics(
                         gemini_live_status="reconnecting",
                         gemini_last_error_category=err_info["category"],
@@ -4373,6 +4460,12 @@ def main():
     ui.root.mainloop()
 
     # The window is closed: write the session summary, stop the engines, go.
+    try:
+        rem_pre = holder.get("rem")
+        if rem_pre is not None:
+            rem_pre.request_shutdown()
+    except Exception:
+        pass
     try:
         from core import desktop_control
         desktop_control.emergency_stop()

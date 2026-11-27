@@ -312,8 +312,14 @@ def screen_agent(parameters: dict, player=None, speak=None, response=None,
                     desc = _describe(before)
                     try:
                         from core.screen_observation import inspect_local_screen
-                        local_detail = inspect_local_screen(str(params.get("text") or ""))
-                        if "Local OCR text:" in local_detail or "Browser windows/tabs" in local_detail:
+                        obs_q = str(
+                            params.get("text")
+                            or (session_memory or {}).get("observation_question")
+                            or (session_memory or {}).get("user_request")
+                            or ""
+                        ).strip()
+                        local_detail = inspect_local_screen(obs_q)
+                        if "Local OCR text:" in local_detail or "Browser windows/tabs" in local_detail or "Foreground rejection:" in local_detail:
                             desc = {"uia_view": desc, "local_screen": local_detail}
                     except Exception:
                         pass

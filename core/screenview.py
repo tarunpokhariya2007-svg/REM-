@@ -1600,15 +1600,33 @@ def _element_from_atspi(pyatspi: Any, node: Any, eid: int, depth: int) -> Option
 # ---------------------------------------------------------------------------
 _ocr_engine: Any = None
 _ocr_lock = threading.Lock()
+_ocr_init_count: int = 0
+_ocr_init_ms: float = 0.0
+_ocr_exec_count: int = 0
+_ocr_last_exec_ms: float = 0.0
+_ocr_total_exec_ms: float = 0.0
+
+
+def ocr_stats() -> dict:
+    """Return OCR engine initialization & execution profiling stats."""
+    with _ocr_lock:
+        return {
+            "initialized": _ocr_engine is not None,
+            "init_count": _ocr_init_count,
+            "init_ms": round(_ocr_init_ms, 2),
+            "exec_count": _ocr_exec_count,
+            "last_exec_ms": round(_ocr_last_exec_ms, 2),
+            "total_exec_ms": round(_ocr_total_exec_ms, 2),
+        }
 
 
 def _ocr_reader() -> Optional[Callable[[Any], Any]]:
-    """The OCR engine, built once. Loading it costs real time and memory, so it
-    is never built until something has actually failed over to it."""
-    global _ocr_engine
+    """The OCR engine, built once and reused across observations."""
+    global _ocr_engine, _ocr_init_count, _ocr_init_ms
     with _ocr_lock:
         if _ocr_engine is not None:
             return _ocr_engine
+        t0 = time.monotonic()
         try:
             if _HAS_RAPIDOCR:
                 from rapidocr import RapidOCR
@@ -1621,12 +1639,15 @@ def _ocr_reader() -> Optional[Callable[[Any], Any]]:
                 _ocr_engine = PaddleOCR(show_log=False)
             else:
                 return None
+            _ocr_init_count += 1
+            _ocr_init_ms = (time.monotonic() - t0) * 1000.0
         except Exception:
             _ocr_engine = None
         return _ocr_engine
 
 
 def _scan_ocr(monitor: dict, deadline: float) -> list[Element]:
+    global _ocr_exec_count, _ocr_last_exec_ms, _ocr_total_exec_ms
     if time.monotonic() > deadline:
         raise TimeoutError("OCR exceeded its budget before it started")
 
@@ -1642,6 +1663,7 @@ def _scan_ocr(monitor: dict, deadline: float) -> list[Element]:
 
     import numpy as np
 
+    t_exec0 = time.monotonic()
     image, monitor, px = capture(monitor)
 
     # First-time RapidOCR ONNX model load can take ~2-3s on Windows; grant a bounded
@@ -1652,6 +1674,11 @@ def _scan_ocr(monitor: dict, deadline: float) -> list[Element]:
         raise TimeoutError("OCR exceeded its budget before it started")
 
     result = engine(np.array(image))
+    exec_ms = (time.monotonic() - t_exec0) * 1000.0
+    with _ocr_lock:
+        _ocr_exec_count += 1
+        _ocr_last_exec_ms = exec_ms
+        _ocr_total_exec_ms += exec_ms
     # Current RapidOCR returns boxes/texts/scores as named fields. Its legacy
     # wrapper returns (rows, elapsed), while PaddleOCR returns nested rows.
     # Normalize the current API to the same internal (box, (text, score)) rows.

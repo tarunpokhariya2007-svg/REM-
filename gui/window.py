@@ -17,9 +17,9 @@ from pathlib import Path
 import psutil
 
 from PyQt6.QtCore import (
-    QEasingCurve, QEvent, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
-    QPoint, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, Qt, QTimer,
-    QUrl, pyqtSignal,
+    QAbstractAnimation, QEasingCurve, QEvent, QLineF, QMimeData, QObject,
+    QParallelAnimationGroup, QPointF, QPoint, QPropertyAnimation, QRect,
+    QRectF, QSize, QSizeF, Qt, QThread, QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
@@ -160,6 +160,9 @@ class MainWindow(QMainWindow):
         )
 
         self.on_text_command   = None
+        self._closing_evt      = threading.Event()
+        self._qt_cleaned_up    = False
+        self._fc_deleted       = False
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop REM mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
@@ -320,9 +323,9 @@ class MainWindow(QMainWindow):
             self._video_item = QGraphicsVideoItem()
             self._video_scene.addItem(self._video_item)
 
-            self._video_audio = QAudioOutput()
+            self._video_audio = QAudioOutput(self)
             self._video_audio.setMuted(True)
-            self._video_player = QMediaPlayer()
+            self._video_player = QMediaPlayer(self)
             self._video_player.setVideoOutput(self._video_item)
             # Keep the picture filling the view as the window is resized.
             self._video_item.nativeSizeChanged.connect(self._fit_video)
@@ -345,8 +348,8 @@ class MainWindow(QMainWindow):
             #
             # A local file or a direct video URL still uses the first player
             # alone: one stream, one player, nothing to synchronise.
-            self._video_sound = QMediaPlayer()
-            self._video_sound_out = QAudioOutput()
+            self._video_sound = QMediaPlayer(self)
+            self._video_sound_out = QAudioOutput(self)
             self._video_sound_out.setMuted(True)
             self._video_sound.setAudioOutput(self._video_sound_out)
 
@@ -1503,7 +1506,7 @@ class MainWindow(QMainWindow):
         control_buttons = QHBoxLayout()
         control_buttons.setSpacing(3)
         self._desktop_pause = QPushButton("PAUSE")
-        self._revoke_screen_btn = QPushButton("REVOKE ACCESS")
+        self._revoke_screen_btn = QPushButton("REVOKE SCREEN ACCESS")
         self._desktop_stop = QPushButton("EMERGENCY STOP")
         for button in (self._desktop_pause, self._revoke_screen_btn, self._desktop_stop):
             button.setFont(px_font(8, QFont.Weight.Bold))
@@ -2303,10 +2306,17 @@ class MainWindow(QMainWindow):
         """
         def work():
             try:
+                if self._closing_evt.is_set():
+                    return
                 self._wake_state()
             except Exception:
                 pass
-            self._wake_btns_sig.emit()
+            if self._closing_evt.is_set():
+                return
+            try:
+                self._wake_btns_sig.emit()
+            except RuntimeError:
+                pass
         threading.Thread(target=work, daemon=True, name="wake-state-warm").start()
 
     def _toggle_drawer(self, checked: bool):
@@ -3690,13 +3700,116 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(0, self._enter_floating_companion_mode)
         super().changeEvent(event)
 
-    def closeEvent(self, event):
+    def shutdown_qt_resources(self, *, delete_floating: bool = True):
+        """Stop all Qt timers, animations, media players, and event notifiers on the Qt thread."""
+        self._closing_evt.set()
         self._app_window_state = WINDOW_STATE_EXITING
+        if QThread.currentThread() != self.thread():
+            return
+
+        if not getattr(self, "_qt_cleaned_up", False):
+            self._qt_cleaned_up = True
+            try:
+                self._cam_stop.set()
+            except Exception:
+                pass
+
+            # Disconnect clipboard signal before teardown
+            try:
+                cb = QApplication.clipboard()
+                if cb is not None:
+                    cb.dataChanged.disconnect(self._on_clipboard_changed)
+            except Exception:
+                pass
+
+            # Stop all active QTimers and animations owned by MainWindow or floating companion
+            roots = [self]
+            fc = getattr(self, "_floating_companion", None)
+            if fc is not None:
+                roots.append(fc)
+            for root in roots:
+                try:
+                    for tmr in root.findChildren(QTimer):
+                        if tmr.isActive():
+                            tmr.stop()
+                except Exception:
+                    pass
+                try:
+                    for anim in root.findChildren(QAbstractAnimation):
+                        anim.stop()
+                except Exception:
+                    pass
+
+            for overlay_attr in ("_overlay", "_floating_settings_overlay", "_quick_drawer"):
+                ov = getattr(self, overlay_attr, None)
+                if ov is not None:
+                    try:
+                        for tmr in ov.findChildren(QTimer):
+                            if tmr.isActive():
+                                tmr.stop()
+                    except Exception:
+                        pass
+                    try:
+                        ov.close()
+                    except Exception:
+                        pass
+
+            # Detach and delete multimedia players/audio outputs on the Qt main thread
+            # so WMF/FFmpeg QWinEventNotifier & COM timers teardown on their owner thread.
+            for p_attr, out_attr in (("_video_player", "_video_audio"), ("_video_sound", "_video_sound_out")):
+                player_obj = getattr(self, p_attr, None)
+                audio_obj = getattr(self, out_attr, None)
+                if player_obj is not None:
+                    try:
+                        player_obj.stop()
+                    except Exception:
+                        pass
+                    try:
+                        player_obj.setSource(QUrl())
+                    except Exception:
+                        pass
+                    if p_attr == "_video_player":
+                        try:
+                            player_obj.setVideoOutput(None)
+                        except Exception:
+                            pass
+                    try:
+                        player_obj.setAudioOutput(None)
+                    except Exception:
+                        pass
+                    try:
+                        player_obj.deleteLater()
+                    except Exception:
+                        pass
+                    setattr(self, p_attr, None)
+                if audio_obj is not None:
+                    try:
+                        audio_obj.deleteLater()
+                    except Exception:
+                        pass
+                    setattr(self, out_attr, None)
+
+        fc = getattr(self, "_floating_companion", None)
+        if fc is not None:
+            try:
+                fc.hide()
+                fc.close()
+            except Exception:
+                pass
+            if delete_floating and not getattr(self, "_fc_deleted", False):
+                self._fc_deleted = True
+                try:
+                    fc.deleteLater()
+                except Exception:
+                    pass
+
         try:
-            self._floating_companion.hide()
-            self._floating_companion.close()
+            QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         except Exception:
             pass
+
+    def closeEvent(self, event):
+        self.shutdown_qt_resources(delete_floating=False)
         super().closeEvent(event)
 
 

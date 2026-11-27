@@ -190,28 +190,8 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
         platform=app_name, to=receiver,
     )
 
-def _send_whatsapp(receiver: str, message: str) -> str:
-    """WhatsApp goes through the verified driver when there is one.
-
-    _desktop_send below is a sequence of keystrokes with sleeps between them:
-    it presses Win, types the app name, presses Ctrl+F, types the contact,
-    presses Enter twice and reports success — without ever reading back which
-    window received any of that. When the machine is a second slower than the
-    sleeps assume, the whole sequence lands somewhere else and the user is
-    still told the message was sent.
-
-    plugins/_whatsapp_core.py already drives WhatsApp properly for the calling
-    plugins: it finds the real window, opens the conversation, checks the
-    conversation is the right person's, types, and confirms the box emptied
-    before it says "sent". Using it here costs nothing and removes the one
-    failure that matters — a message reported as delivered that never left.
-
-    The blind path stays as the fallback for a machine where the driver cannot
-    run at all (the plugin file removed, a missing dependency, no WhatsApp).
-    But once the driver HAS run, its answer stands: falling back after it
-    refused to send is how a message ends up typed into the wrong
-    conversation, which is worse than not sending it.
-    """
+def _send_whatsapp(receiver: str, message: str, *, task_id: str = "") -> str:
+    """WhatsApp goes through the verified driver when there is one."""
     try:
         from plugins import _whatsapp_core as wa
     except Exception as e:
@@ -232,12 +212,33 @@ def _send_whatsapp(receiver: str, message: str) -> str:
     if desktop_control.should_stop():
         return outcome.failed("send_message", "computer control was stopped; no message was sent",
                               platform="WhatsApp", to=receiver)
-    sent, failure = transport.send_message_to(receiver, message, task_id="")
+    dhash = wa.draft_hash(message)
+    ctx = desktop_control.current_bound_auth_context()
+    eff_tid = str(task_id or (getattr(ctx, "task_id", "") if ctx is not None else "") or "")
+    ok_send, deny_reason, _conf = desktop_control.is_send_authorized(
+        receiver=receiver,
+        draft_hash=dhash,
+        composition_task_id=eff_tid,
+        utterance=str(getattr(ctx, "instruction", "") if ctx is not None else ""),
+        auth_context=ctx,
+    )
+    if not ok_send and ctx is not None:
+        return outcome.failed("send_message", deny_reason, platform="WhatsApp", to=receiver)
+
+    sent, failure = transport.send_message_to(receiver, message, task_id=eff_tid)
     if sent:
         return outcome.done("send_message", platform="WhatsApp",
-                            to=receiver, verified=True, sending_status="sent")
+                            to=receiver, verified=True, sending_status="sent",
+                            lifecycle_state=desktop_control.MSG_SEND_VERIFIED,
+                            bubble_verified=True)
     if "unverified" in str(failure or "").casefold():
-        return outcome.unverified("send_message", failure, platform="WhatsApp", to=receiver)
+        return outcome.unverified(
+            "send_message",
+            "I attempted to send the message, but WhatsApp has not confirmed that it was sent.",
+            platform="WhatsApp", to=receiver,
+            lifecycle_state=desktop_control.MSG_SEND_UNVERIFIED,
+            verified=False,
+        )
     return outcome.failed("send_message", failure,
                           platform="WhatsApp", to=receiver)
 
@@ -331,7 +332,7 @@ def _resolve_platform(platform_str: str):
     return lambda r, m: _desktop_send(platform_str.strip().title(), r, m)
 
 
-def _is_voice_authorized_send(receiver: str, platform: str) -> tuple[bool, str]:
+def _is_voice_authorized_send(receiver: str, platform: str, *, message_text: str = "") -> tuple[bool, str]:
     """Return True when an active, explicit voice/typed task clearly authorized sending without GUI confirm."""
     try:
         from core import autonomous_mode, desktop_control
@@ -345,16 +346,23 @@ def _is_voice_authorized_send(receiver: str, platform: str) -> tuple[bool, str]:
             return False, ""
         ok, _reason = desktop_control.authorize_user_request(
             ctx.instruction, "send_message",
-            {"receiver": receiver, "platform": platform},
+            {"receiver": receiver, "platform": platform, "message_text": message_text},
             source=src, auth_context=ctx,
         )
         if not ok:
             return False, ""
-        # The send instruction must be in the CURRENT utterance, as a whole, non-negated
-        # word. Earlier turns (parent_instruction) used to count, so "don't send it" or a
-        # cancelled "send hello to Rio" could authorize a later send.
-        from core import task_control
-        if not task_control.has_send_command(str(getattr(ctx, "instruction", "") or "")):
+        import hashlib
+        dhash = hashlib.sha256(str(message_text or "").encode("utf-8", errors="ignore")).hexdigest()[:16] if message_text else ""
+        comp_tid = str(getattr(ctx, "browser_task_id", "") or getattr(ctx, "task_id", "") or "")
+        ok_send, _deny, _conf = desktop_control.is_send_authorized(
+            receiver=receiver,
+            draft_hash=dhash,
+            composition_task_id=comp_tid,
+            utterance=str(getattr(ctx, "instruction", "") or ""),
+            auth_context=ctx,
+            check_duplicate=False,
+        )
+        if not ok_send:
             return False, ""
         return True, str(getattr(ctx, "task_id", "") or "")
     except Exception:
@@ -401,7 +409,7 @@ def send_message(
             to=receiver, platform=platform,
         )
 
-    voice_direct, task_id = _is_voice_authorized_send(receiver, platform)
+    voice_direct, task_id = _is_voice_authorized_send(receiver, platform, message_text=message_text)
     if voice_direct:
         try:
             from core import desktop_control
@@ -416,7 +424,7 @@ def send_message(
             try:
                 from core import desktop_control
                 with desktop_control.action(f"send_message:{platform} to {receiver}"):
-                    res = _send_whatsapp(receiver, message_text)
+                    res = _send_whatsapp(receiver, message_text, task_id=task_id)
                     desktop_control.report(f"send_message:{platform}", str(res)[:140])
                     if player:
                         player.set_desktop_control_status(desktop_control.snapshot())
@@ -525,12 +533,10 @@ TOOL = {
     "description": (
         "Sends a text message via WhatsApp, Telegram, or another messaging "
         "platform. Write 'message_text' in the USER'S OWN LANGUAGE, or pass the "
-        "verified active draft when the user says 'Send it'. "
-        "When explicitly authorized by the user's direct voice command on WhatsApp, "
-        "this executes directly without forcing an extra HUD click prompt. "
-        "On status=done report that the message was verified sent; on "
-        "status=unverified say you submitted it but could not confirm delivery; "
-        "on status=failed explain why it did not send."
+        "verified active draft ONLY after the user clearly says 'Yes, send it' or 'Send the message'. "
+        "On status=done verified=True report that the message was verified sent; on "
+        "status=unverified say exactly 'I attempted to send the message, but WhatsApp has not confirmed that it was sent.'; "
+        "never report success unless outgoing bubble evidence is verified."
     ),
     "tier": "core",
     "parameters": {

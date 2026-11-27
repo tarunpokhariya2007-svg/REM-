@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from actions import browser_control, screen_agent
 from actions.system_monitor import SystemMonitor
-from core import autonomous_mode, desktop_control, screen_observation
+from core import autonomous_mode, conversation, desktop_control, screen_observation
 from core.avatar_anim import (
     ANGRY,
     CONTEXTUAL_EMOTION_DETECTION,
@@ -32,6 +32,7 @@ from core.avatar_anim import (
 from core.conversation import detect_language
 from core.request_context import RequestContext
 from memory import config_manager
+from plugins import _whatsapp_core
 
 
 def _run_immediate(coro):
@@ -3108,6 +3109,1654 @@ class LiveWhatsAppRegressionSuiteTests(unittest.TestCase):
         self.assertEqual(rem._current_request_context().browser_task_id, root_tid)
         rem._record_user_request("Remove all the text from the message bar", "voice")
         self.assertEqual(rem._current_request_context().browser_task_id, root_tid)
+
+
+class LiveRoutingObservationAndCorrectionTests(unittest.TestCase):
+    def setUp(self):
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync()
+        desktop_control.clear_all_task_state()
+
+    def test_chrome_target_registry_separates_whatsapp_and_youtube(self):
+        from core import appidentity, screenact, screenview
+
+        windows = [
+            ("chrome.exe", "Lo-fi Beats - YouTube - Google Chrome"),
+            ("chrome.exe", "WhatsApp - Google Chrome"),
+        ]
+        with patch.object(screenview, "_foreground", return_value=("chrome.exe", "Lo-fi Beats - YouTube - Google Chrome", 2100, 9101)), \
+             patch.object(screenview, "all_windows", return_value=windows), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(browser_control, "_win32_window_identity_for_title", return_value=(9202, 2200, "chrome.exe", "WhatsApp - Google Chrome")):
+            wa_win = browser_control._find_browser_window("chrome", site_hint="whatsapp")
+            yt_win = browser_control._find_browser_window("chrome", site_hint="youtube")
+
+        self.assertTrue(wa_win["found"])
+        self.assertFalse(wa_win["site_mismatch"])
+        self.assertEqual(wa_win["hwnd"], 9202)
+        self.assertIn("WhatsApp", wa_win["title"])
+        self.assertEqual(yt_win["hwnd"], 9101)
+        self.assertIn("YouTube", yt_win["title"])
+        reg = browser_control.get_browser_target_registry("chrome")
+        self.assertEqual(reg["whatsapp"]["hwnd"], 9202)
+        self.assertEqual(reg["youtube"]["hwnd"], 9101)
+
+        # Open web.whatsapp.com when WhatsApp Chrome window already exists -> focus instead of launching duplicate
+        with patch.object(appidentity, "running", return_value=True), \
+             patch.object(browser_control, "_find_browser_window", return_value=wa_win), \
+             patch.object(browser_control, "_ensure_browser_foreground", return_value=(True, {**wa_win, "foreground": True}, "")), \
+             patch.object(browser_control.subprocess, "Popen") as mock_popen:
+            res = browser_control._open_native("https://web.whatsapp.com/", "chrome")
+        self.assertFalse(mock_popen.called)
+        self.assertIn("status=done", res)
+        self.assertIn("navigation_completed=true", res)
+
+    def test_get_url_fast_path_skips_ocr_and_reports_timings(self):
+        from core import screenview
+
+        t0 = time.monotonic()
+        fake_view = SimpleNamespace(
+            app="chrome.exe",
+            title="WhatsApp - Google Chrome",
+            source="uia",
+            degraded=False,
+            elements=[SimpleNamespace(role="edit", name="Address and search bar", label="Address bar", value="https://web.whatsapp.com/")],
+            windows=[("chrome.exe", "WhatsApp - Google Chrome")],
+            pid=2200,
+        )
+        look_calls = []
+
+        def _fake_look(**kw):
+            look_calls.append(kw)
+            return fake_view
+
+        with patch.object(screenview, "_foreground", return_value=("chrome.exe", "WhatsApp - Google Chrome", 2200, 9202)), \
+             patch.object(screenview, "all_windows", return_value=[("chrome.exe", "WhatsApp - Google Chrome")]), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=_fake_look):
+            out = browser_control._native_browser_action("get_url", {"url": "https://web.whatsapp.com/"}, "chrome")
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        self.assertLess(elapsed_ms, 500.0)
+        self.assertEqual(len(look_calls), 1)
+        self.assertFalse(look_calls[0]["allow_ocr"])
+        self.assertIn("status=done", out)
+        self.assertIn("timing_total_ms=", out)
+        self.assertIn("https://web.whatsapp.com/", out)
+
+    def test_inspect_local_screen_never_attributes_background_chrome_ocr_to_python_self(self):
+        from core import appidentity, screenview
+
+        self_view = SimpleNamespace(
+            app="python.exe", title="REM - Mark LVII", source="self", degraded=True,
+            reason="the assistant's own window is in front", elements=[],
+            windows=[("python.exe", "REM - Mark LVII"), ("chrome.exe", "WhatsApp - Google Chrome")],
+            pid=1111, monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "api_keys.json"
+            with patch.object(config_manager, "CONFIG_FILE", cfg), \
+                 patch.object(screenview, "_foreground", return_value=("python.exe", "REM - Mark LVII", 1111, 1001)), \
+                 patch.object(screenview, "is_own_pid", side_effect=lambda p: p == 1111), \
+                 patch.object(screenview, "look", return_value=self_view), \
+                 patch.object(screenview, "_scan_ocr", side_effect=AssertionError("must not scrape background OCR under app=self")), \
+                 patch.object(appidentity, "focus_window_by_app", return_value={"activated": False, "reason": "foreground_lock"}):
+                summary = screen_observation.inspect_local_screen("Check whether WhatsApp is open in Chrome")
+        self.assertIn("Foreground rejection: REM's own window is in front", summary)
+        self.assertIn("target_matched=False", summary)
+        self.assertIn("confidence=uncertain", summary)
+        self.assertIn("ocr_items=0", summary)
+
+    def test_correction_and_and_check_continuity_without_system_status_confusion(self):
+        from main import RemLive, TOOL_DECLARATIONS
+
+        sys_decl = next(d for d in TOOL_DECLARATIONS if d["name"] == "system_status")
+        self.assertIn("NEVER call this tool to check open applications", sys_decl["description"])
+
+        rem = RemLive.__new__(RemLive)
+        rem._request_context_lock = threading.Lock()
+        rem._request_context = None
+        rem._last_user_command = ""
+        rem._last_user_command_source = "untrusted"
+        rem._active_browser_task = None
+        rem._last_assistant_question = ""
+        rem._current_voice_turn_task_id = ""
+
+        # Step 1: User starts with YouTube, then corrects to WhatsApp
+        rem._record_user_request("Open YouTube in Chrome", "voice")
+        btid = rem._current_request_context().browser_task_id
+        self.assertTrue(btid)
+
+        rem._record_user_request("No, WhatsApp", "voice")
+        ctx_corr = rem._current_request_context()
+        self.assertEqual(ctx_corr.browser_task_id, btid)
+        ok_go, reason_go = desktop_control.authorize_user_request(
+            ctx_corr.instruction, "browser_control",
+            {"action": "go_to", "url": "https://web.whatsapp.com/"},
+            source="voice", auth_context=ctx_corr,
+        )
+        self.assertTrue(ok_go, reason_go)
+
+        # Step 2: Short follow-up "And check" authorizes observation without browser_task=none
+        rem._record_user_request("And check", "voice")
+        ctx_chk = rem._current_request_context()
+        self.assertEqual(ctx_chk.browser_task_id, btid)
+        for tool, args in (
+            ("desktop_ui", {"action": "observe"}),
+            ("screen_process", {"angle": "screen", "text": "And check"}),
+            ("browser_control", {"action": "inspect"}),
+        ):
+            ok, reason = desktop_control.authorize_user_request(
+                ctx_chk.instruction, tool, args, source="voice", auth_context=ctx_chk,
+            )
+            self.assertTrue(ok, f"{tool} failed: {reason}")
+
+        # Step 3: "Check my window directly" authorizes window observation
+        rem._record_user_request("Check my window directly", "voice")
+        ctx_dir = rem._current_request_context()
+        ok_dir, reason_dir = desktop_control.authorize_user_request(
+            ctx_dir.instruction, "screen_process", {"angle": "screen", "text": "Check my window directly"},
+            source="voice", auth_context=ctx_dir,
+        )
+        self.assertTrue(ok_dir, reason_dir)
+
+        # Step 4: "Cancel" invalidates active task & stale contexts
+        rem._record_user_request("Cancel", "voice")
+        self.assertIsNone(rem._active_browser_task)
+        ok_after_cancel, _ = desktop_control.authorize_user_request(
+            ctx_corr.instruction, "browser_control", {"action": "smart_type", "text": "hello"},
+            source="voice", auth_context=ctx_corr,
+        )
+        self.assertFalse(ok_after_cancel)
+
+    def test_whatsapp_search_bar_recovery_and_strict_rio_matching(self):
+        from core import screenact, screenview
+
+        miss_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia", degraded=False, elements=[],
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+        sb_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia", degraded=False,
+            elements=[
+                screenview.Element(eid="sb", role="edit", name="Search input textbox", value="", left=90, top=140, width=260, height=34),
+            ],
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+        results_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia", degraded=False,
+            elements=[
+                screenview.Element(eid="c1", role="listitem", name="Mario\nYesterday\nHey", value="", left=80, top=220, width=280, height=64),
+                screenview.Element(eid="c2", role="listitem", name="Rio\nToday\nReady", value="", left=80, top=290, width=280, height=64),
+            ],
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+        typed = []
+        with patch.object(screenview, "_foreground", return_value=("chrome.exe", "WhatsApp - Google Chrome", 2200, 9202)), \
+             patch.object(screenview, "all_windows", return_value=[("chrome.exe", "WhatsApp - Google Chrome")]), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=[miss_view, sb_view, results_view]), \
+             patch.object(screenact, "move_cursor", side_effect=lambda pt: screenact.Act(True, "move", point=(pt.x, pt.y))), \
+             patch.object(screenact, "click", side_effect=lambda pt: screenact.Act(True, "click", point=(pt.x, pt.y))), \
+             patch.object(screenact, "type_text", side_effect=lambda txt, **kw: (typed.append(txt), screenact.Act(True, "type"))[1]):
+            out = browser_control._native_browser_action("search_contact", {"query": "Rio", "description": "WhatsApp search bar"}, "chrome")
+        self.assertEqual(typed, ["Rio"])
+        self.assertIn("status=done", out)
+        self.assertIn("recovery_attempts=2", out)
+        self.assertIn("unique_contact_count=1", out)
+        self.assertIn("matched_contacts=Rio", out)
+        self.assertNotIn("Mario", out)
+
+
+class WhatsAppLifecycleAndVerificationTests(unittest.TestCase):
+    def setUp(self):
+        desktop_control.clear_all_task_state()
+        desktop_control._sent_attempt_records.clear()
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync()
+        browser_control._mark_opening_inflight("chrome", "whatsapp", False)
+
+    def _ctx(self, instruction: str, *, task_id: str = "t-wa", btid: str = "bt-wa", age_s: float = 0.0):
+        now = time.monotonic() - age_s
+        return RequestContext.create(
+            instruction, "voice", now=now, task_id=task_id,
+            browser="chrome", browser_task_id=btid, spoken_inputs=(instruction,),
+        )
+
+    def test_1_to_5_sandy_silence_yes_draft_and_recipient_change_confirmation_rules(self):
+        ctx = self._ctx("Compose a friendly message for Rio")
+        comp = desktop_control.set_active_composition_state(
+            composition_requested=True,
+            composition_task_id="t-wa",
+            selected_contact="Rio",
+            generated_content="Hey Rio, hope your day is going well!",
+            draft_verified=True,
+            auth_context=ctx,
+        )
+        self.assertEqual(desktop_control.get_message_lifecycle(ctx)["state"], desktop_control.MSG_DRAFT_VERIFIED)
+
+        conf = desktop_control.arm_send_confirmation(
+            recipient="Rio", draft="Hey Rio, hope your day is going well!",
+            composition_task_id="t-wa", auth_context=ctx,
+        )
+        self.assertEqual(desktop_control.get_message_lifecycle(ctx)["state"], desktop_control.MSG_AWAITING_CONFIRMATION)
+
+        # 1. "Sandy" after send confirmation MUST NOT send
+        eval_sandy = desktop_control.evaluate_send_confirmation_utterance("Sandy", auth_context=ctx)
+        self.assertFalse(eval_sandy["authorized"])
+        ok_sandy_ctx = self._ctx("Sandy")
+        ok_send_sandy, deny_sandy = desktop_control.authorize_user_request(
+            "Sandy", "send_message",
+            {"receiver": "Rio", "message_text": "Hey Rio, hope your day is going well!", "platform": "WhatsApp"},
+            source="voice", auth_context=ok_sandy_ctx,
+        )
+        self.assertFalse(ok_send_sandy)
+
+        # 2. Silence MUST NOT send
+        eval_silence = desktop_control.evaluate_send_confirmation_utterance("", auth_context=ctx)
+        self.assertFalse(eval_silence["authorized"])
+        ok_sil, _, _ = desktop_control.is_send_authorized(
+            receiver="Rio", draft_hash=comp["generated_content_hash"],
+            composition_task_id="t-wa", utterance="", auth_context=ctx,
+        )
+        self.assertFalse(ok_sil)
+
+        # 3. "Yes, send it" authorizes ONLY the exact pending draft and recipient
+        eval_yes = desktop_control.evaluate_send_confirmation_utterance("Yes, send it", auth_context=ctx)
+        self.assertTrue(eval_yes["authorized"])
+        self.assertEqual(desktop_control.get_message_lifecycle(ctx)["state"], desktop_control.MSG_SEND_AUTHORIZED)
+        yes_ctx = self._ctx("Yes, send it")
+        ok_yes, deny_yes, _ = desktop_control.is_send_authorized(
+            receiver="Rio", draft_hash=comp["generated_content_hash"],
+            composition_task_id="t-wa", utterance="Yes, send it", auth_context=yes_ctx,
+        )
+        self.assertTrue(ok_yes, deny_yes)
+
+        # 4. Changed draft invalidates confirmation
+        ok_changed_draft, _ = desktop_control.is_send_authorized(
+            receiver="Rio", draft_hash="deadbeef12345678",
+            composition_task_id="t-wa", utterance="Yes, send it", auth_context=yes_ctx,
+        )[:2]
+        self.assertFalse(ok_changed_draft)
+
+        # Re-arm and confirm, then test 5. Changed recipient invalidates confirmation
+        desktop_control.arm_send_confirmation(
+            recipient="Rio", draft="Hey Rio, hope your day is going well!",
+            composition_task_id="t-wa", auth_context=ctx,
+        )
+        desktop_control.evaluate_send_confirmation_utterance("Send the message", auth_context=ctx)
+        ok_changed_rec, _, _ = desktop_control.is_send_authorized(
+            receiver="Mario", draft_hash=comp["generated_content_hash"],
+            composition_task_id="t-wa", utterance="Send the message", auth_context=yes_ctx,
+        )
+        self.assertFalse(ok_changed_rec)
+
+    def test_6_to_8_enter_unverified_without_bubble_verified_with_bubble_and_duplicate_blocked(self):
+        from core import screenact, screenview
+        from plugins import _whatsapp_core as _wa
+
+        ctx = self._ctx("Yes, send it")
+        draft = "Hey Rio, checking in!"
+        dhash = _wa.draft_hash(draft)
+        desktop_control.set_active_composition_state(
+            composition_requested=True, composition_task_id="t-wa",
+            selected_contact="Rio", generated_content=draft, draft_verified=True, auth_context=ctx,
+        )
+        desktop_control.arm_send_confirmation(recipient="Rio", draft=draft, composition_task_id="t-wa", auth_context=ctx)
+        desktop_control.evaluate_send_confirmation_utterance("Yes, send it", auth_context=ctx)
+
+        before_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia", degraded=False,
+            elements=[
+                screenview.Element(eid="hdr", role="text", name="Rio", value="", left=580, top=105, width=100, height=24),
+                screenview.Element(eid="c", role="edit", name="Type a message", value=draft, left=580, top=940, width=680, height=40, focused=True),
+            ],
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+        # Composer cleared, BUT NO outgoing bubble appeared!
+        empty_no_bubble = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia", degraded=False,
+            elements=[
+                screenview.Element(eid="hdr", role="text", name="Rio", value="", left=580, top=105, width=100, height=24),
+                screenview.Element(eid="c", role="edit", name="Type a message", value="", left=580, top=940, width=680, height=40, focused=True),
+            ],
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+
+        # 6. Enter pressed without new bubble => SEND_UNVERIFIED (never "Message sent")
+        tok = desktop_control.bind_auth_context(ctx)
+        try:
+            with patch.object(screenview, "_foreground", return_value=("chrome.exe", "WhatsApp - Google Chrome", 2200, 9202)), \
+                 patch.object(screenview, "all_windows", return_value=[("chrome.exe", "WhatsApp - Google Chrome")]), \
+                 patch.object(screenview, "is_own_pid", return_value=False), \
+                 patch.object(screenview, "look", side_effect=[before_view, empty_no_bubble]), \
+                 patch.object(screenact, "press", return_value=screenact.Act(True, "press")):
+                out_unver = browser_control._native_browser_action("press", {"key": "enter"}, "chrome")
+        finally:
+            desktop_control.reset_auth_context(tok)
+        self.assertIn("status=unverified", out_unver)
+        self.assertIn("WhatsApp has not confirmed that it was sent", out_unver)
+        self.assertEqual(desktop_control.get_message_lifecycle(ctx)["state"], desktop_control.MSG_SEND_UNVERIFIED)
+
+        # 8. Duplicate send is blocked automatically after unverified send attempt
+        ok_dup, dup_reason, _ = desktop_control.is_send_authorized(
+            receiver="Rio", draft_hash=dhash, composition_task_id="t-wa",
+            utterance="Yes, send it", auth_context=ctx,
+        )
+        self.assertFalse(ok_dup)
+        self.assertIn("duplicate", dup_reason.lower())
+
+        # 7. Positive outgoing bubble + verified conversation header establishes SEND_VERIFIED
+        with_bubble = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia", degraded=False,
+            elements=[
+                screenview.Element(eid="hdr", role="text", name="Rio", value="", left=580, top=105, width=100, height=24),
+                screenview.Element(eid="b1", role="text", name=draft, value="", left=900, top=820, width=320, height=34),
+                screenview.Element(eid="c", role="edit", name="Type a message", value="", left=580, top=940, width=680, height=40, focused=True),
+            ],
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+        det = _wa.verify_outgoing_message_detailed(with_bubble, draft, before_view=before_view, expected_contact="Rio")
+        self.assertTrue(det["verified"])
+        self.assertTrue(det["bubble_found"])
+        self.assertTrue(det["composer_cleared"])
+
+    def test_9_to_11_rio_not_mario_no_arbitrary_search_field_and_first_chat_verified(self):
+        from core import screenact, screenview
+        from plugins import _whatsapp_core as _wa
+
+        # 9 & 10. Search must NOT use omnibox/composer if no WhatsApp search field exists
+        omnibox_only = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia", degraded=False,
+            elements=[
+                screenview.Element(eid="addr", role="edit", name="Address and search bar", value="web.whatsapp.com", left=120, top=42, width=800, height=30),
+                screenview.Element(eid="comp", role="edit", name="Type a message", value="", left=580, top=940, width=680, height=40),
+            ],
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+        with patch.object(screenview, "_foreground", return_value=("chrome.exe", "WhatsApp - Google Chrome", 2200, 9202)), \
+             patch.object(screenview, "all_windows", return_value=[("chrome.exe", "WhatsApp - Google Chrome")]), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", return_value=omnibox_only), \
+             patch.object(screenact, "press", side_effect=AssertionError("must never press Enter blindly")), \
+             patch.object(screenact, "click", side_effect=AssertionError("must never click unverified field")):
+            fail_search = browser_control._native_browser_action("search_contact", {"query": "Rio"}, "chrome")
+        self.assertIn("status=failed", fail_search)
+        self.assertIn("search_bar_found=false", fail_search)
+
+        # 9. Verify Rio whole-word contact matching rejects Mario
+        self.assertEqual(_wa.contact_match("Rio", "Mario"), "none")
+        self.assertEqual(_wa.contact_match("Rio", "Rio"), "exact")
+
+        # 11. "Open the first chat" verifies header before returning done
+        list_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia", degraded=False,
+            elements=[
+                screenview.Element(eid="c1", role="listitem", name="Rio\nToday\nReady", value="", left=80, top=220, width=280, height=64),
+                screenview.Element(eid="c2", role="listitem", name="Mario\nYesterday\nHi", value="", left=80, top=290, width=280, height=64),
+            ],
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+        opened_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", source="uia", degraded=False,
+            elements=[
+                screenview.Element(eid="hdr", role="text", name="Rio", value="", left=580, top=105, width=100, height=24),
+                screenview.Element(eid="comp", role="edit", name="Type a message", value="", left=580, top=940, width=680, height=40),
+            ],
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+        )
+        with patch.object(screenview, "_foreground", return_value=("chrome.exe", "WhatsApp - Google Chrome", 2200, 9202)), \
+             patch.object(screenview, "all_windows", return_value=[("chrome.exe", "WhatsApp - Google Chrome")]), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=[list_view, opened_view]), \
+             patch.object(screenact, "get_cursor_pos", return_value=(100, 100)), \
+             patch.object(screenact, "move_cursor", side_effect=lambda pt: screenact.Act(True, "move", point=(pt.x, pt.y))), \
+             patch.object(screenact, "click", side_effect=lambda pt: screenact.Act(True, "click", point=(pt.x, pt.y))):
+            out_first = browser_control._native_browser_action("smart_click", {"description": "open the first chat"}, "chrome")
+        self.assertIn("status=done", out_first)
+        self.assertIn("active_contact=Rio", out_first)
+        self.assertIn("selected_chat_verified=true", out_first)
+
+    def test_12_to_14_reconnect_expiry_inflight_open_continuity_and_ocr_stats(self):
+        from core import screenview
+        from main import RemLive
+
+        # 12. Reconnect preserves draft/recipient & invalidates pre-reconnect send confirmation
+        ctx = self._ctx("Compose message to Rio")
+        draft = "Hey Rio, see you at 5"
+        comp = desktop_control.set_active_composition_state(
+            composition_requested=True, composition_task_id="t-wa",
+            selected_contact="Rio", generated_content=draft, draft_verified=True, auth_context=ctx,
+        )
+        desktop_control.arm_send_confirmation(recipient="Rio", draft=draft, composition_task_id="t-wa", auth_context=ctx)
+        desktop_control.evaluate_send_confirmation_utterance("Yes, send it", auth_context=ctx)
+        desktop_control.on_live_reconnect()
+        preserved = desktop_control.get_active_composition_state(ctx)
+        self.assertIsNotNone(preserved)
+        self.assertEqual(preserved["selected_contact"], "Rio")
+        self.assertTrue(preserved["needs_reverify"])
+        self.assertIsNone(desktop_control.get_pending_send_confirmation(ctx))
+        ok_post_rc, _, _ = desktop_control.is_send_authorized(
+            receiver="Rio", draft_hash=comp["generated_content_hash"],
+            composition_task_id="t-wa", utterance="Yes", auth_context=ctx,
+        )
+        self.assertFalse(ok_post_rc)
+
+        # 13. In-flight WhatsApp opening joins existing open window instead of returning busy failure
+        browser_control._mark_opening_inflight("chrome", "whatsapp", True)
+        try:
+            with patch.object(browser_control, "_find_browser_window", return_value={
+                "found": True, "foreground": True, "browser": "chrome",
+                "app": "chrome.exe", "title": "WhatsApp - Google Chrome", "hwnd": 9202, "pid": 2200, "site_mismatch": False,
+            }), \
+                 patch.object(browser_control, "_ensure_browser_foreground", return_value=(True, {"found": True, "foreground": True, "hwnd": 9202, "pid": 2200, "title": "WhatsApp - Google Chrome"}, "")):
+                joined = browser_control._wait_or_inspect_inflight_open("chrome", "whatsapp", url="https://web.whatsapp.com/")
+        finally:
+            browser_control._mark_opening_inflight("chrome", "whatsapp", False)
+        self.assertIn("joined_inflight=true", joined)
+        self.assertIn("status=done", joined)
+
+        # 14. Browser task continuity survives legitimate WhatsApp workflow + switch action
+        rem = RemLive.__new__(RemLive)
+        rem._request_context_lock = threading.Lock()
+        rem._request_context = None
+        rem._last_user_command = ""
+        rem._last_user_command_source = "untrusted"
+        rem._active_browser_task = None
+        rem._last_assistant_question = ""
+        rem._current_voice_turn_task_id = ""
+
+        rem._record_user_request("Open WhatsApp in Chrome", "voice")
+        btid = rem._current_request_context().browser_task_id
+        for utt, tool, args in (
+            ("Search for Rio in WhatsApp", "browser_control", {"action": "search_contact", "query": "Rio"}),
+            ("Open the first chat", "browser_control", {"action": "smart_click", "description": "first chat"}),
+            ("Switch tab to WhatsApp", "browser_control", {"action": "switch", "browser": "chrome"}),
+        ):
+            rem._record_user_request(utt, "voice")
+            c = rem._current_request_context()
+            self.assertEqual(c.browser_task_id, btid)
+            ok, reason = desktop_control.authorize_user_request(
+                c.instruction, tool, args, source="voice", auth_context=c,
+            )
+            self.assertTrue(ok, f"{utt}: {reason}")
+
+        # OCR profiler telemetry available
+        stats = screenview.ocr_stats()
+        self.assertIn("initialized", stats)
+        self.assertIn("init_count", stats)
+        self.assertIn("exec_count", stats)
+
+
+class ChromeNavigationTabReuseAndQtShutdownTests(unittest.TestCase):
+    def setUp(self):
+        desktop_control.clear_all_task_state()
+        desktop_control._sent_attempt_records.clear()
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync("chrome")
+
+    def tearDown(self):
+        desktop_control.clear_all_task_state()
+        desktop_control._sent_attempt_records.clear()
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync("chrome")
+
+    def test_j01_open_whatsapp_reuses_existing_chrome_window_no_duplicate(self):
+        with patch.object(browser_control.appidentity, "running", return_value=True), \
+             patch.object(browser_control, "_find_browser_window", return_value={
+                 "found": True, "foreground": False, "browser": "chrome",
+                 "app": "chrome.exe", "title": "WhatsApp - Google Chrome",
+                 "hwnd": 4101, "pid": 8201, "matched_site": "whatsapp", "site_mismatch": False,
+             }), \
+             patch.object(browser_control, "_ensure_browser_foreground", return_value=(
+                 True,
+                 {"found": True, "foreground": True, "browser": "chrome",
+                  "app": "chrome.exe", "title": "WhatsApp - Google Chrome", "hwnd": 4101, "pid": 8201},
+                 "",
+             )), \
+             patch.object(browser_control.subprocess, "Popen") as mock_popen:
+            res = browser_control._open_native("https://web.whatsapp.com/", "chrome")
+
+        mock_popen.assert_not_called()
+        self.assertIn("status=done", res)
+        self.assertIn("reused_existing=true", res)
+        self.assertIn("foreground_verified=true", res)
+        self.assertIn("target_matched=true", res)
+        self.assertIn("navigation_lifecycle=SUCCESS", res)
+
+    def test_j02_open_youtube_reuses_existing_chrome_window_no_duplicate(self):
+        with patch.object(browser_control.appidentity, "running", return_value=True), \
+             patch.object(browser_control, "_find_browser_window", return_value={
+                 "found": True, "foreground": True, "browser": "chrome",
+                 "app": "chrome.exe", "title": "YouTube - Google Chrome",
+                 "hwnd": 4102, "pid": 8201, "matched_site": "youtube", "site_mismatch": False,
+             }), \
+             patch.object(browser_control, "_ensure_browser_foreground", return_value=(
+                 True,
+                 {"found": True, "foreground": True, "browser": "chrome",
+                  "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 4102, "pid": 8201},
+                 "",
+             )), \
+             patch.object(browser_control.subprocess, "Popen") as mock_popen:
+            res = browser_control._open_native("https://www.youtube.com/", "chrome")
+
+        mock_popen.assert_not_called()
+        self.assertIn("status=done", res)
+        self.assertIn("reused_existing=true", res)
+        self.assertIn("foreground_verified=true", res)
+        self.assertIn("target_matched=true", res)
+
+    def test_j03_project_overview_and_new_tab_never_verify_whatsapp_or_youtube(self):
+        for title, url in (
+            ("Project Overview - Google Chrome", ""),
+            ("New Tab - Google Chrome", "chrome://newtab/"),
+            ("", "about:blank"),
+        ):
+            for site in ("whatsapp", "youtube"):
+                ident = browser_control.verify_site_page_identity(site, url=url, title=title)
+                self.assertFalse(ident["verified"], f"{site} falsely verified for {title!r}/{url!r}")
+                self.assertFalse(ident["target_matched"])
+
+        with patch.object(browser_control.appidentity, "running", return_value=True), \
+             patch("core.screenview.all_windows", return_value=[("chrome.exe", "Project Overview - Google Chrome")]), \
+             patch("core.screenview._foreground", return_value=("chrome.exe", "Project Overview - Google Chrome", 991, 9910)), \
+             patch("core.screenview.look", return_value=SimpleNamespace(title="Project Overview - Google Chrome", elements=[])):
+            res = browser_control._verify_native_browser("chrome", "https://web.whatsapp.com/", timeout_s=0.05)
+
+        self.assertTrue(res.startswith("status=unverified "))
+        self.assertIn("target_matched=false", res)
+        self.assertIn("page_state=wrong_tab", res)
+
+    def test_j04_google_search_results_rejected_for_whatsapp_and_youtube(self):
+        ident_wa = browser_control.verify_site_page_identity(
+            "whatsapp",
+            url="https://www.google.com/search?q=whatsapp+web",
+            title="whatsapp web - Google Search - Google Chrome",
+        )
+        self.assertFalse(ident_wa["verified"])
+        self.assertFalse(ident_wa["target_matched"])
+        self.assertEqual(ident_wa["page_state"], "wrong_tab")
+
+        ident_yt = browser_control.verify_site_page_identity(
+            "youtube",
+            url="https://www.google.com/search?q=youtube",
+            title="youtube - Google Search - Google Chrome",
+        )
+        self.assertFalse(ident_yt["verified"])
+        self.assertEqual(ident_yt["page_state"], "wrong_tab")
+
+        # Also ensure _site_key_from_url_or_title does not tag Google Search SERP as whatsapp/youtube
+        self.assertEqual(
+            browser_control._site_key_from_url_or_title("", "whatsapp web - Google Search - Google Chrome"),
+            "google",
+        )
+
+    def test_j05_loading_past_deadline_returns_timeout_not_done(self):
+        with patch.object(browser_control.appidentity, "running", return_value=True), \
+             patch("core.screenview.all_windows", return_value=[("chrome.exe", "Loading... - Google Chrome")]), \
+             patch("core.screenview._foreground", return_value=("chrome.exe", "Loading... - Google Chrome", 991, 9910)), \
+             patch("core.screenview.look", return_value=SimpleNamespace(title="Loading... - Google Chrome", elements=[])):
+            res = browser_control._verify_native_browser("chrome", "https://www.youtube.com/", timeout_s=0.05)
+
+        self.assertTrue(res.startswith("status=timeout "))
+        self.assertIn("page_state=loading", res)
+        self.assertIn("foreground_verified=false", res)
+
+    def test_j06_loaded_page_without_foreground_returns_unverified(self):
+        with patch.object(browser_control.appidentity, "running", return_value=True), \
+             patch("core.screenview.all_windows", return_value=[("chrome.exe", "WhatsApp - Google Chrome")]), \
+             patch("core.screenview.is_own_pid", return_value=False), \
+             patch.object(browser_control, "_ensure_browser_foreground", return_value=(False, {"found": True, "foreground": False}, "foreground lock")):
+            res = browser_control._verify_native_browser("chrome", "https://web.whatsapp.com/", timeout_s=0.05)
+
+        self.assertTrue(res.startswith("status=unverified "))
+        self.assertIn("target_matched=true", res)
+        self.assertIn("foreground_verified=false", res)
+
+    def test_j07_screen_observation_target_mismatch_reports_uncertain_wrong_tab(self):
+        fake_view = SimpleNamespace(
+            app="chrome.exe",
+            title="Project Overview - Google Chrome",
+            hwnd=5511,
+            pid=7711,
+            source="uia",
+            degraded=False,
+            reason="",
+            windows=[("chrome.exe", "Project Overview - Google Chrome")],
+            elements=[SimpleNamespace(name="Overview", role="document", text="", value="")],
+        )
+        with patch("core.screenview.look", return_value=fake_view), \
+             patch("core.screenview._foreground", return_value=("chrome.exe", "Project Overview - Google Chrome", 7711, 5511)), \
+             patch("core.appidentity.focus_window_by_app", return_value={"activated": False, "reason": "wrong_tab"}), \
+             patch("core.screenview.is_own_pid", return_value=False):
+            obs = screen_observation.inspect_local_screen(
+                question="Check YouTube in Chrome", target_site="youtube",
+            )
+
+        self.assertIn("target_matched=False", obs)
+        self.assertIn("page_state=wrong_tab", obs)
+        self.assertIn("confidence=uncertain", obs)
+        self.assertIn("target_identified=False", obs)
+
+    def test_j08_repeat_open_and_it_isnt_opening_preserve_browser_continuity(self):
+        from main import RemLive
+
+        rem = RemLive.__new__(RemLive)
+        rem._request_context_lock = threading.Lock()
+        rem._request_context = None
+        rem._last_user_command = ""
+        rem._last_user_command_source = "untrusted"
+        rem._active_browser_task = None
+        rem._last_assistant_question = ""
+        rem._current_voice_turn_task_id = ""
+
+        rem._record_user_request("Open YouTube in Chrome", "voice")
+        btid = rem._current_request_context().browser_task_id
+        for phrase, act in (
+            ("Open YouTube again", "go_to"),
+            ("It isn't opening", "reload"),
+        ):
+            rem._record_user_request(phrase, "voice")
+            ctx = rem._current_request_context()
+            self.assertEqual(ctx.browser_task_id, btid)
+            ok, reason = desktop_control.authorize_user_request(
+                ctx.instruction, "browser_control", {"action": act, "url": "https://www.youtube.com/"},
+                source="voice", auth_context=ctx,
+            )
+            self.assertTrue(ok, f"{phrase} / {act} denied: {reason}")
+
+    def test_j09_explicit_reload_refresh_retry_authorize_reload_action(self):
+        for phrase in ("Refresh the page", "Reload YouTube", "Retry loading", "Reopen it"):
+            ctx = RequestContext.create(
+                phrase, "voice", now=time.monotonic(),
+                browser="chrome", browser_task_id="bt-reload-1", spoken_inputs=(phrase,),
+            )
+            ok, reason = desktop_control.authorize_user_request(
+                phrase, "browser_control", {"action": "reload"}, source="voice", auth_context=ctx,
+            )
+            self.assertTrue(ok, f"Expected reload authorized for {phrase!r}, got {reason}")
+
+    def test_j10_no_to_suggested_refresh_never_authorizes_reload(self):
+        from main import RemLive
+
+        rem = RemLive.__new__(RemLive)
+        rem._request_context_lock = threading.Lock()
+        rem._request_context = None
+        rem._last_user_command = ""
+        rem._last_user_command_source = "untrusted"
+        rem._active_browser_task = None
+        rem._last_assistant_question = "Would you like me to refresh the page?"
+        rem._current_voice_turn_task_id = ""
+
+        rem._record_user_request("Refresh the page", "voice")
+        rem._last_assistant_question = "YouTube didn't update yet. Should I refresh the page?"
+        rem._record_user_request("No", "voice")
+        ctx = rem._current_request_context()
+        ok, reason = desktop_control.authorize_user_request(
+            ctx.instruction, "browser_control", {"action": "reload"}, source="voice", auth_context=ctx,
+        )
+        self.assertFalse(ok)
+        self.assertIn("declined", reason.lower())
+
+        ok_direct, _ = desktop_control.authorize_user_request(
+            "Do not reload", "browser_control", {"action": "reload"}, source="voice",
+        )
+        self.assertFalse(ok_direct)
+
+    def test_j11_youtube_hindi_open_and_honest_language_change_verification(self):
+        self.assertEqual(
+            browser_control.youtube_hindi_intent("Open YouTube in Hindi")["mode"],
+            "open_in_hindi",
+        )
+        self.assertEqual(
+            browser_control.youtube_hindi_intent("Change YouTube's language to Hindi")["mode"],
+            "change_language",
+        )
+
+        # Mock Playwright page staying in English when "Change YouTube's language to Hindi" is asked -> unverified
+        fake_page = MagicMock()
+        fake_page.url = "https://www.youtube.com/"
+        fake_page.is_closed.return_value = False
+        fake_page.goto = AsyncMock(return_value=None)
+        fake_page.title = AsyncMock(return_value="YouTube")
+        fake_page.bring_to_front = AsyncMock(return_value=None)
+        fake_loc = MagicMock()
+        fake_loc.inner_text = AsyncMock(return_value="Home Shorts Subscriptions")
+        fake_page.locator = MagicMock(return_value=fake_loc)
+
+        async def _eval_en(expr):
+            if "visibilityState" in expr:
+                return True
+            if "documentElement.lang" in expr:
+                return "en"
+            return True
+
+        fake_page.evaluate = AsyncMock(side_effect=_eval_en)
+        sess = browser_control._BrowserSession("chrome")
+        sess._context = SimpleNamespace(pages=[fake_page])
+        sess._page = fake_page
+
+        ctx = RequestContext.create(
+            "Change YouTube's language to Hindi", "voice",
+            now=time.monotonic(), browser="chrome", browser_task_id="bt-hi",
+            spoken_inputs=("Change YouTube's language to Hindi",),
+        )
+        tok = desktop_control.bind_auth_context(ctx)
+        try:
+            res = asyncio.run(sess.go_to("https://www.youtube.com/"))
+        finally:
+            desktop_control.reset_auth_context(tok)
+        self.assertTrue(res.startswith("status=unverified "))
+        self.assertIn("language_verified=false", res)
+
+        # Whereas "Open YouTube in Hindi" navigates with ?hl=hi&gl=IN and verifies cleanly
+        fake_page.goto = AsyncMock(side_effect=lambda u, **kw: setattr(fake_page, "url", u))
+        ctx_open = RequestContext.create(
+            "Open YouTube in Hindi", "voice",
+            now=time.monotonic(), browser="chrome", browser_task_id="bt-hi2",
+            spoken_inputs=("Open YouTube in Hindi",),
+        )
+        tok2 = desktop_control.bind_auth_context(ctx_open)
+        try:
+            res_open = asyncio.run(sess.go_to("https://www.youtube.com/"))
+        finally:
+            desktop_control.reset_auth_context(tok2)
+        self.assertIn("status=done", res_open)
+        self.assertIn("hl=hi", res_open)
+
+    def test_j12_playwright_go_to_reuses_matching_site_tab_without_new_page(self):
+        yt_page = MagicMock()
+        yt_page.url = "https://www.youtube.com/"
+        yt_page.is_closed.return_value = False
+        yt_page.title = AsyncMock(return_value="YouTube")
+        yt_page.bring_to_front = AsyncMock(return_value=None)
+        yt_loc = MagicMock()
+        yt_loc.inner_text = AsyncMock(return_value="Home Shorts Subscriptions")
+        yt_page.locator = MagicMock(return_value=yt_loc)
+        yt_page.evaluate = AsyncMock(return_value=True)
+
+        wa_page = MagicMock()
+        wa_page.url = "https://web.whatsapp.com/"
+        wa_page.is_closed.return_value = False
+        wa_page.title = AsyncMock(return_value="WhatsApp")
+        wa_page.bring_to_front = AsyncMock(return_value=None)
+        wa_page.evaluate = AsyncMock(return_value=True)
+
+        new_page_mock = AsyncMock()
+        sess = browser_control._BrowserSession("chrome")
+        sess._context = SimpleNamespace(pages=[yt_page, wa_page], new_page=new_page_mock)
+        sess._page = wa_page
+
+        res = asyncio.run(sess.go_to("https://www.youtube.com/"))
+        new_page_mock.assert_not_called()
+        yt_page.goto.assert_not_called()
+        self.assertIn("status=done", res)
+        self.assertIn("tab_reused=true", res)
+        self.assertIn("navigation_lifecycle=SUCCESS", res)
+
+    def test_j13_error_page_fails_and_stage_timings_recorded(self):
+        fake_page = MagicMock()
+        fake_page.url = "about:blank"
+        fake_page.is_closed.return_value = False
+        fake_page.goto = AsyncMock(side_effect=lambda u, **kw: setattr(fake_page, "url", u))
+        fake_page.title = AsyncMock(return_value="This site can't be reached")
+        fake_page.bring_to_front = AsyncMock(return_value=None)
+        err_loc = MagicMock()
+        err_loc.inner_text = AsyncMock(return_value="ERR_NAME_NOT_RESOLVED")
+        fake_page.locator = MagicMock(return_value=err_loc)
+        fake_page.evaluate = AsyncMock(return_value=True)
+
+        sess = browser_control._BrowserSession("chrome")
+        sess._context = SimpleNamespace(pages=[fake_page])
+        sess._page = fake_page
+
+        res = asyncio.run(sess.go_to("https://www.youtube.com/"))
+        self.assertTrue(res.startswith("status=failed "))
+        self.assertIn("page_state=error", res)
+        self.assertEqual(browser_control.NAV_REQUESTED, "REQUESTED")
+        self.assertEqual(browser_control.NAV_SUCCESS, "SUCCESS")
+
+    def test_j14_reload_verifies_dom_and_native_window_state(self):
+        fake_page = MagicMock()
+        fake_page.url = "https://www.youtube.com/"
+        fake_page.is_closed.return_value = False
+        fake_page.reload = AsyncMock(return_value=None)
+        fake_page.title = AsyncMock(return_value="YouTube")
+        fake_page.evaluate = AsyncMock(return_value=True)
+        loc = MagicMock()
+        loc.inner_text = AsyncMock(return_value="Home Subscriptions")
+        fake_page.locator = MagicMock(return_value=loc)
+
+        sess = browser_control._BrowserSession("chrome")
+        sess._context = SimpleNamespace(pages=[fake_page])
+        sess._page = fake_page
+        res = asyncio.run(sess.reload())
+        self.assertIn("status=done", res)
+        self.assertIn("foreground_verified=true", res)
+        self.assertIn("target_matched=true", res)
+
+    def test_qt_mainwindow_clean_shutdown_no_timer_or_notifier_warnings(self):
+        import subprocess, sys
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        script = (
+            "import sys\n"
+            "from PyQt6.QtWidgets import QApplication\n"
+            "from PyQt6.QtCore import QTimer\n"
+            "from gui.window import MainWindow\n"
+            "app = QApplication(sys.argv)\n"
+            "win = MainWindow('face.png')\n"
+            "win.show()\n"
+            "QTimer.singleShot(40, win.close)\n"
+            "QTimer.singleShot(80, app.quit)\n"
+            "app.exec()\n"
+            "win.shutdown_qt_resources()\n"
+            "app.processEvents()\n"
+        )
+        env = dict(os.environ)
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root, env=env, capture_output=True, text=True, timeout=25,
+        )
+        self.assertEqual(proc.returncode, 0, f"stderr={proc.stderr!r}\nstdout={proc.stdout!r}")
+        for bad in (
+            "QObject::killTimer",
+            "Timers cannot be stopped from another thread",
+            "QObject::~QObject",
+            "QWinEventNotifier",
+        ):
+            self.assertNotIn(bad, proc.stderr, f"Unexpected Qt shutdown warning {bad!r} in stderr: {proc.stderr}")
+
+
+class LiveBrowserAutomationRepairTests(unittest.TestCase):
+    def setUp(self):
+        desktop_control.clear_all_task_state()
+        desktop_control._sent_attempt_records.clear()
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync("chrome")
+
+    def tearDown(self):
+        desktop_control.clear_all_task_state()
+        desktop_control._sent_attempt_records.clear()
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync("chrome")
+
+    def test_issue1_strip_composite_and_extract_whatsapp_contacts_handles_empty_malformed(self):
+        from plugins import _whatsapp_core as _wa
+
+        for bad in (None, "", "   \t\n  ", "\n\n", 42):
+            out = _wa._strip_composite_contact_name(bad)
+            self.assertIsInstance(out, str)
+            if bad in (None, "", "   \t\n  ", "\n\n"):
+                self.assertEqual(out, "")
+
+        self.assertEqual(_wa._strip_composite_contact_name("Rio\n10:30 AM\nHey there"), "Rio")
+        self.assertEqual(_wa._strip_composite_contact_name("Rio yesterday"), "Rio")
+
+        # UIA + OCR fallback paths with malformed/None/empty entries alongside "Rio"
+        for src in ("uia", "ocr"):
+            fake_view = SimpleNamespace(
+                app="chrome.exe",
+                title="WhatsApp - Google Chrome",
+                source=src,
+                monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+                window_rect=(0, 0, 1920, 1080),
+                elements=[
+                    SimpleNamespace(name="", role="text", left=120, top=180, width=220, height=30),
+                    SimpleNamespace(name=None, role="listitem", left=120, top=220, width=240, height=50),
+                    SimpleNamespace(name="   \n  ", role="ocr_text", left=120, top=280, width=220, height=28),
+                    SimpleNamespace(name="Rio\n10:30 AM", role=("ocr_text" if src == "ocr" else "listitem"),
+                                    left=120, top=320, width=260, height=48, center=(240, 344)),
+                ],
+            )
+            contacts = _wa.extract_whatsapp_contacts(fake_view, query="Rio")
+            self.assertEqual(len(contacts), 1, f"source={src}: {contacts}")
+            self.assertEqual(contacts[0]["display_name"], "Rio")
+
+    def test_issue2_real_signature_scroll_integration_down_up_focus_and_clears_stale_coords(self):
+        from core import screenact
+
+        wheel_calls: list[tuple[str, int]] = []
+        desktop_control.set_active_target(
+            target_type="video", exact_target_name="Old Video",
+            browser="chrome", tab_title="YouTube - Google Chrome",
+            point=(400, 420), rect=(300, 380, 200, 80),
+        )
+        self.assertIsNotNone(desktop_control.get_active_target(None))
+
+        orig_scroll = screenact.scroll
+
+        def _real_sig_scroll(direction="down", amount=3, *, target=None):
+            # Enforce exact real parameter signature and body of core.screenact.scroll
+            return orig_scroll(direction, amount, target=target)
+
+        with patch.object(browser_control, "_find_browser_window", return_value={
+            "found": True, "foreground": False, "browser": "chrome",
+            "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 6101, "pid": 3101, "matched_site": "youtube",
+        }), \
+             patch.object(browser_control, "_ensure_browser_foreground", return_value=(
+                 True,
+                 {"found": True, "foreground": True, "browser": "chrome",
+                  "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 6101, "pid": 3101, "matched_site": "youtube"},
+                 "",
+             )) as mock_fg, \
+             patch.object(screenact, "available", return_value=(True, "")), \
+             patch.object(screenact, "_wheel", side_effect=lambda d, n: wheel_calls.append((d, n))), \
+             patch.object(screenact, "scroll", wraps=_real_sig_scroll):
+            res_down = browser_control._native_browser_action("scroll", {"direction": "down", "amount": 500}, "chrome")
+            res_up = browser_control._native_browser_action("scroll", {"direction": "up", "amount": 4}, "chrome")
+
+        mock_fg.assert_called()
+        self.assertEqual(wheel_calls, [("down", 5), ("up", 4)])
+        self.assertIn("status=done", res_down)
+        self.assertIn("direction=down", res_down)
+        self.assertIn("amount=5", res_down)
+        self.assertIn("status=done", res_up)
+        self.assertIn("direction=up", res_up)
+        self.assertIn("amount=4", res_up)
+        self.assertIsNone(desktop_control.get_active_target(None))
+
+    def test_issue3_youtube_grid_ordering_horizontal_row_ambiguity_and_playback_check(self):
+        from core import screenact, screenview
+
+        # Boundary test: 298 vs 320 sit in Row 1 (must sort left-to-right before Row 2 at top=560)
+        raw = [
+            {"title": "Row2 Card1", "left": 240, "top": 560, "width": 300, "height": 40, "point": (390, 580), "rect": (240, 560, 300, 40)},
+            {"title": "Row1 Card3", "left": 920, "top": 315, "width": 300, "height": 40, "point": (1070, 335), "rect": (920, 315, 300, 40)},
+            {"title": "Row1 Card1", "left": 240, "top": 298, "width": 300, "height": 40, "point": (390, 318), "rect": (240, 298, 300, 40)},
+            {"title": "Row1 Card2", "left": 580, "top": 320, "width": 300, "height": 40, "point": (730, 340), "rect": (580, 320, 300, 40)},
+        ]
+        ordered, rows, ambig, _secs = browser_control._cluster_youtube_video_rows(raw)
+        self.assertFalse(ambig)
+        self.assertEqual([v["title"] for v in ordered], ["Row1 Card1", "Row1 Card2", "Row1 Card3", "Row2 Card1"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(ordered[2]["col_index"], 3)
+
+        # Native "Third video horizontally" clicks Row1 Card3 and verifies Pause (k) -> playback_verified=True
+        home_view = SimpleNamespace(
+            app="chrome.exe", title="YouTube - Google Chrome", hwnd=7101, pid=4101, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="Row1 Card1 - Official Video", role="link", left=240, top=298, width=280, height=36, center=(380, 316)),
+                SimpleNamespace(name="Row1 Card2 - Live Session", role="link", left=580, top=318, width=280, height=36, center=(720, 336)),
+                SimpleNamespace(name="Row1 Card3 - Third Song", role="link", left=920, top=308, width=280, height=36, center=(1060, 326)),
+                SimpleNamespace(name="Row2 Card1 - Next Row", role="link", left=240, top=580, width=280, height=36, center=(380, 598)),
+            ],
+        )
+        watch_view = SimpleNamespace(
+            app="chrome.exe", title="Row1 Card3 - Third Song - YouTube - Google Chrome", hwnd=7101, pid=4101, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="Pause (k)", role="button", left=50, top=680, width=40, height=30, center=(70, 695)),
+            ],
+        )
+        clicked_pts: list[tuple[int, int]] = []
+        with patch.object(browser_control, "_find_browser_window", return_value={
+            "found": True, "foreground": True, "browser": "chrome",
+            "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 7101, "pid": 4101, "matched_site": "youtube",
+        }), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=[home_view, watch_view]), \
+             patch.object(screenact, "move_cursor", side_effect=lambda pt: screenact.Act(True, "move", point=(pt.x, pt.y))), \
+             patch.object(screenact, "click", side_effect=lambda pt: (clicked_pts.append((pt.x, pt.y)), screenact.Act(True, "click", point=(pt.x, pt.y)))[1]):
+            with patch.object(browser_control, "_find_browser_window", side_effect=[
+                {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 7101, "pid": 4101, "matched_site": "youtube"},
+                {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 7101, "pid": 4101, "matched_site": "youtube"},
+                {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "Row1 Card3 - Third Song - YouTube - Google Chrome", "hwnd": 7101, "pid": 4101, "matched_site": "youtube"},
+            ]):
+                res = browser_control._native_browser_action("smart_click", {"description": "third video horizontally"}, "chrome")
+
+        self.assertEqual(clicked_pts, [(1060, 326)])
+        self.assertIn("status=done", res)
+        self.assertIn("playback_verified=true", res)
+        self.assertIn("action_state=ACTION_VERIFIED", res)
+
+        # Genuine multi-section shelf ambiguity in Playwright DOM asks instead of guessing
+        fake_page = MagicMock()
+        fake_page.url = "https://www.youtube.com/"
+        sess = browser_control._BrowserSession("chrome")
+        sess._page = fake_page
+        with patch.object(sess, "_extract_youtube_videos", AsyncMock(return_value=[
+            {"id": "vid111111", "title": "A1", "channel": "C1", "rect": [100, 200, 200, 40], "section": "Breaking News"},
+            {"id": "vid222222", "title": "A2", "channel": "C2", "rect": [400, 200, 200, 40], "section": "Breaking News"},
+            {"id": "vid333333", "title": "B1", "channel": "C3", "rect": [100, 500, 200, 40], "section": "Trending Now"},
+            {"id": "vid444444", "title": "B2", "channel": "C4", "rect": [400, 500, 200, 40], "section": "Trending Now"},
+        ])):
+            amb_res = asyncio.run(sess._click_youtube_video_ordinal(fake_page, 1, "second video"))
+        self.assertIn("status=ask", amb_res)
+
+    def test_issue3_smart_click_ordinal_authorization_fixes_target_not_named(self):
+        for voice_req, target_desc in (
+            ("Play the second video.", "second video"),
+            ("Open the second video.", "2nd video"),
+            ("Click on the second video.", "second thumbnail in top row"),
+            ("Third video horizontally.", "third video horizontally"),
+            ("Third video horizontally.", "3rd horizontal video"),
+        ):
+            ctx = RequestContext.create(voice_req, "voice", browser="chrome", browser_task_id="bt-ord")
+            ok, reason = desktop_control.authorize_user_request(
+                voice_req, "browser_control",
+                {"action": "smart_click", "description": target_desc},
+                source="voice", auth_context=ctx,
+            )
+            self.assertTrue(ok, f"Expected authorized for {voice_req!r} -> {target_desc!r}, got {reason}")
+
+        # Wrong ordinal or unrequested target remains strictly denied
+        ctx_sec = RequestContext.create("Click on the second video.", "voice", browser="chrome", browser_task_id="bt-ord2")
+        ok_bad, _ = desktop_control.authorize_user_request(
+            "Click on the second video.", "browser_control",
+            {"action": "smart_click", "description": "Buy Now button"},
+            source="voice", auth_context=ctx_sec,
+        )
+        self.assertFalse(ok_bad)
+
+    def test_issue4_wrong_window_explorer_reacquisition_and_refusal(self):
+        from core import appidentity, screenact, screenview
+
+        # Record previous Chrome HWND/site target, then Explorer steals foreground
+        browser_control._registry.note_site_target("chrome", "youtube", {
+            "hwnd": 8844, "pid": 4422, "title": "YouTube - Google Chrome",
+            "url": "https://www.youtube.com/", "foreground": True,
+        })
+        explorer_view = SimpleNamespace(
+            app="explorer.exe", title="Program Manager", hwnd=1111, pid=2222,
+            source="uia", degraded=False, reason="",
+            windows=[("explorer.exe", "Program Manager"), ("chrome.exe", "YouTube - Google Chrome")],
+            elements=[],
+        )
+        chrome_view = SimpleNamespace(
+            app="chrome.exe", title="YouTube - Google Chrome", hwnd=8844, pid=4422,
+            source="uia", degraded=False, reason="",
+            windows=[("chrome.exe", "YouTube - Google Chrome")],
+            elements=[SimpleNamespace(name="Search", role="combobox", left=400, top=120, width=400, height=34)],
+        )
+
+        # Case A: Explorer foreground -> focus_hwnd reacquires Chrome 8844 cleanly
+        with patch.object(screenview, "_foreground", side_effect=[
+            ("explorer.exe", "Program Manager", 2222, 1111),
+            ("chrome.exe", "YouTube - Google Chrome", 4422, 8844),
+        ]), \
+             patch.object(screenview, "look", side_effect=[explorer_view, chrome_view]), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(appidentity, "focus_hwnd", return_value={"activated": True, "target_hwnd": 8844, "target_pid": 4422}) as mock_fh:
+            obs = screen_observation.inspect_local_screen(question="Check screen", target_site="youtube")
+        mock_fh.assert_called_with(8844)
+        self.assertIn("target_matched=True", obs)
+
+        # Case B: Reacquisition fails and Explorer stays foreground -> refuse scroll/click & return target_matched=False
+        with patch.object(screenview, "_foreground", return_value=("explorer.exe", "Program Manager", 2222, 1111)), \
+             patch.object(screenview, "look", return_value=explorer_view), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(appidentity, "focus_hwnd", return_value={"activated": False, "reason": "foreground_lock"}), \
+             patch.object(appidentity, "focus_window_by_app", return_value={"activated": False, "reason": "foreground_lock"}):
+            obs_fail = screen_observation.inspect_local_screen(question="Check YouTube", target_site="youtube")
+            nav_fail = browser_control._native_browser_action("scroll", {"direction": "down"}, "chrome")
+        self.assertIn("target_matched=False", obs_fail)
+        self.assertIn("explorer.exe", obs_fail)
+        self.assertTrue(nav_fail.startswith("status=failed "))
+        self.assertIn("foreground_activation_failed", nav_fail)
+
+    def test_issue5_dom_first_whatsapp_search_and_select_without_sending(self):
+        fake_page = MagicMock()
+        fake_page.url = "https://web.whatsapp.com/"
+        fake_page.is_closed.return_value = False
+        sb_loc = MagicMock()
+        sb_loc.click = AsyncMock(return_value=None)
+        sb_loc.fill = AsyncMock(return_value=None)
+        fake_page.locator = MagicMock(return_value=SimpleNamespace(first=sb_loc))
+        fake_page.mouse = MagicMock(click=AsyncMock(return_value=None))
+
+        async def _eval_wa(script, *a):
+            if "chat-list-search" in script:
+                return {"found": True, "visible": True, "enabled": True, "focused": True, "value": "", "label": "Search", "rect": [50, 120, 260, 32], "x": 180, "y": 136}
+            if "#pane-side" in script:
+                return [{"title": "Rio\n10:30 AM", "chatId": "rio@c.us", "rect": [40, 200, 300, 60], "point": [180, 230]}]
+            if "document.querySelector('#main')" in script:
+                return {"found": True, "header": "Rio", "composer": True, "focused": False, "text": "", "url": "https://web.whatsapp.com/"}
+            return {}
+
+        fake_page.evaluate = AsyncMock(side_effect=_eval_wa)
+        sess = browser_control._BrowserSession("chrome")
+        sess._context = SimpleNamespace(pages=[fake_page])
+        sess._page = fake_page
+
+        res_search = asyncio.run(sess.search_whatsapp_contact("Rio"))
+        self.assertIn("status=done", res_search)
+        self.assertIn("matched_contacts=Rio", res_search)
+        self.assertIn("search_source=dom", res_search)
+
+        res_select = asyncio.run(sess.select_whatsapp_contact("Rio"))
+        self.assertIn("status=done", res_select)
+        self.assertIn("active_contact=Rio", res_select)
+        self.assertIn("selected_chat_verified=true", res_select)
+        self.assertIn("message_sent=false", res_select)
+
+
+class CategoryChipsAndLiveAcceptanceRepairTests(unittest.TestCase):
+    def setUp(self):
+        desktop_control.clear_all_task_state()
+        desktop_control._sent_attempt_records.clear()
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync("chrome")
+
+    def tearDown(self):
+        desktop_control.clear_all_task_state()
+        desktop_control._sent_attempt_records.clear()
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync("chrome")
+
+    def _yt_chip_and_grid_view(self):
+        # Exact reproduction of YouTube Home screenshot layout:
+        # Row 0 (y=165): All, Music, Mixes, Gaming, Grandmaster chess title, The Avengers, Science fiction
+        # Row 1 (y=340): First Video Alpha, Second Video Beta, Third Video Gamma
+        return SimpleNamespace(
+            app="chrome.exe",
+            title="YouTube - Google Chrome",
+            hwnd=9101,
+            pid=5101,
+            source="ocr",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080},
+            window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="All", role="ocr_text", left=240, top=165, width=48, height=32, center=(264, 181)),
+                SimpleNamespace(name="Music", role="ocr_text", left=305, top=166, width=72, height=32, center=(341, 182)),
+                SimpleNamespace(name="Mixes", role="ocr_text", left=390, top=165, width=74, height=32, center=(427, 181)),
+                SimpleNamespace(name="Gaming", role="ocr_text", left=480, top=166, width=88, height=32, center=(524, 182)),
+                SimpleNamespace(name="Grandmaster chess title", role="ocr_text", left=585, top=165, width=190, height=32, center=(680, 181)),
+                SimpleNamespace(name="The Avengers", role="ocr_text", left=790, top=166, width=130, height=32, center=(855, 182)),
+                SimpleNamespace(name="Science fiction", role="ocr_text", left=935, top=165, width=145, height=32, center=(1007, 181)),
+                SimpleNamespace(name="First Video Alpha", role="ocr_text", left=240, top=340, width=320, height=36, center=(400, 358)),
+                SimpleNamespace(name="Second Video Beta", role="ocr_text", left=620, top=345, width=320, height=36, center=(780, 363)),
+                SimpleNamespace(name="Third Video Gamma", role="ocr_text", left=1000, top=342, width=320, height=36, center=(1160, 360)),
+            ],
+        )
+
+    def test_g1_g2_g3_g5_category_chips_never_enter_video_ordinals(self):
+        from core import screenact, screenview
+
+        view = self._yt_chip_and_grid_view()
+        cls = browser_control.classify_youtube_elements(view)
+        chip_labels = [c["label"] for c in cls[browser_control.ELEM_CATEGORY_CHIP]]
+        video_titles = [v["title"] for v in cls[browser_control.ELEM_VIDEO_CARD]]
+
+        self.assertIn("All", chip_labels)
+        self.assertIn("Science fiction", chip_labels)
+        self.assertIn("The Avengers", chip_labels)
+        self.assertEqual(video_titles, ["First Video Alpha", "Second Video Beta", "Third Video Gamma"])
+        self.assertNotIn("Science fiction", video_titles)
+
+        # Clicking "second video horizontally" and "third video" picks VIDEO_CARD #2 and #3, never "Science fiction"
+        for desc, expected_pt, expected_title, watch_title in (
+            ("second video horizontally", (780, 363), "Second Video Beta", "Second Video Beta - YouTube - Google Chrome"),
+            ("third video", (1160, 360), "Third Video Gamma", "Third Video Gamma - YouTube - Google Chrome"),
+        ):
+            clicks = []
+            watch_view = SimpleNamespace(
+                app="chrome.exe", title=watch_title, hwnd=9101, pid=5101, source="uia",
+                monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+                elements=[SimpleNamespace(name="Pause (k)", role="button", left=50, top=680, width=40, height=30, center=(70, 695))],
+            )
+            with patch.object(browser_control, "_find_browser_window", side_effect=[
+                {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 9101, "pid": 5101, "matched_site": "youtube"},
+                {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 9101, "pid": 5101, "matched_site": "youtube"},
+                {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": watch_title, "hwnd": 9101, "pid": 5101, "matched_site": "youtube"},
+            ]), \
+                 patch.object(screenview, "is_own_pid", return_value=False), \
+                 patch.object(screenview, "look", side_effect=[view, watch_view]), \
+                 patch.object(screenact, "move_cursor", side_effect=lambda pt: screenact.Act(True, "move", point=(pt.x, pt.y))), \
+                 patch.object(screenact, "click", side_effect=lambda pt: (clicks.append((pt.x, pt.y)), screenact.Act(True, "click", point=(pt.x, pt.y)))[1]):
+                res = browser_control._native_browser_action("smart_click", {"description": desc}, "chrome")
+            self.assertEqual(clicks, [expected_pt])
+            self.assertIn(expected_title, res)
+            self.assertNotIn("Science fiction", res)
+
+    def test_g4_click_all_resolves_to_category_chip_and_verifies(self):
+        from core import screenact, screenview
+
+        ctx = RequestContext.create("Click on the All.", "voice", browser="chrome", browser_task_id="bt-all")
+        self.assertTrue(desktop_control.authorize_user_request(
+            "Click on the All.", "browser_control", {"action": "smart_click", "description": "All category chip"},
+            source="voice", auth_context=ctx,
+        )[0])
+
+        view_before = self._yt_chip_and_grid_view()
+        view_after = SimpleNamespace(
+            app="chrome.exe", title="YouTube - Google Chrome", hwnd=9101, pid=5101, source="ocr",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="All", role="tab", left=240, top=165, width=48, height=32, center=(264, 181), selected=True),
+                SimpleNamespace(name="Fresh All Video", role="ocr_text", left=240, top=340, width=320, height=36, center=(400, 358)),
+            ],
+        )
+        clicks = []
+        with patch.object(browser_control, "_find_browser_window", return_value={
+            "found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe",
+            "title": "YouTube - Google Chrome", "hwnd": 9101, "pid": 5101, "matched_site": "youtube",
+        }), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=[view_before, view_after]), \
+             patch.object(screenact, "move_cursor", side_effect=lambda pt: screenact.Act(True, "move", point=(pt.x, pt.y))), \
+             patch.object(screenact, "click", side_effect=lambda pt: (clicks.append((pt.x, pt.y)), screenact.Act(True, "click", point=(pt.x, pt.y)))[1]):
+            res = browser_control._native_browser_action("smart_click", {"description": "All"}, "chrome")
+        self.assertEqual(clicks, [(264, 181)])
+        self.assertIn("status=done", res)
+        self.assertIn("target_class=CATEGORY_CHIP", res)
+        self.assertIn("chip_selected=true", res)
+
+    def test_g6_g7_whatsapp_search_authorizes_workflow_but_blocks_send(self):
+        from main import RemLive
+
+        rem = RemLive.__new__(RemLive)
+        rem._request_context_lock = threading.Lock()
+        rem._request_context = None
+        rem._last_user_command = ""
+        rem._last_user_command_source = "untrusted"
+        rem._active_browser_task = None
+        rem._last_assistant_question = ""
+        rem._current_voice_turn_task_id = ""
+
+        rem._record_user_request("Open WhatsApp in Chrome browser.", "voice")
+        rem._record_user_request("Now open the chat with Rio.", "voice")
+        ctx = rem._current_request_context()
+
+        for tool, args in (
+            ("browser_control", {"action": "smart_click", "description": "Search or start new chat"}),
+            ("browser_control", {"action": "smart_type", "description": "WhatsApp search field", "text": "Rio"}),
+            ("browser_control", {"action": "press", "key": "Enter"}),
+            ("browser_control", {"action": "search_contact", "query": "Rio"}),
+            ("browser_control", {"action": "select_contact", "description": "Rio"}),
+        ):
+            ok, reason = desktop_control.authorize_user_request(
+                ctx.instruction, tool, args, source="voice", auth_context=ctx,
+            )
+            self.assertTrue(ok, f"{args} should authorize during WhatsApp search, got: {reason}")
+
+        # Must NEVER authorize sending a message during contact search
+        ok_send, _ = desktop_control.authorize_user_request(
+            ctx.instruction, "send_message",
+            {"platform": "whatsapp", "receiver": "Rio", "message_text": "hello"},
+            source="voice", auth_context=ctx,
+        )
+        self.assertFalse(ok_send)
+
+    def test_g8_unclear_destination_never_inherits_previous_youtube_tab(self):
+        from main import RemLive
+
+        rem = RemLive.__new__(RemLive)
+        rem._request_context_lock = threading.Lock()
+        rem._request_context = None
+        rem._last_user_command = ""
+        rem._last_user_command_source = "untrusted"
+        rem._active_browser_task = None
+        rem._last_assistant_question = ""
+        rem._current_voice_turn_task_id = ""
+
+        rem._record_user_request("Open YouTube in Chrome.", "voice")
+        rem._record_user_request("Open the Euro Win Chrome browser now.", "voice")
+        ctx = rem._current_request_context()
+
+        ok_yt, _ = desktop_control.authorize_user_request(
+            ctx.instruction, "browser_control",
+            {"action": "go_to", "url": "https://www.youtube.com/"},
+            source="voice", auth_context=ctx,
+        )
+        self.assertFalse(ok_yt)
+
+        tok = desktop_control.bind_auth_context(ctx)
+        try:
+            with patch.object(browser_control._registry, "has", return_value=False):
+                out = browser_control._browser_control_impl({"action": "go_to", "url": "", "browser": "chrome"})
+        finally:
+            desktop_control.reset_auth_context(tok)
+        self.assertIn("status=ask", out)
+
+    def test_g9_g10_failed_or_unverified_click_flushes_stale_coords_and_requires_evidence(self):
+        from core import screenact, screenview
+
+        desktop_control.set_active_target(
+            target_type="video", exact_target_name="Stale Button",
+            browser="chrome", tab_title="YouTube - Google Chrome",
+            point=(500, 400), rect=(450, 380, 100, 40),
+        )
+        static_view = SimpleNamespace(
+            app="chrome.exe", title="YouTube - Google Chrome", hwnd=9101, pid=5101, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[SimpleNamespace(name="Settings Menu", role="button", left=500, top=400, width=100, height=40, center=(550, 420))],
+        )
+        # Click succeeds at OS level, but post-click screen state is completely unchanged -> must be unverified + flush target
+        with patch.object(browser_control, "_find_browser_window", return_value={
+            "found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe",
+            "title": "YouTube - Google Chrome", "hwnd": 9101, "pid": 5101,
+        }), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", return_value=static_view), \
+             patch.object(screenact, "move_cursor", return_value=screenact.Act(True, "move", point=(550, 420))), \
+             patch.object(screenact, "click", return_value=screenact.Act(True, "click", point=(550, 420))):
+            res = browser_control._native_browser_action("smart_click", {"description": "Settings Menu"}, "chrome")
+
+        self.assertTrue(res.startswith("status=unverified "))
+        self.assertIn("action_state=ACTION_UNVERIFIED", res)
+        self.assertIsNone(desktop_control.get_active_target(None))
+
+
+class EvidenceProvenanceAndTitleIntegrityTests(unittest.TestCase):
+    """Section 7 regressions for video-card provenance, OCR conflict safety, and WhatsApp intent search."""
+
+    def setUp(self):
+        desktop_control.clear_all_task_state()
+        desktop_control._sent_attempt_records.clear()
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync("chrome")
+        screen_observation._PROVENANCE_HISTORY.clear()
+
+    def tearDown(self):
+        desktop_control.clear_all_task_state()
+        desktop_control._sent_attempt_records.clear()
+        browser_control._registry.clear_site_targets()
+        browser_control._registry.invalidate_sync("chrome")
+        screen_observation._PROVENANCE_HISTORY.clear()
+
+    def test_01_youtube_dom_card_extraction_preserves_structured_provenance(self):
+        class FakeLocator:
+            def __init__(self, rows):
+                self._rows = rows
+
+            async def evaluate_all(self, _js):
+                return [dict(r) for r in self._rows]
+
+        dom_rows = [
+            {
+                "position": 1, "id": "vid000001", "url": "https://www.youtube.com/watch?v=vid000001",
+                "title": "Video One", "exact_title": "Video One", "channel": "Ch1",
+                "rect": [40, 220, 300, 40], "card_bbox": [30, 120, 320, 240],
+                "title_bbox": [40, 220, 300, 40], "thumbnail_bbox": [30, 120, 320, 180],
+                "section": "", "is_ad": False, "is_playable": True,
+                "extraction_source": "DOM", "association_confidence": 0.98,
+                "card_ordering": "row_major", "evidence_status": "OBSERVED",
+            },
+            {
+                "position": 2, "id": "vid000002", "url": "https://www.youtube.com/watch?v=vid000002",
+                "title": "Video Two", "exact_title": "Video Two", "channel": "Ch2",
+                "rect": [400, 220, 300, 40], "card_bbox": [390, 120, 320, 240],
+                "title_bbox": [400, 220, 300, 40], "thumbnail_bbox": [390, 120, 320, 180],
+                "section": "", "is_ad": False, "is_playable": True,
+                "extraction_source": "DOM", "association_confidence": 0.98,
+                "card_ordering": "row_major", "evidence_status": "OBSERVED",
+            },
+        ]
+
+        class FakePage:
+            url = "https://www.youtube.com/results?search_query=test"
+
+            async def title(self):
+                return "test - YouTube"
+
+            def locator(self, _sel):
+                return FakeLocator(dom_rows)
+
+        sess = browser_control._BrowserSession("chrome")
+        import asyncio
+        cards = asyncio.run(sess._extract_youtube_videos(FakePage()))
+        self.assertEqual(len(cards), 2)
+        for c in cards:
+            self.assertEqual(c["extraction_source"], "DOM")
+            self.assertEqual(c["evidence_status"], "OBSERVED")
+            self.assertTrue(c.get("observation_id", "").startswith("obs_"))
+            self.assertIsNotNone(c["thumbnail_bbox"])
+            self.assertIsNotNone(c["card_bbox"])
+            self.assertIsNotNone(c["title_bbox"])
+        prov = screen_observation.get_latest_observation_provenance(url_contains="youtube.com")
+        self.assertIsNotNone(prov)
+        self.assertEqual(len(prov["targets"]), 2)
+
+    def test_02_youtube_ocr_bounding_box_card_association(self):
+        view = SimpleNamespace(
+            app="chrome.exe", title="YouTube - Google Chrome", hwnd=9301, pid=4301, source="ocr",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="Clean Robotics Walkthrough", role="ocr_text", left=260, top=340, width=300, height=28, center=(410, 354)),
+                SimpleNamespace(name="Python Asyncio Deep Dive", role="ocr_text", left=640, top=340, width=300, height=28, center=(790, 354)),
+            ],
+        )
+        cls = browser_control.classify_youtube_elements(view)
+        cards = cls[browser_control.ELEM_VIDEO_CARD]
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(cards[0]["exact_title"], "Clean Robotics Walkthrough")
+        self.assertEqual(cards[0]["extraction_source"], "OCR")
+        self.assertEqual(cards[0]["evidence_status"], "ASSOCIATED")
+        self.assertEqual(cards[0]["title_bbox"], [260, 340, 300, 28])
+
+    def test_03_conflicting_ocr_fragments_never_merged_and_block_fabrication(self):
+        from core import screenview
+        # Card 1 & Card 2 clean; Card 3 has conflicting Gojo / Myra fragments in the same card slot
+        view = SimpleNamespace(
+            app="chrome.exe", title="YouTube - Google Chrome", hwnd=9302, pid=4302, source="ocr",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="First Verified Tutorial", role="ocr_text", left=260, top=340, width=280, height=28, center=(400, 354)),
+                SimpleNamespace(name="Second Verified Tutorial", role="ocr_text", left=620, top=340, width=280, height=28, center=(760, 354)),
+                SimpleNamespace(name="Satoru Gojo vs Toji Fushiguro", role="ocr_text", left=980, top=330, width=280, height=28, center=(1120, 344)),
+                SimpleNamespace(name="MYRA AI Got Angry and Started Crying!", role="ocr_text", left=985, top=390, width=290, height=28, center=(1130, 404)),
+            ],
+        )
+        cls = browser_control.classify_youtube_elements(view)
+        cards = cls[browser_control.ELEM_VIDEO_CARD]
+        self.assertEqual(len(cards), 3)
+        third = cards[2]
+        self.assertEqual(third["evidence_status"], "UNKNOWN")
+        self.assertEqual(third["exact_title"], "")
+        self.assertGreaterEqual(len(third["conflicting_titles"]), 2)
+
+        with patch.object(browser_control, "_find_browser_window", return_value={
+            "found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe",
+            "title": "YouTube - Google Chrome", "hwnd": 9302, "pid": 4302,
+        }), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", return_value=view):
+            out = browser_control._native_browser_action("play_video", {"description": "third video"}, "chrome")
+        self.assertTrue(out.startswith("status=unverified "))
+        self.assertIn("evidence_status=UNKNOWN", out)
+        self.assertIn("cannot reliably read the third video's title", out)
+
+    def test_04_ordinal_selection_uses_verified_third_card_and_reports_exact_title(self):
+        from core import screenact, screenview
+        pre_view = SimpleNamespace(
+            app="chrome.exe", title="YouTube - Google Chrome", hwnd=9303, pid=4303, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="Video Alpha One", role="link", left=260, top=340, width=260, height=30, center=(390, 355)),
+                SimpleNamespace(name="Video Beta Two", role="link", left=620, top=340, width=260, height=30, center=(750, 355)),
+                SimpleNamespace(name="Video Gamma Three", role="link", left=980, top=340, width=260, height=30, center=(1110, 355)),
+            ],
+        )
+        post_view = SimpleNamespace(
+            app="chrome.exe", title="Video Gamma Three - YouTube - Google Chrome", hwnd=9303, pid=4303, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[SimpleNamespace(name="Pause (k)", role="button", left=100, top=700, width=40, height=40, center=(120, 720))],
+        )
+        seq_wins = [
+            {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 9303, "pid": 4303},
+            {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "YouTube - Google Chrome", "hwnd": 9303, "pid": 4303},
+            {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "Video Gamma Three - YouTube - Google Chrome", "hwnd": 9303, "pid": 4303},
+            {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "Video Gamma Three - YouTube - Google Chrome", "hwnd": 9303, "pid": 4303},
+        ]
+        with patch.object(browser_control, "_find_browser_window", side_effect=seq_wins), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=[pre_view, post_view]), \
+             patch.object(screenact, "move_cursor", return_value=screenact.Act(True, "move", point=(1110, 355))), \
+             patch.object(screenact, "click", return_value=screenact.Act(True, "click", point=(1110, 355))):
+            out = browser_control._native_browser_action("play_video", {"description": "third video"}, "chrome")
+        self.assertTrue(out.startswith("status=done "))
+        self.assertIn('title="Video Gamma Three"', out)
+        self.assertIn("playback_verified=true", out)
+
+    def test_05_stale_observations_invalidated_after_scroll_and_failed_click(self):
+        from core import screenact
+        rec = screen_observation.record_observation_provenance(
+            hwnd=9304, pid=4304, active_app="chrome.exe", active_url="https://www.youtube.com/",
+            tab_identity="YouTube - Google Chrome", source="UIA", confidence="high", stale=False,
+        )
+        self.assertIsNotNone(screen_observation.get_latest_observation_provenance(hwnd=9304))
+        with patch.object(browser_control, "_find_browser_window", return_value={
+            "found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe",
+            "title": "YouTube - Google Chrome", "hwnd": 9304, "pid": 4304,
+        }), \
+             patch.object(screenact, "scroll", return_value=screenact.Act(True, "scroll")):
+            browser_control._native_browser_action("scroll", {"direction": "down", "amount": 4}, "chrome")
+        self.assertIsNone(screen_observation.get_latest_observation_provenance(hwnd=9304))
+        marked = screen_observation.get_observation_provenance(rec["observation_id"])
+        self.assertTrue(marked["stale"])
+        self.assertEqual(marked["stale_reason"], "scroll")
+
+    def test_06_whatsapp_intent_phrase_parsed_and_opens_contact_via_sidebar_search(self):
+        from core import screenact, screenview
+        parsed = _whatsapp_core.parse_whatsapp_intent_target("Chat named Rio")
+        self.assertTrue(parsed["is_intent"])
+        self.assertEqual(parsed["contact"], "Rio")
+        parsed_asr = _whatsapp_core.parse_whatsapp_intent_target("Now open Shed with the Rio.")
+        self.assertTrue(parsed_asr["is_intent"])
+        self.assertEqual(parsed_asr["contact"], "Rio")
+
+        # Initial WhatsApp screen has sidebar search box, NO Rio visible yet
+        initial_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", hwnd=9401, pid=4401, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="Search input textbox", role="textbox", left=90, top=140, width=260, height=34, center=(220, 157), enabled=True, automation_id="chat-list-search"),
+                SimpleNamespace(name="Alice", role="listitem", left=90, top=240, width=260, height=60, center=(220, 270)),
+            ],
+        )
+        # After sidebar search types "Rio", Rio appears in sidebar results
+        searched_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", hwnd=9401, pid=4401, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="Search input textbox", role="textbox", value="Rio", left=90, top=140, width=260, height=34, center=(220, 157), enabled=True),
+                SimpleNamespace(name="Rio", role="listitem", left=90, top=240, width=260, height=60, center=(220, 270)),
+            ],
+        )
+        # After clicking Rio, chat header confirms Rio is open
+        opened_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", hwnd=9401, pid=4401, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="Rio", role="heading", left=560, top=92, width=160, height=28, center=(640, 106)),
+                SimpleNamespace(name="Type a message", role="textbox", left=620, top=990, width=700, height=40, center=(970, 1010)),
+            ],
+        )
+        wa_win = {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "WhatsApp - Google Chrome", "hwnd": 9401, "pid": 4401}
+        typed_texts: list[str] = []
+        clicked_labels: list[str] = []
+
+        def fake_type(txt, clear_first=False):
+            typed_texts.append(txt)
+            return screenact.Act(True, "type")
+
+        def fake_click(pt):
+            clicked_labels.append(getattr(pt, "label", ""))
+            return screenact.Act(True, "click", point=(pt.x, pt.y))
+
+        with patch.object(browser_control, "_find_browser_window", return_value=wa_win), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=[initial_view, searched_view, opened_view]), \
+             patch.object(screenact, "move_cursor", return_value=screenact.Act(True, "move", point=(220, 270))), \
+             patch.object(screenact, "click", side_effect=fake_click), \
+             patch.object(screenact, "type_text", side_effect=fake_type):
+            out = browser_control._native_browser_action("smart_click", {"description": "Chat named Rio"}, "chrome")
+
+        self.assertTrue(out.startswith("status=done "), out)
+        self.assertIn("selected_chat_verified=true", out)
+        self.assertEqual(typed_texts, ["Rio"])
+        self.assertIn("Rio", clicked_labels)
+
+    def test_07_whatsapp_sidebar_search_authorized_while_composer_and_send_remain_protected(self):
+        ctx = RequestContext.create(
+            "Open the chat with Rio", "voice", browser_task_id="wa-auth-1"
+        )
+        for tool, args in (
+            ("browser_control", {"action": "smart_click", "description": "WhatsApp sidebar search box"}),
+            ("browser_control", {"action": "smart_type", "description": "WhatsApp sidebar search box", "text": "Rio"}),
+            ("browser_control", {"action": "smart_click", "description": "Chat named Rio"}),
+        ):
+            ok, reason = desktop_control.authorize_user_request(
+                ctx.instruction, tool, args, source="voice", auth_context=ctx,
+            )
+            self.assertTrue(ok, f"Expected allow for {args}, got deny={reason}")
+
+        # Composer typing and Send/Call MUST remain strictly denied during chat-open request!
+        for tool, args in (
+            ("browser_control", {"action": "smart_type", "description": "Type a message", "text": "Rio"}),
+            ("whatsapp", {"action": "send_message", "contact": "Rio", "message": "Hi"}),
+            ("whatsapp", {"action": "call", "contact": "Rio"}),
+        ):
+            ok, reason = desktop_control.authorize_user_request(
+                ctx.instruction, tool, args, source="voice", auth_context=ctx,
+            )
+            self.assertFalse(ok, f"Expected deny for protected {tool}:{args}, got allow ({reason})")
+
+    def test_08_whatsapp_contact_workflow_never_touches_composer_or_presses_enter(self):
+        from core import screenact, screenview
+        initial_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", hwnd=9402, pid=4402, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="Search input textbox", role="textbox", left=90, top=140, width=260, height=34, center=(220, 157), enabled=True),
+                SimpleNamespace(name="Type a message", role="textbox", left=620, top=990, width=700, height=40, center=(970, 1010)),
+            ],
+        )
+        empty_search_view = SimpleNamespace(
+            app="chrome.exe", title="WhatsApp - Google Chrome", hwnd=9402, pid=4402, source="uia",
+            monitor={"left": 0, "top": 0, "width": 1920, "height": 1080}, window_rect=(0, 0, 1920, 1080),
+            elements=[
+                SimpleNamespace(name="Search input textbox", role="textbox", value="GhostUser", left=90, top=140, width=260, height=34, center=(220, 157), enabled=True),
+            ],
+        )
+        wa_win = {"found": True, "foreground": True, "browser": "chrome", "app": "chrome.exe", "title": "WhatsApp - Google Chrome", "hwnd": 9402, "pid": 4402}
+        with patch.object(browser_control, "_find_browser_window", return_value=wa_win), \
+             patch.object(screenview, "is_own_pid", return_value=False), \
+             patch.object(screenview, "look", side_effect=[initial_view, empty_search_view]), \
+             patch.object(screenact, "move_cursor", return_value=screenact.Act(True, "move", point=(220, 157))), \
+             patch.object(screenact, "click", return_value=screenact.Act(True, "click", point=(220, 157))), \
+             patch.object(screenact, "type_text", return_value=screenact.Act(True, "type")), \
+             patch.object(screenact, "press") as mock_press:
+            out = browser_control._native_browser_action("smart_click", {"description": "Chat named GhostUser"}, "chrome")
+        self.assertTrue(out.startswith("status=unverified "), out)
+        self.assertIn("selected_chat_verified=false", out)
+        mock_press.assert_not_called()
+
+    def test_09_provenance_question_reports_recorded_facts_without_fabrication(self):
+        rec = screen_observation.record_observation_provenance(
+            hwnd=9501, pid=4501, active_app="chrome.exe",
+            active_url="https://www.youtube.com/results?search_query=gojo",
+            tab_identity="gojo - YouTube - Google Chrome", source="DOM", confidence="high",
+            targets=[{
+                "exact_title": "Satoru Gojo vs Toji Fushiguro",
+                "extraction_source": "DOM",
+                "evidence_status": "OBSERVED",
+                "card_bbox": [900, 200, 320, 240],
+                "title_bbox": [900, 390, 320, 36],
+                "thumbnail_bbox": [900, 200, 320, 180],
+                "association_confidence": 0.98,
+            }],
+        )
+        ans = screen_observation.explain_title_provenance("Satoru Gojo vs Toji Fushiguro")
+        self.assertIn(rec["observation_id"], ans)
+        self.assertIn("extraction_source=DOM", ans)
+        self.assertIn("evidence_status=OBSERVED", ans)
+        missing = screen_observation.explain_title_provenance("Nonexistent Fabricated Video")
+        self.assertIn("not verified in recorded provenance", missing)
+
+    def test_10_spoken_response_guidance_forbids_title_invention_and_unverified_playback_claims(self):
+        g_unknown = conversation.tool_result_guidance(
+            "status=unverified source=browser_control evidence_status=UNKNOWN "
+            "I can see the video cards, but I cannot reliably read the third video's title."
+        )
+        self.assertIn("never guess or invent a title", g_unknown)
+        self.assertIn("cannot reliably read the requested video's title", g_unknown)
+
+        g_no_play = conversation.tool_result_guidance(
+            "status=done source=browser_control title='Exact Video' playback_verified=false"
+        )
+        self.assertIn("do NOT say 'I'm playing it'", g_no_play)
 
 
 if __name__ == "__main__":

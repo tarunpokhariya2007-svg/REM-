@@ -47,6 +47,19 @@ _CORRECTION_PHRASES = ("not that", "not this", "i meant", "i mean", "i said", "c
                        "make it", "my mistake", "no i")
 _CONFIRM_ONLY = {"yes", "yeah", "yep", "yup", "ok", "okay", "sure", "haan", "ha", "correct", "right",
                  "do it", "go ahead", "yes please", "yes do it", "yes go ahead"}
+_REJECT_ONLY = {"no", "nope", "nah", "nahi", "nahin", "dont", "don't", "not now", "no thanks", "skip"}
+
+
+def has_rejection(text: str) -> bool:
+    """True when the current utterance declines or rejects a suggested action."""
+    raw = " ".join(_words(text))
+    words = [w for w in _words(text) if w not in _FILLERS]
+    flat = " ".join(words)
+    if flat in _REJECT_ONLY or raw in _REJECT_ONLY:
+        return True
+    if words and words[0] in {"no", "nope", "nah", "nahi", "nahin"} and len(words) <= 6:
+        return True
+    return False
 
 
 def classify_utterance(text: str) -> str:

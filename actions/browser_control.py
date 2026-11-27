@@ -171,18 +171,27 @@ _INDEX_TO_ORDINAL: dict[int, str] = {
 
 def _parse_ordinal_index(text: str) -> int | None:
     """Extract 0-based video/result index (or -1 for last) from natural-language description."""
+    s = str(text or "")
     m = re.search(
         r"\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|"
         r"sixth|6th|seventh|7th|eighth|8th|ninth|9th|tenth|10th|last)"
-        r"\b(?:\s+\w+){0,2}\s+(?:videos?|results?|thumbnails?|cards?|links?|items?|one)\b",
-        str(text or ""),
+        r"\b(?:\s+\w+){0,3}\s+(?:videos?|results?|thumbnails?|cards?|links?|items?|chats?|contacts?|one|horizontally|row)\b",
+        s,
         re.IGNORECASE,
     )
+    if not m:
+        m = re.search(
+            r"\b(?:video|result|card|item|thumbnail)\s*(?:#|no\.?|number)?\s*(10|[1-9])\b",
+            s,
+            re.IGNORECASE,
+        )
+        if m:
+            return int(m.group(1)) - 1
     if not m:
         m = re.fullmatch(
             r"\s*(?:the\s+)?(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|"
             r"sixth|6th|seventh|7th|eighth|8th|ninth|9th|tenth|10th|last)\s*",
-            str(text or ""),
+            s,
             re.IGNORECASE,
         )
     if not m:
@@ -757,6 +766,144 @@ def _expected_site_hints(url: str) -> tuple[str, tuple[str, ...]]:
     return host, tuple(dict.fromkeys(h for h in hints if h))
 
 
+NAV_REQUESTED = "REQUESTED"
+NAV_BROWSER_RESOLVED = "BROWSER_RESOLVED"
+NAV_TAB_SELECTED = "TAB_SELECTED"
+NAV_NAVIGATION_STARTED = "NAVIGATION_STARTED"
+NAV_NAVIGATION_COMPLETED = "NAVIGATION_COMPLETED"
+NAV_PAGE_IDENTITY_VERIFIED = "PAGE_IDENTITY_VERIFIED"
+NAV_FOREGROUND_VERIFIED = "FOREGROUND_VERIFIED"
+NAV_SUCCESS = "SUCCESS"
+
+ACTION_REQUESTED = "ACTION_REQUESTED"
+TARGET_IDENTIFIED = "TARGET_IDENTIFIED"
+ACTION_ATTEMPTED = "ACTION_ATTEMPTED"
+ACTION_VERIFIED = "ACTION_VERIFIED"
+ACTION_FAILED = "ACTION_FAILED"
+ACTION_UNVERIFIED = "ACTION_UNVERIFIED"
+
+ELEM_VIDEO_CARD = "VIDEO_CARD"
+ELEM_CATEGORY_CHIP = "CATEGORY_CHIP"
+ELEM_NAVIGATION_ITEM = "NAVIGATION_ITEM"
+ELEM_SHORTS_CARD = "SHORTS_CARD"
+ELEM_AD_CARD = "AD_CARD"
+ELEM_SEARCH_CONTROL = "SEARCH_CONTROL"
+ELEM_PLAYER_CONTROL = "PLAYER_CONTROL"
+ELEM_OTHER = "OTHER"
+
+_YT_CHIP_ANCHORS = frozenset({
+    "all", "music", "mixes", "gaming", "live", "news", "sports", "podcasts",
+    "recently uploaded", "watched", "new to you", "for you", "posts", "playlists",
+    "science fiction", "movies", "comedy", "trending", "learning", "fashion",
+})
+
+
+def _log_browser_action_diag(
+    *,
+    task_id: str = "",
+    intent: str = "",
+    parsed_target: str = "",
+    browser_hwnd: int = 0,
+    browser_pid: int = 0,
+    requested_site: str = "",
+    verified_site: str = "",
+    active_tab: str = "",
+    action: str = "",
+    target_class: str = "",
+    selected_target: str = "",
+    selection_method: str = "none",
+    target_bbox: object = None,
+    auth_result: str = "",
+    auth_reason: str = "",
+    click_method: str = "",
+    fg_hwnd_before: int = 0,
+    fg_hwnd_after: int = 0,
+    verification_result: str = ACTION_UNVERIFIED,
+    failure_reason: str = "",
+    elapsed_ms: float = 0.0,
+) -> None:
+    """Emit structured diagnostic metadata without logging message contents or secrets."""
+    safe_tab = " ".join(str(active_tab or "").split())[:96]
+    safe_target = " ".join(str(selected_target or "").split())[:96]
+    safe_intent = " ".join(str(intent or "").split())[:96]
+    safe_parsed = " ".join(str(parsed_target or "").split())[:64]
+    safe_reason = " ".join(str(failure_reason or "").split())[:120]
+    print(
+        f"[BrowserDiag] task_id={task_id or 'none'} intent={safe_intent or 'none'!r} "
+        f"parsed_target={safe_parsed or 'none'!r} hwnd={int(browser_hwnd or 0)} "
+        f"pid={int(browser_pid or 0)} fg_before={int(fg_hwnd_before or 0)} fg_after={int(fg_hwnd_after or 0)} "
+        f"req_site={requested_site or 'none'} ver_site={verified_site or 'none'} "
+        f"tab={safe_tab!r} action={action or 'none'} class={target_class or 'OTHER'} "
+        f"target={safe_target!r} method={selection_method or 'none'} click_method={click_method or 'none'} "
+        f"bbox={target_bbox!r} auth={auth_result or 'n/a'}:{auth_reason or 'none'} "
+        f"result={verification_result} reason={safe_reason or 'none'} elapsed_ms={round(float(elapsed_ms or 0.0), 1)}"
+    )
+
+
+def _cluster_youtube_video_rows(
+    items: list[dict],
+    *,
+    row_gap: int = 95,
+) -> tuple[list[dict], list[list[dict]], bool, list[str]]:
+    """Order YouTube video items in deterministic reading order (left-to-right per row, top-to-bottom).
+
+    Items sharing vertical row proximity (`<= row_gap` px from the row anchor `top`) belong
+    to the same visual horizontal row and sort left-to-right. Returns
+    `(ordered_items, rows, ambiguous_sections, section_names)`.
+    """
+    if not items:
+        return [], [], False, []
+
+    def _top_left(it: dict) -> tuple[int, int]:
+        rect = it.get("rect")
+        if isinstance(rect, (list, tuple)) and len(rect) >= 2:
+            return int(rect[1] or 0), int(rect[0] or 0)
+        return int(it.get("top", 0) or 0), int(it.get("left", 0) or 0)
+
+    has_coords = any(_top_left(it) != (0, 0) for it in items)
+    if not has_coords:
+        ordered = [dict(it) for it in items]
+        for idx, it in enumerate(ordered, 1):
+            it["position"] = idx
+            it.setdefault("row_index", 1)
+            it.setdefault("col_index", idx)
+        return ordered, [ordered], False, []
+
+    sorted_by_top = sorted(items, key=lambda it: (_top_left(it)[0], _top_left(it)[1]))
+    rows: list[list[dict]] = []
+    row_tops: list[int] = []
+    for it in sorted_by_top:
+        t, _l = _top_left(it)
+        if not rows or abs(t - row_tops[-1]) > row_gap:
+            rows.append([dict(it)])
+            row_tops.append(t)
+        else:
+            rows[-1].append(dict(it))
+
+    ordered: list[dict] = []
+    sections: list[str] = []
+    for r_idx, row in enumerate(rows, 1):
+        row.sort(key=lambda it: _top_left(it)[1])
+        for c_idx, it in enumerate(row, 1):
+            it["row_index"] = r_idx
+            it["col_index"] = c_idx
+            it["position"] = len(ordered) + 1
+            sec = str(it.get("section") or "").strip()
+            if sec and sec not in sections:
+                sections.append(sec)
+            ordered.append(it)
+
+    # Genuine ambiguity: multiple distinct named shelf sections (>=2 items in each) compete cleanly
+    section_counts: dict[str, int] = {}
+    for it in ordered:
+        sec = str(it.get("section") or "").strip()
+        if sec:
+            section_counts[sec] = section_counts.get(sec, 0) + 1
+    competing_sections = [s for s, cnt in section_counts.items() if cnt >= 2]
+    ambiguous = len(competing_sections) >= 2
+    return ordered, rows, ambiguous, competing_sections
+
+
 def _classify_page_state(title: str, body: str = "") -> str:
     text = f"{title}\n{body}".casefold()
     if any(k in text for k in (
@@ -775,7 +922,303 @@ def _classify_page_state(title: str, body: str = "") -> str:
     return "loaded" if title.strip() else "unverified"
 
 
-def inspect_open_chrome_tabs_local(browser_name: str = "chrome") -> list[str]:
+def _is_non_target_chrome_title(title: str, url: str = "") -> tuple[bool, str]:
+    """Detect blank tabs, DevTools/Docs overview pages, and Google Search SERPs."""
+    t = str(title or "").strip().casefold()
+    u = str(url or "").strip().casefold()
+    if not u and not t:
+        return True, "empty"
+    if u in {"about:blank", "chrome://newtab", "chrome://newtab/", "edge://newtab", "edge://newtab/"} or t in {
+        "new tab", "new tab - google chrome", "new tab - microsoft edge", "untitled",
+    }:
+        return True, "blank"
+    if "project overview" in t:
+        return True, "wrong_tab"
+    if "google search" in t or t.endswith(" - google search - google chrome") or (
+        "google." in u and "/search" in u
+    ):
+        return True, "google_search"
+    return False, ""
+
+
+def _site_key_from_url_or_title(url: str = "", title: str = "") -> str:
+    url_cf = str(url or "").casefold()
+    title_cf = str(title or "").casefold()
+    non_target, kind = _is_non_target_chrome_title(title, url)
+    if non_target:
+        return "google" if kind == "google_search" else ""
+    combined = f"{url_cf} {title_cf}"
+    if "web.whatsapp.com" in url_cf or "whatsapp" in combined:
+        return "whatsapp"
+    if "youtube.com" in url_cf or "youtu.be" in url_cf or "youtube" in combined:
+        return "youtube"
+    if "google.com" in url_cf or title_cf.strip() in {"google", "google - google chrome"}:
+        return "google"
+    return ""
+
+
+def verify_site_page_identity(
+    site: str,
+    *,
+    url: str = "",
+    title: str = "",
+    body: str = "",
+    dom_ready: bool | None = None,
+    uia_elements=None,
+) -> dict:
+    """Verify independent site identity; reject New Tab, Project Overview, and SERPs."""
+    site_cf = str(site or "").strip().casefold()
+    url_s = str(url or "").strip()
+    url_cf = url_s.casefold()
+    title_s = str(title or "").strip()
+    title_cf = title_s.casefold()
+    uia_text = " ".join(
+        str(getattr(el, "name", "") or getattr(el, "label", "") or getattr(el, "value", "") or "")
+        for el in (uia_elements or ())
+    )
+    content_cf = f"{title_s}\n{body}\n{uia_text}".casefold()
+
+    base_state = _classify_page_state(title_s, body)
+    if base_state == "error":
+        return {
+            "verified": False, "target_matched": False, "site": site_cf,
+            "page_state": "error", "reason": f"browser error page displayed ({title_s or url_s})",
+            "url_match": False, "title_match": False, "content_match": False,
+        }
+
+    non_target, kind = _is_non_target_chrome_title(title_s, url_s)
+    if kind == "blank":
+        return {
+            "verified": False, "target_matched": False, "site": site_cf,
+            "page_state": "blank", "reason": "active tab is blank or New Tab",
+            "url_match": False, "title_match": False, "content_match": False,
+        }
+    if kind == "wrong_tab":
+        return {
+            "verified": False, "target_matched": False, "site": site_cf,
+            "page_state": "wrong_tab", "reason": f"wrong Chrome window/tab active ({title_s})",
+            "url_match": False, "title_match": False, "content_match": False,
+        }
+    if kind == "google_search" and site_cf in {"whatsapp", "youtube"}:
+        return {
+            "verified": False, "target_matched": False, "site": site_cf,
+            "page_state": "wrong_tab",
+            "reason": f"Chrome shows a Google Search results page ({title_s}), not {site_cf}",
+            "url_match": False, "title_match": False, "content_match": False,
+        }
+
+    url_host = ""
+    if url_cf:
+        try:
+            url_host = (urlsplit(url_s).hostname or "").casefold()
+        except Exception:
+            url_host = ""
+
+    url_match = False
+    title_match = False
+    content_match = False
+    if site_cf == "whatsapp":
+        url_match = ("web.whatsapp.com" in url_host) or ("web.whatsapp.com" in url_cf)
+        if url_cf and not url_match:
+            return {
+                "verified": False, "target_matched": False, "site": site_cf,
+                "page_state": "wrong_tab", "reason": f"tab URL '{url_s}' is not web.whatsapp.com",
+                "url_match": False, "title_match": False, "content_match": False,
+            }
+        title_match = ("whatsapp" in title_cf) and ("google search" not in title_cf)
+        content_match = any(
+            k in content_cf for k in (
+                "chats", "search or start new chat", "whatsapp", "scan qr code",
+                "use whatsapp on your computer", "link with phone number", "type a message",
+            )
+        )
+        matched = bool((url_match or (not url_cf and title_match)) and (title_match or content_match or url_match))
+    elif site_cf == "youtube":
+        url_match = ("youtube.com" in url_host or "youtu.be" in url_host or "youtube.com" in url_cf)
+        if url_cf and not url_match:
+            return {
+                "verified": False, "target_matched": False, "site": site_cf,
+                "page_state": "wrong_tab", "reason": f"tab URL '{url_s}' is not youtube.com",
+                "url_match": False, "title_match": False, "content_match": False,
+            }
+        title_match = ("youtube" in title_cf) and ("google search" not in title_cf)
+        content_match = any(
+            k in content_cf for k in (
+                "youtube", "search", "watch", "shorts", "subscriptions", "home",
+                "trending", "history", "play", "pause", "हिन्दी", "hindi", "खोजें",
+            )
+        )
+        matched = bool((url_match or (not url_cf and title_match)) and (title_match or content_match or url_match))
+    elif site_cf:
+        host, hints = _expected_site_hints(url_s or site_cf)
+        url_match = bool(host and host in url_host) if url_cf else False
+        title_match = any(h in title_cf for h in hints) if title_cf else False
+        if url_cf and host and not url_match and not title_match:
+            return {
+                "verified": False, "target_matched": False, "site": site_cf,
+                "page_state": "wrong_tab", "reason": f"tab URL '{url_s}' does not match expected site '{site_cf}'",
+                "url_match": False, "title_match": False, "content_match": False,
+            }
+        content_match = title_match or url_match
+        matched = bool(url_match or title_match)
+    else:
+        matched = bool((url_cf and url_cf != "about:blank") or title_s)
+
+    if base_state == "loading" or dom_ready is False:
+        return {
+            "verified": False, "target_matched": False, "site": site_cf,
+            "page_state": "loading", "reason": "target page is still loading",
+            "url_match": url_match, "title_match": title_match, "content_match": content_match,
+        }
+
+    if not matched:
+        return {
+            "verified": False, "target_matched": False, "site": site_cf,
+            "page_state": "wrong_tab" if (title_s or url_s) else "unverified",
+            "reason": f"visible page '{title_s or url_s or 'unknown'}' does not match requested site '{site_cf}'",
+            "url_match": url_match, "title_match": title_match, "content_match": content_match,
+        }
+
+    if base_state == "login_required":
+        return {
+            "verified": True, "target_matched": True, "site": site_cf,
+            "page_state": "login_required", "reason": f"{site_cf} login/QR screen verified",
+            "url_match": url_match, "title_match": title_match, "content_match": content_match,
+        }
+
+    return {
+        "verified": True, "target_matched": True, "site": site_cf,
+        "page_state": "loaded" if (title_s or url_match) else "unverified",
+        "reason": f"{site_cf or 'page'} identity verified",
+        "url_match": url_match, "title_match": title_match, "content_match": content_match,
+    }
+
+
+def youtube_hindi_intent(text: str) -> dict:
+    """Detect Hindi localization requests for YouTube (`Open YouTube in Hindi` / language change)."""
+    cf = " ".join(str(text or "").casefold().split())
+    if not cf or ("youtube" not in cf) or ("hindi" not in cf and "हिन्दी" not in cf):
+        return {"is_hindi": False, "mode": "", "url": "", "language": ""}
+    is_change = any(k in cf for k in ("change", "switch", "set", "language", "badlo", "karo"))
+    return {
+        "is_hindi": True,
+        "mode": "change_language" if is_change else "open_in_hindi",
+        "url": "https://www.youtube.com/?hl=hi&gl=IN",
+        "language": "hi",
+    }
+
+
+def _infer_requested_site(action: str, params: dict | None = None, request_text: str = "") -> str:
+    p = params or {}
+    act = str(action or "").lower().strip()
+    if act in ("search_contact", "select_contact", "compose_message", "update_draft"):
+        return "whatsapp"
+    url_hint = _site_key_from_url_or_title(str(p.get("url") or ""), "")
+    if url_hint:
+        return url_hint
+    for k in ("description", "text", "target", "query", "engine"):
+        site = _site_key_from_url_or_title("", str(p.get(k) or ""))
+        if site:
+            return site
+    if not request_text:
+        try:
+            from core import desktop_control as _dc
+            ctx = _dc.current_bound_auth_context()
+            if ctx is not None:
+                request_text = str(getattr(ctx, "instruction", "") or "")
+                site_req = _site_key_from_url_or_title("", request_text)
+                if site_req:
+                    return site_req
+                parent = str(getattr(ctx, "parent_instruction", "") or "")
+                site_p = _site_key_from_url_or_title("", parent)
+                if site_p:
+                    return site_p
+        except Exception:
+            pass
+    site = _site_key_from_url_or_title("", request_text)
+    if site:
+        return site
+    if act in ("play_video", "replay_video", "next_video", "pause_video", "resume_video",
+               "seek_forward", "seek_backward", "set_playback_position", "focus_search"):
+        return "youtube"
+    # Preserve last verified site in active browser target registry across follow-ups ("Scroll down", etc.)
+    try:
+        from core import desktop_control as _dc
+        tgt = _dc.get_active_target(_dc.current_bound_auth_context())
+        if tgt:
+            tab_site = _site_key_from_url_or_title(str(tgt.get("tab_url") or ""), str(tgt.get("tab_title") or ""))
+            if tab_site:
+                return tab_site
+    except Exception:
+        pass
+    try:
+        reg = _registry.get_target_registry(_registry._active_browser or "chrome")
+        fg = reg.get("foreground") or {}
+        fg_site = str(fg.get("site") or "").strip().casefold()
+        if fg_site in ("whatsapp", "youtube"):
+            return fg_site
+    except Exception:
+        pass
+    return ""
+
+
+def _win32_window_identity_for_title(browser_name: str, title_query: str = "", site_hint: str = "") -> tuple[int, int, str, str]:
+    """Return (hwnd, pid, app, title) for the best matching external browser window on Windows."""
+    if _OS != "Windows":
+        return 0, 0, "", ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import psutil
+        from core import screenview
+
+        user32 = ctypes.windll.user32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        tq = str(title_query or "").strip().casefold()
+        sh = str(site_hint or "").strip().casefold()
+        matches: list[tuple[int, int, int, str, str]] = []
+
+        def _visit(hwnd, _lp):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value or ""
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            pid_i = int(pid.value or 0)
+            if pid_i and screenview.is_own_pid(pid_i):
+                return True
+            app_name = ""
+            try:
+                app_name = psutil.Process(pid_i).name()
+            except Exception:
+                pass
+            if not _proc_matches_browser(app_name, title, browser_name):
+                return True
+            t_cf = title.casefold()
+            score = 1
+            if sh and _site_key_from_url_or_title("", title) == sh:
+                score += 10
+            if tq and tq in t_cf:
+                score += 5
+            matches.append((score, int(hwnd), pid_i, app_name or f"{browser_name}.exe", title))
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_visit), 0)
+        if not matches:
+            return 0, 0, "", ""
+        matches.sort(key=lambda item: item[0], reverse=True)
+        _, hwnd, pid_i, app_name, title = matches[0]
+        return hwnd, pid_i, app_name, title
+    except Exception:
+        return 0, 0, "", ""
+
+
+def inspect_open_chrome_tabs_local(browser_name: str = "chrome", *, site_hint: str = "") -> list[str]:
     """Return a non-intrusive local summary of open browser windows/tabs."""
     found: list[str] = []
     try:
@@ -784,119 +1227,272 @@ def inspect_open_chrome_tabs_local(browser_name: str = "chrome") -> list[str]:
             app_cf = str(app or "").casefold()
             title_cf = str(title or "").casefold()
             if browser_name in app_cf or "chrome" in title_cf or "edge" in title_cf:
-                found.append(f"{app or browser_name}: {title}")
+                entry = f"{app or browser_name}: {title}"
+                if site_hint and _site_key_from_url_or_title("", title) == site_hint:
+                    found.insert(0, entry)
+                else:
+                    found.append(entry)
     except Exception:
         pass
     try:
         if _registry.has(browser_name):
             sess = _registry.get(browser_name)
-            page = getattr(sess, "_page", None)
-            if page is not None and not page.is_closed():
-                found.insert(0, f"CDP tab: {page.url}")
+            ctx = getattr(sess, "_context", None)
+            pages = [p for p in (getattr(ctx, "pages", ()) or ()) if not p.is_closed()] if ctx is not None else []
+            for p in pages:
+                if site_hint and _site_key_from_url_or_title(getattr(p, "url", ""), "") == site_hint:
+                    found.insert(0, f"CDP tab: {p.url}")
+                    break
+            else:
+                page = getattr(sess, "_page", None)
+                if page is not None and not page.is_closed():
+                    found.insert(0, f"CDP tab: {page.url}")
     except Exception:
         pass
     return found
 
 
-def _verify_native_browser(name: str, url: str, *, timeout_s: float | None = None,
-                           reused_existing: bool = False) -> str:
-    """Verify native browser launch and active window/tab state when possible."""
+def _verify_native_browser(
+    name: str,
+    url: str,
+    *,
+    timeout_s: float | None = None,
+    reused_existing: bool = False,
+    initial_timings: dict | None = None,
+) -> str:
+    """Confirm active tab URL/title, page identity, load state and foreground visibility."""
     import time as _time
+    t_start = _time.perf_counter()
+    timings = dict(initial_timings or {})
     if timeout_s is None:
         try:
-            timeout_s = float(os.environ.get("REM_BROWSER_VERIFY_TIMEOUT", "2.5"))
+            default_t = "3.5" if (reused_existing and _site_key_from_url_or_title(url, "") == "whatsapp") else "2.5"
+            timeout_s = float(os.environ.get("REM_BROWSER_VERIFY_TIMEOUT", default_t))
         except ValueError:
             timeout_s = 2.5
 
     host, hints = _expected_site_hints(url)
+    site_hint = _site_key_from_url_or_title(url, "")
     deadline = _time.monotonic() + max(0.0, timeout_s)
     running = bool(appidentity.running(name))
     matched_title = ""
+    matched_app = ""
     observed_url = ""
+    matched_hwnd = 0
+    matched_pid = 0
+    matched_ident: dict = {}
+    saw_loading = False
+    loading_title = ""
+    error_title = ""
     all_browser_titles: list[str] = []
 
     while True:
+        t_win0 = _time.perf_counter()
         running = bool(appidentity.running(name))
         all_browser_titles = []
+        matched_ident = {}
         try:
             from core import screenview
             for app, title in screenview.all_windows():
-                app_cf = str(app or "").casefold()
-                title_cf = str(title or "").casefold()
-                if name in app_cf or (name == "chrome" and "google chrome" in title_cf) or (name == "edge" and "microsoft edge" in title_cf):
+                if _proc_matches_browser(app, title, name):
                     all_browser_titles.append(str(title or ""))
-                    if any(h in title_cf for h in hints):
-                        matched_title = str(title or "")
-                        break
-            if not matched_title:
-                fg_app, fg_title, _pid, _hwnd = screenview._foreground()
-                if name in str(fg_app or "").casefold():
+                    if site_hint:
+                        ident = verify_site_page_identity(site_hint, url="", title=str(title or ""))
+                        if ident["page_state"] == "error":
+                            error_title = str(title or "")
+                            matched_ident = ident
+                            break
+                        if ident["page_state"] == "loading":
+                            saw_loading = True
+                            loading_title = str(title or "")
+                            continue
+                        if ident["verified"]:
+                            matched_title = str(title or "")
+                            matched_app = str(app or "")
+                            matched_ident = ident
+                            break
+                    else:
+                        title_cf = str(title or "").casefold()
+                        if any(h in title_cf for h in hints):
+                            ident = verify_site_page_identity("", url=url, title=str(title or ""))
+                            if ident["page_state"] == "loading":
+                                saw_loading = True
+                                loading_title = str(title or "")
+                                continue
+                            matched_title = str(title or "")
+                            matched_app = str(app or "")
+                            matched_ident = ident
+                            break
+            if not matched_title and not error_title:
+                fg_app, fg_title, fg_pid, fg_hwnd = screenview._foreground()
+                if not screenview.is_own_pid(int(fg_pid or 0)) and _proc_matches_browser(fg_app, fg_title, name):
                     view = screenview.look(budget_s=0.6, allow_ocr=False, allow_pixel_digest=False)
-                    for el in view.elements:
+                    for el in getattr(view, "elements", ()) or ():
                         val = str(getattr(el, "value", "") or getattr(el, "name", "") or "")
                         if host and host in val.casefold():
-                            observed_url = val if "://" in val else f"https://{val}"
-                            matched_title = str(fg_title or view.title or "")
-                            break
+                            cand_url = val if "://" in val else f"https://{val}"
+                            cand_title = str(fg_title or getattr(view, "title", "") or "")
+                            ident = verify_site_page_identity(
+                                site_hint, url=cand_url, title=cand_title, uia_elements=getattr(view, "elements", ()),
+                            )
+                            if ident["page_state"] == "error":
+                                error_title = cand_title
+                                observed_url = cand_url
+                                matched_ident = ident
+                                break
+                            if ident["page_state"] == "loading":
+                                saw_loading = True
+                                loading_title = cand_title
+                                observed_url = cand_url
+                                continue
+                            if ident["verified"]:
+                                observed_url = cand_url
+                                matched_title = cand_title
+                                matched_app = str(fg_app or "")
+                                matched_hwnd = int(fg_hwnd or 0)
+                                matched_pid = int(fg_pid or 0)
+                                matched_ident = ident
+                                break
         except Exception:
             pass
-        if matched_title or _time.monotonic() >= deadline:
+        timings["window_resolution_ms"] = round(
+            float(timings.get("window_resolution_ms", 0.0)) + (_time.perf_counter() - t_win0) * 1000.0, 1
+        )
+        if matched_title or error_title or _time.monotonic() >= deadline:
             break
         _time.sleep(0.35)
 
     if not url:
+        timings["total_ms"] = round((_time.perf_counter() - t_start) * 1000.0, 1)
         if running:
             print(f"[Browser] Verified launch browser={name} reused={reused_existing} windows={len(all_browser_titles)}")
-            return outcome.done("browser_control", browser=name, opened=True,
-                                verified=True, browser_launched=True,
-                                reused_existing=reused_existing,
-                                page_state="loaded" if all_browser_titles else "open")
+            return outcome.done(
+                "browser_control", browser=name, opened=True,
+                verified=True, browser_launched=True,
+                reused_existing=reused_existing,
+                navigation_lifecycle=NAV_SUCCESS,
+                page_state="loaded" if all_browser_titles else "open",
+                total_ms=timings["total_ms"],
+            )
         print(f"[Browser] Unverified launch browser={name} (process not detected)")
         return outcome.unverified(
             "browser_control",
             "the browser was launched but has not appeared in the process list yet",
             browser=name, browser_launched=False, reused_existing=reused_existing,
+            navigation_lifecycle=NAV_BROWSER_RESOLVED,
             page_state="unverified", verification_step="process_presence",
+            total_ms=timings["total_ms"],
+        )
+
+    if error_title:
+        timings["total_ms"] = round((_time.perf_counter() - t_start) * 1000.0, 1)
+        print(f"[Browser] Navigation error detected browser={name} url={url} title={error_title!r}")
+        return outcome.failed(
+            "browser_control",
+            f"the page reported an error ({error_title})",
+            browser=name, url=observed_url or url, title=error_title,
+            page_state="error", browser_launched=running,
+            reused_existing=reused_existing, navigation_requested=True,
+            navigation_completed=False, target_matched=False, foreground_verified=False,
+            navigation_lifecycle=NAV_NAVIGATION_COMPLETED,
+            total_ms=timings["total_ms"],
         )
 
     if matched_title:
-        page_state = _classify_page_state(matched_title)
-        if page_state == "error":
-            print(f"[Browser] Navigation error detected browser={name} url={url} title={matched_title!r}")
-            return outcome.failed(
+        page_state = matched_ident.get("page_state") or _classify_page_state(matched_title)
+        cand_win = {
+            "found": True,
+            "foreground": False,
+            "browser": name,
+            "app": matched_app or name,
+            "title": matched_title,
+            "hwnd": matched_hwnd,
+            "pid": matched_pid,
+        }
+        t_act0 = _time.perf_counter()
+        ok_fg, fg_win, fg_err = _ensure_browser_foreground(
+            name, cand_win, title_hint=matched_title, site_hint=site_hint,
+        )
+        timings["tab_activation_ms"] = round((_time.perf_counter() - t_act0) * 1000.0, 1)
+        timings["total_ms"] = round((_time.perf_counter() - t_start) * 1000.0, 1)
+        if not ok_fg:
+            return outcome.unverified(
                 "browser_control",
-                f"the page reported an error ({matched_title})",
+                f"the page loaded ({matched_title}) but {name} did not reach the visible foreground: {fg_err}",
                 browser=name, url=observed_url or url, title=matched_title,
-                page_state="error", browser_launched=running,
-                reused_existing=reused_existing, navigation_requested=True,
+                active_tab=matched_title, page_state=page_state,
+                browser_launched=running, reused_existing=reused_existing,
+                navigation_requested=True, navigation_completed=True,
+                target_matched=True, foreground_verified=False, verified=False,
+                navigation_lifecycle=NAV_PAGE_IDENTITY_VERIFIED,
+                **{k: v for k, v in timings.items()},
             )
+        if site_hint:
+            _registry.note_site_target(name, site_hint, {
+                "hwnd": int(fg_win.get("hwnd", 0) or matched_hwnd or 0),
+                "pid": int(fg_win.get("pid", 0) or matched_pid or 0),
+                "title": str(fg_win.get("title") or matched_title),
+                "url": observed_url or url,
+                "site": site_hint,
+            })
         print(f"[Browser] Verified native navigation browser={name} reused={reused_existing} url={observed_url or url} page_state={page_state}")
         return outcome.done(
             "browser_control",
             verified=True,
             browser=name,
             url=observed_url or url,
-            title=matched_title,
-            active_tab=matched_title,
+            title=str(fg_win.get("title") or matched_title),
+            active_tab=str(fg_win.get("title") or matched_title),
+            window_hwnd=int(fg_win.get("hwnd", 0) or matched_hwnd or 0),
+            window_pid=int(fg_win.get("pid", 0) or matched_pid or 0),
             page_state=page_state,
             browser_launched=running,
             reused_existing=reused_existing,
             navigation_requested=True,
             navigation_completed=True,
+            target_matched=True,
+            foreground_verified=True,
+            navigation_lifecycle=NAV_SUCCESS,
+            **{k: v for k, v in timings.items()},
+        )
+
+    timings["total_ms"] = round((_time.perf_counter() - t_start) * 1000.0, 1)
+    if saw_loading:
+        print(f"[Browser] Timed out while page remained loading browser={name} url={url} title={loading_title!r}")
+        return outcome.timed_out(
+            "browser_control",
+            f"the page stayed in a loading state ({loading_title or url}) before identity could be verified",
+            browser=name,
+            url=observed_url or url,
+            title=loading_title,
+            browser_launched=running,
+            reused_existing=reused_existing,
+            navigation_requested=True,
+            navigation_completed=False,
+            target_matched=False,
+            foreground_verified=False,
+            page_state="loading",
+            navigation_lifecycle=NAV_NAVIGATION_STARTED,
+            **{k: v for k, v in timings.items()},
         )
 
     print(f"[Browser] Unverified native navigation browser={name} url={url} running={running}")
     return outcome.unverified(
         "browser_control",
-        "navigation was requested, but active tab URL and page load state could not be confirmed",
+        "navigation was requested, but active tab URL and visible target page identity could not be confirmed",
         browser=name,
         url=url,
         browser_launched=running,
         reused_existing=reused_existing,
         navigation_requested=True,
         navigation_completed=False,
-        page_state="unverified",
+        target_matched=False,
+        foreground_verified=False,
+        page_state="wrong_tab" if all_browser_titles else "unverified",
         verification_step="active_tab_url_and_title",
+        navigation_lifecycle=NAV_NAVIGATION_STARTED,
+        observed_tabs="; ".join(all_browser_titles[:4]) if all_browser_titles else None,
+        **{k: v for k, v in timings.items()},
     )
 
 
@@ -923,12 +1519,86 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
     else:
         name = _registry._active_browser or _detect_running_browser() or _detect_default_browser()
 
-    # Specific browser → launch or reuse its own executable, never silently substitute Edge.
+    # Specific browser -> launch or reuse its own executable, never silently substitute Edge.
     if name:
+        t_res0 = time.perf_counter()
         try:
             reused_existing = bool(appidentity.running(name))
         except Exception:
             reused_existing = False
+        req_text = ""
+        try:
+            from core import desktop_control as _dc
+            _ctx = _dc.current_bound_auth_context()
+            req_text = str(getattr(_ctx, "instruction", "") or "") if _ctx is not None else ""
+        except Exception:
+            pass
+        yt_hi = youtube_hindi_intent(req_text)
+        if yt_hi.get("is_hindi") and url and "youtube.com" in url.casefold() and "hl=hi" not in url.casefold():
+            if yt_hi["mode"] == "open_in_hindi":
+                url = yt_hi["url"]
+        site_hint = _site_key_from_url_or_title(url, "") if url else ""
+        if reused_existing and site_hint:
+            existing_win = _find_browser_window(name, site_hint=site_hint)
+            win_res_ms = round((time.perf_counter() - t_res0) * 1000.0, 1)
+            wants_specific_query = bool(url and (urlsplit(url).query or len(urlsplit(url).path.strip("/")) > 0))
+            if existing_win.get("found") and not existing_win.get("site_mismatch") and not wants_specific_query:
+                ident = verify_site_page_identity(
+                    site_hint, url="", title=str(existing_win.get("title") or ""),
+                )
+                if ident.get("verified"):
+                    t_act0 = time.perf_counter()
+                    ok_fg, fg_win, _fg_err = _ensure_browser_foreground(
+                        name, existing_win,
+                        title_hint=("WhatsApp" if site_hint == "whatsapp" else "YouTube" if site_hint == "youtube" else site_hint),
+                        site_hint=site_hint,
+                    )
+                    act_ms = round((time.perf_counter() - t_act0) * 1000.0, 1)
+                    if ok_fg:
+                        final_title = str(fg_win.get("title") or existing_win.get("title") or "")
+                        _registry.note_site_target(
+                            name, site_hint,
+                            {
+                                "hwnd": int(fg_win.get("hwnd", 0) or 0),
+                                "pid": int(fg_win.get("pid", 0) or 0),
+                                "title": final_title,
+                                "url": url,
+                                "site": site_hint,
+                            },
+                        )
+                        _registry.invalidate_sync(name)
+                        return outcome.done(
+                            "browser_control",
+                            opened=url,
+                            browser=name,
+                            url=url,
+                            title=final_title,
+                            active_tab=final_title,
+                            window_hwnd=int(fg_win.get("hwnd", 0) or 0),
+                            window_pid=int(fg_win.get("pid", 0) or 0),
+                            page_state=ident.get("page_state") or _classify_page_state(final_title),
+                            browser_launched=True,
+                            reused_existing=True,
+                            focused_existing=True,
+                            target_matched=True,
+                            foreground_verified=True,
+                            navigation_requested=True,
+                            navigation_completed=True,
+                            navigation_lifecycle=NAV_SUCCESS,
+                            window_resolution_ms=win_res_ms,
+                            tab_activation_ms=act_ms,
+                            total_ms=round((time.perf_counter() - t_res0) * 1000.0, 1),
+                        )
+                elif ident.get("page_state") == "loading":
+                    _ensure_browser_foreground(name, existing_win, title_hint=site_hint, site_hint=site_hint)
+                    return _verify_native_browser(
+                        name, url, reused_existing=True,
+                        initial_timings={"window_resolution_ms": win_res_ms},
+                    )
+        # Deduplicate concurrent open requests for the same browser+site so repeated
+        # commands like "Open WhatsApp in Chrome" wait/inspect cleanly instead of spawning duplicates.
+        if site_hint and _is_opening_inflight(name, site_hint):
+            return _wait_or_inspect_inflight_open(name, site_hint, url=url)
         if _OS == "Darwin":
             app = _MAC_APP_NAMES.get(name)
             if app:
@@ -947,6 +1617,7 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
             else:
                 exe = _find_exe_windows(_WIN_EXE_HINTS.get(name, name))
         if exe:
+            _mark_opening_inflight(name, site_hint, True)
             try:
                 args = [exe] + (_launch_flags(name) if not reused_existing else []) + ([url] if url else [])
                 subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -959,6 +1630,8 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
                         f"requested browser '{name}' failed to launch ({e}); did not substitute another browser",
                         browser=name, url=url, reused_existing=reused_existing,
                     )
+            finally:
+                _mark_opening_inflight(name, site_hint, False)
         if explicit_browser:
             return outcome.failed(
                 "browser_control",
@@ -1387,8 +2060,25 @@ class _BrowserSession:
         except Exception:
             return False
 
-    async def go_to(self, url: str) -> str:
+    async def _get_page_for_site(self, site_hint: str = "") -> Page:
+        page = await self._get_page()
+        sh = str(site_hint or "").strip().casefold()
+        if not sh or getattr(self, "_context", None) is None:
+            return page
+        pages = [p for p in (getattr(self._context, "pages", ()) or ()) if not p.is_closed()]
+        matching = [p for p in pages if _site_key_from_url_or_title(getattr(p, "url", ""), "") == sh]
+        if matching:
+            chosen = page if page in matching else matching[-1]
+            self._page = chosen
+            try:
+                await chosen.bring_to_front()
+            except Exception:
+                pass
+            return chosen
+        return page
 
+    async def go_to(self, url: str) -> str:
+        t0 = time.perf_counter()
         try:
             url = _normalize_url(url)
         except ValueError:
@@ -1397,13 +2087,83 @@ class _BrowserSession:
                 "Which website did you mean? Please give me its name or web address.",
                 verified=False,
             )
-        page     = await self._get_page()
-        prev_url = page.url
+        yt_hi: dict = {"is_hindi": False, "mode": "", "url": "", "language": ""}
+        try:
+            from core import desktop_control as _dc
+            _ctx = _dc.current_bound_auth_context()
+            _req_txt = str(getattr(_ctx, "instruction", "") or "") if _ctx is not None else ""
+            yt_hi = youtube_hindi_intent(_req_txt)
+            if yt_hi.get("is_hindi") and yt_hi.get("mode") == "open_in_hindi" and "youtube.com" in url.casefold() and "hl=hi" not in url.casefold():
+                url = yt_hi["url"]
+        except Exception:
+            pass
+
+        site_hint = _site_key_from_url_or_title(url, "")
+        t_tab0 = time.perf_counter()
+        page = await self._get_page_for_site(site_hint)
+        tab_resolution_ms = round((time.perf_counter() - t_tab0) * 1000.0, 1)
+        prev_url = page.url or ""
         navigation_error = None
+
+        # Tab reuse: if selected tab already hosts the target site and no distinct sub-path/query/language change was asked
+        wants_specific_nav = bool(urlsplit(url).query or len(urlsplit(url).path.strip("/")) > 0)
+        if site_hint and _site_key_from_url_or_title(prev_url, "") == site_hint and not wants_specific_nav and not yt_hi.get("is_hindi"):
+            if await self._page_visible_for_action(page):
+                try:
+                    cur_title = await page.title()
+                except Exception:
+                    cur_title = ""
+                try:
+                    cur_body = (await page.locator("body").inner_text(timeout=800))[:800]
+                except Exception:
+                    cur_body = ""
+                ident = verify_site_page_identity(
+                    site_hint, url=prev_url, title=cur_title, body=cur_body, dom_ready=True,
+                )
+                if ident.get("verified"):
+                    return outcome.done(
+                        "browser_control",
+                        opened=prev_url,
+                        browser=self.browser_name,
+                        url=prev_url,
+                        title=cur_title or "",
+                        page_state=ident.get("page_state") or "loaded",
+                        profile=self.profile_kind or "real",
+                        reused_existing=True,
+                        tab_reused=True,
+                        verified=True,
+                        navigation_confirmed=True,
+                        target_matched=True,
+                        foreground_verified=True,
+                        page_ready=True,
+                        requested_url=url,
+                        navigation_lifecycle=NAV_SUCCESS,
+                        tab_resolution_ms=tab_resolution_ms,
+                        total_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+                    )
+
+        # If current tab holds a DIFFERENT live site (e.g. switching between WhatsApp and YouTube),
+        # prefer opening a tab only when no matching site tab existed and current tab isn't blank.
+        prev_site = _site_key_from_url_or_title(prev_url, "")
+        if site_hint and prev_site and prev_site != site_hint and getattr(self, "_context", None) is not None:
+            try:
+                page = await self._context.new_page()
+                self._page = page
+                prev_url = page.url or ""
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         if not await self._page_visible_for_action(page):
             return outcome.unverified(
                 "browser_control", "browser page is hidden; navigation was not attempted",
-                requested=url, actual=prev_url, navigation_confirmed=False)
+                requested=url, actual=prev_url, navigation_confirmed=False,
+                foreground_verified=False, target_matched=False,
+                navigation_lifecycle=NAV_TAB_SELECTED,
+            )
 
         async def _do_goto(p: Page) -> str:
             """Attempt navigation and return the resulting URL (may still be blank)."""
@@ -1412,13 +2172,12 @@ class _BrowserSession:
                 await p.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 await asyncio.sleep(0.3)
             except PlaywrightTimeout:
-                # A timeout can happen after the address changed. The URL and
-                # document readiness below decide whether navigation occurred.
                 navigation_error = "timeout"
             except Exception as e:
                 navigation_error = type(e).__name__
             return p.url
 
+        t_nav0 = time.perf_counter()
         result_url = await _do_goto(page)
 
         if result_url in ("about:blank", "", None, prev_url) and prev_url in ("about:blank", "", None):
@@ -1430,63 +2189,147 @@ class _BrowserSession:
                 result_url = await _do_goto(new_page)
             except Exception as e:
                 print(f"[Browser] New-tab retry failed: {e}")
+        navigation_ms = round((time.perf_counter() - t_nav0) * 1000.0, 1)
 
         if result_url and result_url not in ("about:blank", "", None):
-            try:
-                page_ready = await page.evaluate(
-                    "() => document.readyState === 'interactive' || document.readyState === 'complete'")
-            except Exception:
-                page_ready = False
+            t_dom0 = time.perf_counter()
+            page_ready = False
+            title = ""
+            body_sample = ""
+            ident: dict = {}
+            settle_deadline = time.monotonic() + 2.5
+            while True:
+                try:
+                    page_ready = await page.evaluate(
+                        "() => document.readyState === 'interactive' || document.readyState === 'complete'")
+                except Exception:
+                    page_ready = False
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ""
+                try:
+                    body_sample = (await page.locator("body").inner_text(timeout=1_200))[:1200]
+                except Exception:
+                    body_sample = ""
+                ident = verify_site_page_identity(
+                    site_hint, url=result_url, title=title, body=body_sample, dom_ready=page_ready,
+                )
+                if ident.get("page_state") != "loading" or time.monotonic() >= settle_deadline:
+                    break
+                await asyncio.sleep(0.25)
+            dom_verification_ms = round((time.perf_counter() - t_dom0) * 1000.0, 1)
+
             if not page_ready:
+                if navigation_error == "timeout" or ident.get("page_state") == "loading":
+                    return outcome.timed_out(
+                        "browser_control",
+                        "the browser URL changed, but the page remained loading past the readiness deadline",
+                        requested=url, actual=result_url, navigation_confirmed=True,
+                        page_ready=False, target_matched=False, foreground_verified=False,
+                        error=navigation_error, page_state="loading",
+                        navigation_lifecycle=NAV_NAVIGATION_STARTED,
+                        tab_resolution_ms=tab_resolution_ms, navigation_ms=navigation_ms,
+                        dom_verification_ms=dom_verification_ms,
+                    )
                 return outcome.unverified(
                     "browser_control",
                     "the browser URL changed, but the page did not confirm DOM readiness",
                     requested=url, actual=result_url, navigation_confirmed=True,
-                    page_ready=False, error=navigation_error)
-            if not await self._page_visible_for_action(page):
-                return outcome.unverified(
-                    "browser_control",
-                    "the URL loaded, but the browser page is hidden; visible navigation is not confirmed",
-                    requested=url, actual=result_url, navigation_confirmed=False,
-                    page_ready=True, browser=self.browser_name, page_state="hidden")
-            try:
-                title = await page.title()
-            except Exception:
-                title = ""
-            try:
-                body_sample = (await page.locator("body").inner_text(timeout=1_500))[:1200]
-            except Exception:
-                body_sample = ""
-            page_state = _classify_page_state(title or result_url, body_sample)
-            if page_state == "error":
+                    page_ready=False, target_matched=False, foreground_verified=False,
+                    error=navigation_error, navigation_lifecycle=NAV_NAVIGATION_COMPLETED,
+                )
+            if ident.get("page_state") == "error":
                 print(f"[Browser] Navigation error page browser={self.browser_name} url={result_url} title={title!r}")
                 return outcome.failed(
                     "browser_control",
                     f"the requested page failed to load ({title or result_url})",
                     browser=self.browser_name, url=result_url, title=title, page_state="error",
+                    target_matched=False, foreground_verified=False,
+                    navigation_lifecycle=NAV_NAVIGATION_COMPLETED,
                 )
+            if not await self._page_visible_for_action(page):
+                return outcome.unverified(
+                    "browser_control",
+                    "the URL loaded, but the browser page is hidden; visible navigation is not confirmed",
+                    requested=url, actual=result_url, navigation_confirmed=False,
+                    page_ready=True, target_matched=bool(ident.get("target_matched")),
+                    foreground_verified=False, browser=self.browser_name, page_state="hidden",
+                    navigation_lifecycle=NAV_PAGE_IDENTITY_VERIFIED,
+                )
+            if site_hint and not ident.get("verified"):
+                return outcome.unverified(
+                    "browser_control",
+                    ident.get("reason") or "the loaded tab did not match the requested target site",
+                    requested=url, actual=result_url, title=title or "",
+                    browser=self.browser_name, page_state=ident.get("page_state") or "wrong_tab",
+                    navigation_confirmed=False, target_matched=False,
+                    foreground_verified=True, page_ready=page_ready,
+                    navigation_lifecycle=NAV_NAVIGATION_COMPLETED,
+                )
+            page_state = ident.get("page_state") or _classify_page_state(title or result_url, body_sample)
+            if yt_hi.get("mode") == "change_language":
+                try:
+                    html_lang = str(await page.evaluate("() => (document.documentElement.lang || '').toLowerCase()") or "")
+                except Exception:
+                    html_lang = ""
+                hindi_confirmed = (
+                    html_lang.startswith("hi")
+                    or "hl=hi" in result_url.casefold()
+                    or any(w in f"{title}\n{body_sample}" for w in ("हिन्दी", "खोजें", "होम"))
+                )
+                if not hindi_confirmed:
+                    return outcome.unverified(
+                        "browser_control",
+                        "I opened YouTube, but could not confirm that the display language switched to Hindi; you can set Settings > Language > हिन्दी.",
+                        requested=url, actual=result_url, title=title or "",
+                        browser=self.browser_name, page_state=page_state,
+                        target_matched=True, foreground_verified=True,
+                        language_verified=False,
+                        navigation_lifecycle=NAV_FOREGROUND_VERIFIED,
+                    )
             print(f"[Browser] Verified navigation browser={self.browser_name} url={result_url} page_state={page_state}")
-            return outcome.done("browser_control", opened=result_url,
-                                browser=self.browser_name, url=result_url,
-                                title=title or "", page_state=page_state,
-                                profile=self.profile_kind or "real",
-                                verified=True, navigation_confirmed=True,
-                                page_ready=True, requested_url=url,
-                                requested_url_match=(result_url.rstrip("/")
-                                                     == url.rstrip("/")),
-                                profile_notice=(
-                                    "separate profile; existing signed-in profile was not used"
-                                    if self.profile_kind == "separate" else None))
+            return outcome.done(
+                "browser_control", opened=result_url,
+                browser=self.browser_name, url=result_url,
+                title=title or "", page_state=page_state,
+                profile=self.profile_kind or "real",
+                verified=True, navigation_confirmed=True,
+                target_matched=True, foreground_verified=True,
+                page_ready=True, requested_url=url,
+                requested_url_match=(result_url.rstrip("/") == url.rstrip("/")),
+                navigation_lifecycle=NAV_SUCCESS,
+                tab_resolution_ms=tab_resolution_ms,
+                navigation_ms=navigation_ms,
+                dom_verification_ms=dom_verification_ms,
+                total_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+                profile_notice=(
+                    "separate profile; existing signed-in profile was not used"
+                    if self.profile_kind == "separate" else None
+                ),
+            )
+        if navigation_error == "timeout":
+            return outcome.timed_out(
+                "browser_control",
+                "navigation timed out before the page loaded",
+                requested=url, actual=result_url or "", navigation_confirmed=False,
+                target_matched=False, foreground_verified=False,
+                navigation_lifecycle=NAV_NAVIGATION_STARTED,
+            )
         if result_url == prev_url and prev_url not in ("about:blank", "", None):
             return outcome.unverified(
                 "browser_control",
                 "the requested navigation was accepted, but the current page URL did not change",
                 requested=url, actual=result_url, navigation_confirmed=False,
-                page_ready=False, error=navigation_error)
+                page_ready=False, target_matched=False, foreground_verified=False,
+                error=navigation_error, navigation_lifecycle=NAV_NAVIGATION_STARTED,
+            )
         return outcome.failed(
             "browser_control",
             "the page stayed blank - the address may be wrong, or the site may "
-            "not have answered", url=url)
+            "not have answered", url=url, target_matched=False, foreground_verified=False,
+            navigation_lifecycle=NAV_NAVIGATION_COMPLETED,
+        )
 
     async def search(self, query: str, engine: str = "google") -> str:
         chosen = str(engine or "").lower().strip()
@@ -1548,9 +2391,24 @@ class _BrowserSession:
     async def scroll(self, direction: str = "down", amount: int = 500) -> str:
         page = await self._get_page()
         try:
-            y = amount if direction == "down" else -amount
-            await page.mouse.wheel(0, y)
-            return f"Scrolled {direction}."
+            d = str(direction or "down").lower().strip()
+            mag = max(80, min(2000, abs(int(amount or 500))))
+            dx, dy = 0, 0
+            if d == "up":
+                dy = -mag
+            elif d == "left":
+                dx = -mag
+            elif d == "right":
+                dx = mag
+            else:
+                dy = mag
+            await page.mouse.wheel(dx, dy)
+            try:
+                from core import desktop_control as _dc
+                _dc.clear_task_targets()
+            except Exception:
+                pass
+            return f"Scrolled {d}."
         except Exception as e:
             return f"Scroll error: {e}"
 
@@ -1613,8 +2471,8 @@ class _BrowserSession:
         except Exception as e:
             return f"Could not get page text: {e}"
 
-    async def get_url(self) -> str:
-        page = await self._get_page()
+    async def get_url(self, site_hint: str = "") -> str:
+        page = await self._get_page_for_site(site_hint)
         return page.url
 
     async def fill_form(self, fields: dict) -> str:
@@ -1668,12 +2526,37 @@ class _BrowserSession:
         if is_youtube and desc_cf in {"next video", "play next video", "play the next video"}:
             return await self._click_youtube_next_video(page)
 
+        if is_youtube:
+            chip_res = await self._try_click_youtube_category_chip(page, desc_str)
+            if chip_res is not None:
+                return chip_res
+
         ordinal_idx = _parse_ordinal_index(desc_str)
         if ordinal_idx is not None:
             if is_youtube:
                 return await self._click_youtube_video_ordinal(page, ordinal_idx, desc_str)
             return await self._click_ordinal_result(
                 page, _INDEX_TO_ORDINAL.get(ordinal_idx, f"#{ordinal_idx + 1}"), before)
+
+        is_whatsapp = ("web.whatsapp.com" in str(page.url or "").casefold()) or ("whatsapp" in host)
+        if is_whatsapp and not _is_search_bar_query(desc_str):
+            from plugins import _whatsapp_core as _wa
+            wa_intent = _wa.parse_whatsapp_intent_target(desc_str)
+            if wa_intent.get("is_intent") or any(k in desc_cf for k in ("chat", "contact")):
+                c_query = str(wa_intent.get("contact") or "").strip()
+                if not c_query:
+                    c_query = re.sub(
+                        r"\b(?:open|select|click|chat|conversation|contact|named|called|with|for|the|one|now|shed)\b",
+                        " ", desc_str, flags=re.IGNORECASE,
+                    )
+                    c_query = " ".join(c_query.split()).strip(" .,!?'\"-")
+                if c_query:
+                    return await self._open_whatsapp_contact_bounded(page, c_query)
+                return outcome.ask(
+                    "browser_control",
+                    "Which WhatsApp contact or chat would you like me to open, Tarun-kun?",
+                    browser=self.browser_name, verified=False,
+                )
 
         if is_youtube:
             title_match = re.search(r"\b(?:video\s+)?titled\s+[\"']?(.+?)[\"']?$", desc_str, re.IGNORECASE)
@@ -1767,6 +2650,7 @@ class _BrowserSession:
             const r = card.getBoundingClientRect(), s = getComputedStyle(card);
             if (r.width < 2 || r.height < 2 || s.display === 'none' || s.visibility === 'hidden') continue;
             if (card.hasAttribute('is-ad')
+                || card.closest('yt-chip-cloud-chip-renderer, #chips-wrapper, iron-selector#chips, [role="tablist"]')
                 || card.closest('ytd-ad-slot-renderer, ytd-promoted-sparkles-web-renderer')
                 || card.querySelector('ytd-ad-slot-renderer, ytd-promoted-sparkles-web-renderer, #ad-badge, [id*=ad-badge], ytd-badge-supported-renderer[aria-label*="Sponsored" i]')) {{
               continue;
@@ -1789,6 +2673,8 @@ class _BrowserSession:
                 || a.innerText || a.textContent || '').trim();
             const chEl = card.querySelector('ytd-channel-name a, #channel-name a, ytd-channel-name #text, .yt-content-metadata-view-model__metadata-row a');
             const channel = (chEl?.innerText || chEl?.textContent || '').trim();
+            const thumbEl = card.querySelector('ytd-thumbnail, yt-thumbnail-view-model, a#thumbnail, img.yt-core-image');
+            const tr = thumbEl ? thumbEl.getBoundingClientRect() : null;
             if (!id || !title || seen.has(id)) continue;
             seen.add(id);
             out.push({{
@@ -1796,9 +2682,19 @@ class _BrowserSession:
               id,
               url: `https://www.youtube.com/watch?v=${{id}}`,
               title: title.slice(0, 160),
+              exact_title: title.slice(0, 160),
               channel: channel.slice(0, 80),
+              rect: [Math.round(ar.left), Math.round(ar.top), Math.round(ar.width), Math.round(ar.height)],
+              card_bbox: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+              title_bbox: [Math.round(ar.left), Math.round(ar.top), Math.round(ar.width), Math.round(ar.height)],
+              thumbnail_bbox: tr ? [Math.round(tr.left), Math.round(tr.top), Math.round(tr.width), Math.round(tr.height)] : null,
+              section: (card.closest('ytd-rich-section-renderer, ytd-shelf-renderer')?.querySelector('#title, h2')?.innerText || '').trim().slice(0, 60),
               is_ad: false,
               is_playable: true,
+              extraction_source: 'DOM',
+              association_confidence: 0.98,
+              card_ordering: 'row_major',
+              evidence_status: 'OBSERVED',
             }});
           }}
           return out;
@@ -1815,7 +2711,140 @@ class _BrowserSession:
                 cards = await page.locator(selector).evaluate_all(js)
             except Exception:
                 pass
-        return cards or []
+        ordered, _rows, _ambig, _secs = _cluster_youtube_video_rows(cards or [])
+        try:
+            from core import screen_observation as _so
+            obs_ts = round(time.time(), 3)
+            page_url = str(getattr(page, "url", "") or "")
+            try:
+                tab_title = str(await page.title() or "")
+            except Exception:
+                tab_title = ""
+            obs_rec = _so.record_observation_provenance(
+                captured_at=obs_ts,
+                active_app=self.browser_name,
+                active_url=page_url,
+                tab_identity=tab_title,
+                source="DOM",
+                dom_evidence=[
+                    {"id": c.get("id", ""), "title": c.get("exact_title", ""), "bbox": c.get("card_bbox")}
+                    for c in ordered[:20]
+                ],
+                confidence=("high" if ordered else "medium"),
+                stale=False,
+            )
+            obs_id = obs_rec["observation_id"]
+            for c in ordered:
+                c["observation_id"] = obs_id
+                c["screenshot_timestamp"] = obs_ts
+                c["active_url"] = page_url
+                c["tab_identity"] = tab_title
+            _so.update_observation_targets(obs_id, ordered[:20], extraction_source="DOM")
+        except Exception:
+            pass
+        return ordered
+
+    async def _open_whatsapp_contact_bounded(self, page, contact_query: str) -> str:
+        """Bounded WhatsApp contact workflow via #side search without composer/send/call."""
+        from plugins import _whatsapp_core as _wa
+        q = str(contact_query or "").strip()
+        if not q:
+            return outcome.ask(
+                "browser_control",
+                "Which WhatsApp contact should I open, Tarun-kun?",
+                browser=self.browser_name, verified=False,
+            )
+        try:
+            sb = await _wa.dom_locate_whatsapp_search_bar(page)
+            if not sb.get("found") or not sb.get("enabled"):
+                return outcome.failed(
+                    "browser_control",
+                    f"Could not find an editable WhatsApp sidebar search field to look up {q!r}.",
+                    action="smart_click", browser=self.browser_name,
+                    failure_reason="whatsapp_search_field_not_found", verified=False,
+                )
+            loc = page.locator(
+                '#side div[contenteditable="true"][role="textbox"][data-tab="3"], '
+                '#side [data-testid="chat-list-search"], '
+                '#side [aria-label*="Search input" i]'
+            ).first
+            if await loc.count() < 1:
+                return outcome.failed(
+                    "browser_control",
+                    "WhatsApp sidebar search field is not present in the current tab.",
+                    action="smart_click", browser=self.browser_name,
+                    failure_reason="whatsapp_search_field_not_found", verified=False,
+                )
+            await loc.click(timeout=5_000)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(q)
+            await asyncio.sleep(0.45)
+            rows = page.locator('#pane-side [role="listitem"], #pane-side [role="row"], #side [data-testid="cell-frame-container"]')
+            rcount = await rows.count()
+            matched_idx = None
+            matched_name = ""
+            exact_idx = None
+            matches: list[tuple[int, str]] = []
+            for i in range(min(rcount, 12)):
+                try:
+                    raw_txt = str(await rows.nth(i).inner_text(timeout=1_000) or "")
+                except Exception:
+                    raw_txt = ""
+                disp = _wa._strip_composite_contact_name(raw_txt)
+                if not disp:
+                    continue
+                mkind = _wa.contact_match(q, disp)
+                if mkind != "none":
+                    matches.append((i, disp))
+                    if disp.casefold() == q.casefold() and exact_idx is None:
+                        exact_idx = i
+                        matched_name = disp
+            if exact_idx is not None:
+                matched_idx = exact_idx
+            elif len(matches) == 1:
+                matched_idx, matched_name = matches[0]
+            elif len(matches) > 1:
+                names = ", ".join(m[1] for m in matches[:4])
+                return outcome.ask(
+                    "browser_control",
+                    f"I found {len(matches)} WhatsApp chats matching {q!r}: {names}. Which one should I open?",
+                    browser=self.browser_name, unique_contact_count=len(matches), verified=False,
+                )
+            if matched_idx is None:
+                return outcome.unverified(
+                    "browser_control",
+                    f"I searched WhatsApp for {q!r}, Tarun-kun, but couldn't find a matching chat.",
+                    action="smart_click", browser=self.browser_name,
+                    selected_chat_verified=False, target_identified=False, verified=False,
+                )
+            await rows.nth(matched_idx).click(timeout=5_000)
+            await asyncio.sleep(0.35)
+            hdr_loc = page.locator('#main header span[title], #main header [data-testid="conversation-info-header-chat-title"]')
+            hdr_txt = ""
+            if await hdr_loc.count() >= 1:
+                hdr_txt = str(await hdr_loc.first.inner_text(timeout=1_500) or "").strip()
+            chat_ok = bool(hdr_txt and _wa.contact_match(matched_name or q, hdr_txt) != "none")
+            if not chat_ok:
+                return outcome.unverified(
+                    "browser_control",
+                    f"I clicked {matched_name or q}, but I couldn't confirm that the chat header opened.",
+                    action="smart_click", browser=self.browser_name,
+                    resolved_target=matched_name or q, selected_chat_verified=False, verified=False,
+                )
+            return outcome.done(
+                "browser_control",
+                action="smart_click", browser=self.browser_name,
+                resolved_target=hdr_txt or matched_name,
+                active_contact=hdr_txt or matched_name,
+                selected_chat_verified=True, verified=True,
+            )
+        except Exception as exc:
+            return outcome.failed(
+                "browser_control",
+                f"WhatsApp contact lookup failed safely: {type(exc).__name__}: {exc}",
+                action="smart_click", browser=self.browser_name, verified=False,
+            )
 
     async def _is_empty_youtube_home(self, page) -> bool:
         try:
@@ -1873,12 +2902,110 @@ class _BrowserSession:
             f"opened video {title!r}, but playback is not confirmed: {verdict.reason}",
             playback_verified=False, blocked_by=verdict.status, **common)
 
+    async def _try_click_youtube_category_chip(self, page, description: str) -> str | None:
+        """Resolve and verify a click on a YouTube category chip (`CATEGORY_CHIP`) such as 'All'."""
+        raw = str(description or "").strip()
+        cleaned = re.sub(
+            r"\b(?:click|on|the|category|chip|filter|pill|tab|button|select)\b",
+            "", raw, flags=re.IGNORECASE,
+        ).strip()
+        if not cleaned or _parse_ordinal_index(raw) is not None or "video" in raw.casefold():
+            return None
+        try:
+            chips = await page.evaluate(
+                """() => {
+                    const out = [];
+                    const els = document.querySelectorAll('yt-chip-cloud-chip-renderer, #chips-wrapper [role="tab"], iron-selector#chips [role="tab"]');
+                    for (let i = 0; i < els.length; i++) {
+                        const el = els[i];
+                        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                        if (r.width < 12 || r.height < 12 || s.display === 'none' || s.visibility === 'hidden') continue;
+                        const label = (el.innerText || el.getAttribute('aria-label') || '').trim();
+                        if (!label) continue;
+                        const selected = (el.getAttribute('aria-selected') === 'true') || el.hasAttribute('selected') || el.classList.contains('iron-selected');
+                        out.push({index: i, label, selected, rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)]});
+                    }
+                    return out;
+                }"""
+            )
+        except Exception:
+            return None
+        if not chips:
+            return None
+        want_cf = cleaned.casefold()
+        match = next((c for c in chips if c["label"].strip().casefold() == want_cf), None)
+        if match is None:
+            return None
+        try:
+            chip_loc = page.locator('yt-chip-cloud-chip-renderer, #chips-wrapper [role="tab"], iron-selector#chips [role="tab"]').nth(int(match["index"]))
+            await chip_loc.click(timeout=5_000)
+            await asyncio.sleep(0.35)
+            after_chips = await page.evaluate(
+                """() => [...document.querySelectorAll('yt-chip-cloud-chip-renderer, #chips-wrapper [role="tab"], iron-selector#chips [role="tab"]')].map((el, i) => ({
+                    index: i,
+                    label: (el.innerText || el.getAttribute('aria-label') || '').trim(),
+                    selected: (el.getAttribute('aria-selected') === 'true') || el.hasAttribute('selected') || el.classList.contains('iron-selected'),
+                }))"""
+            )
+            now_chip = next((c for c in (after_chips or []) if c["label"].strip().casefold() == want_cf), None)
+            sel_ok = bool(now_chip and now_chip.get("selected"))
+            _log_browser_action_diag(
+                requested_site="youtube", verified_site="youtube", active_tab=str(getattr(page, "url", "") or ""),
+                action="smart_click", target_class=ELEM_CATEGORY_CHIP, selected_target=match["label"],
+                selection_method="DOM", target_bbox=match["rect"], click_method="dom_click",
+                verification_result=(ACTION_VERIFIED if sel_ok else ACTION_UNVERIFIED),
+                failure_reason=("" if sel_ok else "category_chip_selected_state_not_confirmed"),
+            )
+            if not sel_ok:
+                return outcome.unverified(
+                    "browser_control",
+                    f"Clicked the '{match['label']}' category chip, but YouTube did not confirm it became active.",
+                    action="smart_click", browser=self.browser_name, target_class=ELEM_CATEGORY_CHIP,
+                    resolved_target=match["label"], action_state=ACTION_UNVERIFIED, verified=False,
+                )
+            return outcome.done(
+                "browser_control", action="smart_click", browser=self.browser_name,
+                target_class=ELEM_CATEGORY_CHIP, resolved_target=match["label"],
+                chip_selected=True, action_state=ACTION_VERIFIED, verified=True,
+            )
+        except Exception as exc:
+            return outcome.failed("browser_control", f"Category chip click failed: {type(exc).__name__}: {exc}", action="smart_click", action_state=ACTION_FAILED)
+
     async def _click_youtube_video_ordinal(self, page, ordinal: int | str, before: tuple | str = ()) -> str:
         """Select a real visible non-ad YouTube video by 0-based ordinal index or word (e.g. 'second')."""
         try:
             raw_label = before if isinstance(before, str) else ""
             cards = await self._extract_youtube_videos(page, include_shorts=("short" in raw_label.casefold()))
             idx = (_ORDINAL_WORDS.get(str(ordinal).lower()) if isinstance(ordinal, str) else int(ordinal))
+            ordered, rows, ambiguous, sections = _cluster_youtube_video_rows(cards)
+            cards = ordered
+            if "horizontal" in raw_label.casefold() and rows:
+                horiz_rows = [r for r in rows if len(r) >= 2]
+                if not horiz_rows:
+                    return outcome.unverified(
+                        "browser_control",
+                        "I do not see a multi-column horizontal video row on YouTube right now.",
+                        action="play_video", browser=self.browser_name,
+                        action_state=ACTION_UNVERIFIED, selection_method="DOM",
+                        video_count=len(cards), verified=False,
+                    )
+                primary_row = horiz_rows[0]
+                if idx is not None and idx != -1 and idx >= len(primary_row):
+                    return outcome.unverified(
+                        "browser_control",
+                        f"The first horizontal row only shows {len(primary_row)} videos, so position {idx + 1} is unavailable.",
+                        action="play_video", browser=self.browser_name,
+                        action_state=ACTION_UNVERIFIED, selection_method="DOM",
+                        video_count=len(primary_row), verified=False,
+                    )
+                cards = primary_row
+                ambiguous = False
+            elif ambiguous and sections:
+                return outcome.ask(
+                    "browser_control",
+                    f"I see multiple video sections on YouTube ({', '.join(sections[:3])}). Which section or video title should I click?",
+                    browser=self.browser_name, action_state=ACTION_UNVERIFIED, verified=False,
+                )
             if idx == -1:
                 idx = len(cards) - 1
             if idx is None or idx < 0 or idx >= len(cards):
@@ -1890,10 +3017,25 @@ class _BrowserSession:
                 return f"I found {len(cards)} eligible non-ad YouTube video results; requested position is unavailable, so nothing was clicked."
             selected = cards[idx]
             video_id = str(selected.get("id", ""))
-            title = str(selected.get("title", ""))
+            title = str(selected.get("exact_title") or selected.get("title") or "").strip()
+            ev_status = str(selected.get("evidence_status") or "OBSERVED").upper()
+            ord_label = _INDEX_TO_ORDINAL.get(idx, f"#{idx + 1}")
+            if ev_status in ("UNKNOWN", "INFERRED") or not title:
+                return outcome.unverified(
+                    "browser_control",
+                    f"I can see the video cards, but I cannot reliably read the {ord_label} video's title.",
+                    action="play_video", browser=self.browser_name,
+                    evidence_status=ev_status or "UNKNOWN",
+                    target_identified=False, playback_verified=False, verified=False,
+                )
             channel = str(selected.get("channel", ""))
-            if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id) or not title:
-                return "The selected result did not have a verifiable video identity; nothing was clicked."
+            if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id):
+                return outcome.unverified(
+                    "browser_control",
+                    f"I can see the video cards, but I cannot reliably verify the {ord_label} video's identity.",
+                    action="play_video", browser=self.browser_name,
+                    evidence_status="UNKNOWN", target_identified=False, playback_verified=False, verified=False,
+                )
             loc = page.locator(f'a#video-title[href*="watch?v={video_id}"]')
             count = await loc.count()
             if count == 0:
@@ -2336,6 +3478,29 @@ class _BrowserSession:
         if not await self._page_visible_for_action(page):
             return outcome.unverified(
                 "browser_control", "browser page is hidden; no text was entered")
+        if "web.whatsapp.com" in str(page.url or "").casefold() and _is_search_bar_query(description):
+            from plugins import _whatsapp_core as _wa
+            try:
+                sb = await _wa.dom_locate_whatsapp_search_bar(page)
+                if sb.get("found") and sb.get("enabled"):
+                    loc = page.locator('#side div[contenteditable="true"][role="textbox"][data-tab="3"], #side [data-testid="chat-list-search"], #side [aria-label*="Search input" i]').first
+                    if await loc.count() >= 1:
+                        await loc.click(timeout=5_000)
+                        await page.keyboard.press("Control+A")
+                        await page.keyboard.press("Backspace")
+                        await page.keyboard.type(str(text))
+                        after_sb = await _wa.dom_locate_whatsapp_search_bar(page)
+                        got_q = str(after_sb.get("value") or "").strip()
+                        q_ok = bool(str(text).strip() and str(text).strip().casefold() in got_q.casefold())
+                        return outcome.done(
+                            "browser_control", action="smart_type", field=sb.get("label", "WhatsApp search field"),
+                            method=sb.get("method", "whatsapp_dom"), field_detected=True,
+                            field_focused=bool(after_sb.get("focus_verified", True)),
+                            text_entered=True, entered_text=(got_q or str(text)),
+                            query_verified=q_ok, verified=True,
+                        )
+            except Exception:
+                pass
         if "web.whatsapp.com" in str(page.url or "").casefold() and not _is_search_bar_query(description):
             from plugins import _whatsapp_core as _wa
             try:
@@ -2597,11 +3762,169 @@ class _BrowserSession:
 
     async def reload(self) -> str:
         page = await self._get_page()
+        site_hint = _site_key_from_url_or_title(page.url or "", "")
         try:
-            await page.reload(timeout=15_000)
-            return f"Page reloaded: {page.url}"
+            await page.reload(wait_until="domcontentloaded", timeout=15_000)
+            await asyncio.sleep(0.25)
+            title = await page.title()
+            body = ""
+            try:
+                body = (await page.locator("body").inner_text(timeout=1_000))[:800]
+            except Exception:
+                pass
+            ready = await page.evaluate(
+                "() => document.readyState === 'interactive' || document.readyState === 'complete'"
+            )
+            ident = verify_site_page_identity(
+                site_hint, url=page.url or "", title=title, body=body, dom_ready=bool(ready),
+            )
+            vis = await self._page_visible_for_action(page)
+            if ident.get("page_state") == "error":
+                return outcome.failed(
+                    "browser_control", f"page error after reload ({title or page.url})",
+                    action="reload", browser=self.browser_name, url=page.url or "", title=title,
+                    page_state="error",
+                )
+            if not vis or not ident.get("verified"):
+                return outcome.unverified(
+                    "browser_control", ident.get("reason") or "reload dispatched, but visible loaded page was not confirmed",
+                    action="reload", browser=self.browser_name, url=page.url or "", title=title,
+                    page_state=ident.get("page_state") or "unverified", foreground_verified=bool(vis),
+                    target_matched=bool(ident.get("target_matched")),
+                )
+            return outcome.done(
+                "browser_control", action="reload", browser=self.browser_name,
+                url=page.url or "", title=title or "", page_state=ident.get("page_state") or "loaded",
+                foreground_verified=True, target_matched=True, verified=True,
+            )
         except Exception as e:
-            return f"Reload error: {e}"
+            return outcome.failed("browser_control", f"reload failed: {e}", action="reload", browser=self.browser_name)
+
+    async def search_whatsapp_contact(self, query: str) -> str:
+        from plugins import _whatsapp_core as _wa
+        q = str(query or "").strip()
+        if not q:
+            return outcome.ask("browser_control", "Which contact or chat should I search for?", browser=self.browser_name, verified=False)
+        page = await self._get_page_for_site("whatsapp")
+        if "web.whatsapp.com" not in str(getattr(page, "url", "") or "").casefold():
+            return outcome.unverified(
+                "browser_control", "The active Playwright tab is not WhatsApp Web.",
+                action="search_contact", browser=self.browser_name, action_state=ACTION_UNVERIFIED, verified=False,
+            )
+        sb = await _wa.dom_locate_whatsapp_search_field(page)
+        if not sb.get("found") or not sb.get("visible") or not sb.get("enabled"):
+            return outcome.unverified(
+                "browser_control", "Could not locate WhatsApp search field via DOM.",
+                action="search_contact", browser=self.browser_name,
+                action_state=ACTION_UNVERIFIED, selection_method="DOM", verified=False,
+            )
+        loc = page.locator(
+            '#side div[contenteditable="true"][data-tab="3"], '
+            '#side [role="textbox"][contenteditable="true"], '
+            '#side [data-testid="chat-list-search"] [contenteditable="true"], '
+            '#side [data-testid="chat-list-search"] input, '
+            '#side input[type="search"], '
+            '#side input[type="text"], '
+            '#side [data-testid="chat-list-search"]'
+        ).first
+        await loc.click(timeout=5_000)
+        if sb.get("editable", True):
+            try:
+                await loc.fill(q)
+            except Exception:
+                await page.keyboard.type(q, delay=20)
+        else:
+            await page.keyboard.type(q, delay=20)
+        await asyncio.sleep(0.35)
+        rb_sb = await _wa.dom_locate_whatsapp_search_field(page)
+        q_confirmed = bool(q.casefold() in str((rb_sb or {}).get("value") or "").casefold())
+        contacts = await _wa.dom_extract_whatsapp_contacts(page, query=q)
+        matches = [c for c in contacts if _wa.contact_match(q, c["display_name"]) != "none"]
+        _log_browser_action_diag(
+            requested_site="whatsapp", verified_site="whatsapp",
+            active_tab=str(getattr(page, "url", "") or ""), action="search_contact",
+            target_class=ELEM_SEARCH_CONTROL, selected_target=q,
+            selection_method="DOM", target_bbox=sb.get("rect"),
+            click_method="dom_click",
+            verification_result=(ACTION_VERIFIED if (matches or q_confirmed) else ACTION_UNVERIFIED),
+        )
+        return outcome.done(
+            "browser_control", action="search_contact", browser=self.browser_name,
+            control_mode="cdp_dom", resolved_target=q,
+            search_source="dom", search_method="dom_side_search",
+            query_verified=(q_confirmed or bool(matches)), unique_contact_count=len(matches),
+            matched_contacts="; ".join(c["display_name"] for c in matches[:5]),
+            action_state=(ACTION_VERIFIED if (matches or q_confirmed) else ACTION_UNVERIFIED),
+            verification_status=("verified" if (matches or q_confirmed) else "unverified"),
+            message_sent=False,
+            verified=bool(matches or q_confirmed),
+        )
+
+    async def select_whatsapp_contact(self, description: str) -> str:
+        from plugins import _whatsapp_core as _wa
+        desc = str(description or "").strip()
+        page = await self._get_page_for_site("whatsapp")
+        if "web.whatsapp.com" not in str(getattr(page, "url", "") or "").casefold():
+            return outcome.unverified(
+                "browser_control", "The active Playwright tab is not WhatsApp Web.",
+                action="select_contact", browser=self.browser_name, action_state=ACTION_UNVERIFIED, verified=False,
+            )
+        ord_c = _parse_ordinal_index(desc)
+        cleaned = "" if ord_c is not None else re.sub(
+            r"\b(?:open|select|click|chat|contact|the|one)\b", "", desc, flags=re.IGNORECASE,
+        ).strip() or desc
+        contacts = await _wa.dom_extract_whatsapp_contacts(page, query=cleaned)
+        if cleaned:
+            contacts = [c for c in contacts if _wa.contact_match(cleaned, c["display_name"]) != "none"]
+        if not contacts:
+            return outcome.unverified(
+                "browser_control", f"No WhatsApp contact matching {desc!r} was found via DOM.",
+                action="select_contact", browser=self.browser_name, action_state=ACTION_UNVERIFIED,
+                selection_method="DOM", verified=False,
+            )
+        chosen = None
+        if ord_c is not None:
+            pick = (len(contacts) - 1) if ord_c == -1 else ord_c
+            if 0 <= pick < len(contacts):
+                chosen = contacts[pick]
+        if chosen is None:
+            exact = [c for c in contacts if cleaned and c["display_name"].casefold() == cleaned.casefold()]
+            chosen = exact[0] if len(exact) == 1 else (contacts[0] if len(contacts) == 1 else None)
+        if chosen is None:
+            names = ", ".join(c["display_name"] for c in contacts[:4])
+            return outcome.ask(
+                "browser_control",
+                f"I see {len(contacts)} unique contacts matching {cleaned or desc!r}: {names}. Which one should I open?",
+                browser=self.browser_name, unique_contact_count=len(contacts), verified=False,
+            )
+        pt = chosen.get("point") or (0, 0)
+        if pt and pt != (0, 0):
+            await page.mouse.click(pt[0], pt[1])
+        else:
+            await page.get_by_text(chosen["display_name"], exact=False).first.click(timeout=5_000)
+        await asyncio.sleep(0.35)
+        hdr = await _wa.dom_verify_active_chat(page, expected_contact=chosen["display_name"])
+        _log_browser_action_diag(
+            requested_site="whatsapp", verified_site="whatsapp",
+            active_tab=str(getattr(page, "url", "") or ""), action="select_contact",
+            selected_target=chosen["display_name"], selection_method="DOM", target_bbox=chosen.get("rect"),
+            verification_result=(ACTION_VERIFIED if hdr.get("verified") else ACTION_UNVERIFIED),
+            failure_reason=str(hdr.get("reason") or ""),
+        )
+        if not hdr.get("verified"):
+            return outcome.unverified(
+                "browser_control",
+                f"Clicked {chosen['display_name']}, but WhatsApp Web header did not confirm that chat opened ({hdr.get('reason') or 'unconfirmed'}).",
+                action="select_contact", browser=self.browser_name, control_mode="cdp_dom",
+                resolved_target=chosen["display_name"], selected_chat_verified=False,
+                action_state=ACTION_UNVERIFIED, verification_status="unverified", verified=False,
+            )
+        return outcome.done(
+            "browser_control", action="select_contact", browser=self.browser_name, control_mode="cdp_dom",
+            resolved_target=chosen["display_name"], active_contact=hdr["active_contact"],
+            active_chat_id=hdr["chat_id"], selected_chat_verified=True,
+            action_state=ACTION_VERIFIED, verification_status="verified", message_sent=False, verified=True,
+        )
 
     async def close_browser(self) -> str:
         await self._async_close()
@@ -2617,6 +3940,7 @@ class _SessionRegistry:
         self._lock             = threading.Lock()
         self._last_native_url: str                        = ""
         self._sync_state:      dict[str, dict]            = {}
+        self._target_registry: dict[str, dict]            = {}
 
     def invalidate_sync(self, browser_name: str | None = None) -> None:
         with self._lock:
@@ -2625,6 +3949,63 @@ class _SessionRegistry:
             else:
                 name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
                 self._sync_state.pop(name, None)
+
+    def note_site_target(self, browser_name: str, site: str, info: dict) -> None:
+        name = _ALIASES.get(str(browser_name or "chrome").lower().strip(), str(browser_name or "chrome").lower().strip())
+        site_key = str(site or "").strip().casefold() or "other"
+        entry = {
+            "browser": name,
+            "site": site_key,
+            "hwnd": int((info or {}).get("hwnd", 0) or 0),
+            "pid": int((info or {}).get("pid", 0) or 0),
+            "title": str((info or {}).get("title") or ""),
+            "url": str((info or {}).get("url") or ""),
+            "foreground": bool((info or {}).get("foreground")),
+            "last_verified_at": time.time(),
+        }
+        with self._lock:
+            reg = self._target_registry.setdefault(
+                name, {"foreground": {}, "whatsapp": {}, "youtube": {}, "other_tabs": []}
+            )
+            if entry["foreground"]:
+                reg["foreground"] = dict(entry)
+            if site_key in ("whatsapp", "youtube"):
+                reg[site_key] = dict(entry)
+            else:
+                others = [
+                    t for t in reg.get("other_tabs", [])
+                    if (t.get("title"), t.get("url")) != (entry["title"], entry["url"])
+                ]
+                others.insert(0, dict(entry))
+                reg["other_tabs"] = others[:8]
+
+    def get_site_target(self, browser_name: str, site: str) -> dict:
+        name = _ALIASES.get(str(browser_name or "chrome").lower().strip(), str(browser_name or "chrome").lower().strip())
+        site_key = str(site or "").strip().casefold()
+        with self._lock:
+            reg = self._target_registry.get(name) or {}
+            if site_key in ("whatsapp", "youtube"):
+                return dict(reg.get(site_key) or {})
+            return dict(reg.get("foreground") or {})
+
+    def clear_site_targets(self, browser_name: str | None = None) -> None:
+        with self._lock:
+            if not browser_name:
+                self._target_registry.clear()
+            else:
+                name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+                self._target_registry.pop(name, None)
+
+    def get_target_registry(self, browser_name: str | None = None) -> dict:
+        name = _ALIASES.get(str(browser_name or self._active_browser or "chrome").lower().strip(), str(browser_name or self._active_browser or "chrome").lower().strip())
+        with self._lock:
+            reg = self._target_registry.get(name) or {"foreground": {}, "whatsapp": {}, "youtube": {}, "other_tabs": []}
+            return {
+                "foreground": dict(reg.get("foreground") or {}),
+                "whatsapp": dict(reg.get("whatsapp") or {}),
+                "youtube": dict(reg.get("youtube") or {}),
+                "other_tabs": [dict(t) for t in (reg.get("other_tabs") or [])],
+            }
 
     def update_sync(self, browser_name: str, data: dict) -> dict:
         name = _ALIASES.get(str(browser_name or "chrome").lower().strip(), str(browser_name or "chrome").lower().strip())
@@ -2762,13 +4143,77 @@ def _should_use_native_window(browser_name: str | None) -> bool:
     return _has_running_or_visible_browser(b)
 
 
-def _find_browser_window(browser_name: str) -> dict:
-    """Identify the actual visible foreground/open window for ``browser_name``."""
+def get_browser_target_registry(browser_name: str = "chrome") -> dict:
+    """Return tracked foreground, WhatsApp, YouTube, and other browser targets."""
+    return _registry.get_target_registry(browser_name)
+
+
+def _find_browser_window(browser_name: str, *, site_hint: str = "") -> dict:
+    """Identify the actual visible foreground/open window for ``browser_name``.
+
+    When ``site_hint`` is specified (e.g. 'whatsapp' or 'youtube'), prefer the
+    matching Chrome/browser window/tab rather than blindly returning an unrelated
+    foreground window from another site.
+    """
     b = _ALIASES.get(str(browser_name or "chrome").lower().strip(), str(browser_name or "chrome").lower().strip())
+    sh = str(site_hint or "").strip().casefold()
     try:
         from core import screenview
         fg_app, fg_title, fg_pid, fg_hwnd = screenview._foreground()
-        if _proc_matches_browser(fg_app, fg_title, b):
+        fg_matches_browser = _proc_matches_browser(fg_app, fg_title, b)
+        fg_site = _site_key_from_url_or_title("", fg_title) if fg_matches_browser else ""
+        if fg_matches_browser and (not sh or fg_site == sh):
+            info = {
+                "found": True,
+                "foreground": True,
+                "browser": b,
+                "app": fg_app,
+                "title": fg_title,
+                "pid": int(fg_pid or 0),
+                "hwnd": int(fg_hwnd or 0),
+                "matched_site": fg_site,
+                "site_mismatch": False,
+                "ambiguous_matches": 0,
+            }
+            if fg_site:
+                _registry.note_site_target(b, fg_site, info)
+            return info
+
+        all_browser_wins: list[tuple[str, str]] = []
+        site_matches: list[tuple[str, str]] = []
+        for app, title in screenview.all_windows():
+            if _proc_matches_browser(app, title, b):
+                all_browser_wins.append((app, title))
+                w_site = _site_key_from_url_or_title("", title)
+                if sh and w_site == sh:
+                    site_matches.append((app, title))
+
+        if sh and site_matches:
+            app, title = site_matches[0]
+            whwnd, wpid, wapp, wtitle = _win32_window_identity_for_title(b, title_query=title, site_hint=sh)
+            info = {
+                "found": True,
+                "foreground": bool(fg_matches_browser and fg_hwnd and whwnd and int(fg_hwnd) == int(whwnd)),
+                "browser": b,
+                "app": wapp or app,
+                "title": wtitle or title,
+                "pid": int(wpid or 0),
+                "hwnd": int(whwnd or 0),
+                "matched_site": sh,
+                "site_mismatch": False,
+                "ambiguous_matches": len(site_matches) if len(site_matches) > 1 else 0,
+            }
+            _registry.note_site_target(b, sh, info)
+            return info
+
+        if sh:
+            cached = _registry.get_site_target(b, sh)
+            if cached and cached.get("title"):
+                for app, title in all_browser_wins:
+                    if _site_key_from_url_or_title("", title) == sh:
+                        return {**cached, "found": True, "site_mismatch": False}
+
+        if fg_matches_browser:
             return {
                 "found": True,
                 "foreground": True,
@@ -2777,22 +4222,30 @@ def _find_browser_window(browser_name: str) -> dict:
                 "title": fg_title,
                 "pid": int(fg_pid or 0),
                 "hwnd": int(fg_hwnd or 0),
+                "matched_site": fg_site,
+                "site_mismatch": bool(sh and fg_site and fg_site != sh),
+                "ambiguous_matches": 0,
             }
-        for app, title in screenview.all_windows():
-            if _proc_matches_browser(app, title, b):
-                return {
-                    "found": True,
-                    "foreground": False,
-                    "browser": b,
-                    "app": app,
-                    "title": title,
-                    "pid": 0,
-                    "hwnd": 0,
-                }
+        if all_browser_wins:
+            app, title = all_browser_wins[0]
+            whwnd, wpid, wapp, wtitle = _win32_window_identity_for_title(b, title_query=title, site_hint=sh)
+            actual_site = _site_key_from_url_or_title("", wtitle or title)
+            return {
+                "found": True,
+                "foreground": False,
+                "browser": b,
+                "app": wapp or app,
+                "title": wtitle or title,
+                "pid": int(wpid or 0),
+                "hwnd": int(whwnd or 0),
+                "matched_site": actual_site,
+                "site_mismatch": bool(sh and actual_site != sh),
+                "ambiguous_matches": 0,
+            }
     except Exception:
         pass
     running = bool(appidentity.running(b)) if b else False
-    return {"found": running, "foreground": False, "browser": b, "app": b, "title": "", "pid": 0, "hwnd": 0}
+    return {"found": running, "foreground": False, "browser": b, "app": b, "title": "", "pid": 0, "hwnd": 0, "matched_site": "", "site_mismatch": False, "ambiguous_matches": 0}
 
 
 _DURATION_RE = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$")
@@ -2814,17 +4267,30 @@ _YT_NAV_NOISE = frozenset({
 })
 
 
-def _extract_native_youtube_candidates(view, *, include_shorts: bool = False) -> tuple[list[dict], bool]:
-    """Extract ordered non-ad video candidates from UIA/OCR on the visible Chrome window."""
-    elements = list(getattr(view, "elements", ()) or ())
-    mon = getattr(view, "monitor", None) or {}
-    mon_top = int(mon.get("top", 0) or 0)
-    mon_left = int(mon.get("left", 0) or 0)
-    mon_w = int(mon.get("width", 1920) or 1920)
-    header_floor = mon_top + 130
-    ocr_floor = mon_top + 185  # Excludes Chrome toolbar + YouTube masthead/filter chips
-    sidebar_ceil = mon_left + (200 if mon_w >= 1100 else 60)
-    view_source = str(getattr(view, "source", "") or "").casefold()
+def classify_youtube_elements(view, *, include_shorts: bool = False) -> dict:
+    """Classify visible UIA/OCR elements on YouTube into explicit semantic classes.
+
+    Classes: ``VIDEO_CARD``, ``CATEGORY_CHIP``, ``NAVIGATION_ITEM``, ``SHORTS_CARD``,
+    ``AD_CARD``, ``SEARCH_CONTROL``, ``PLAYER_CONTROL``, ``OTHER``.
+    Any element sharing the horizontal YouTube category-chip bar (anchored by labels such
+    as 'All', 'Music', 'Gaming', 'Mixes', etc.) is classified ``CATEGORY_CHIP`` and NEVER
+    enters ``VIDEO_CARD`` ordinals even for dynamic multi-word topics like 'Science fiction'.
+    """
+    elements = list(getattr(view, "elements", ()) or ()) if view is not None else []
+    mon = (getattr(view, "monitor", None) if view is not None else None) or {}
+    win_rect = getattr(view, "window_rect", None) if view is not None else None
+    if isinstance(win_rect, (list, tuple)) and len(win_rect) == 4 and int(win_rect[2] or 0) > 200:
+        w_left, w_top, w_w, _w_h = (int(v or 0) for v in win_rect)
+    else:
+        w_left = int(mon.get("left", 0) or 0)
+        w_top = int(mon.get("top", 0) or 0)
+        w_w = int(mon.get("width", 1920) or 1920)
+
+    header_floor = w_top + 130
+    ocr_floor = w_top + 185
+    chip_top_max = w_top + 315
+    sidebar_ceil = w_left + (200 if w_w >= 1100 else 60)
+    view_source = str(getattr(view, "source", "") or "").casefold() if view is not None else ""
 
     joined_low = " ".join(
         str(getattr(el, "name", "") or getattr(el, "value", "") or "").casefold()
@@ -2832,80 +4298,265 @@ def _extract_native_youtube_candidates(view, *, include_shorts: bool = False) ->
     )
     empty_home = "try searching to get started" in joined_low
 
-    now_m = time.monotonic()
-    candidates: list[dict] = []
-    seen_titles: set[str] = set()
+    # First detect horizontal Category Chip Bar Y bands using compact anchor pills
+    compact_rows: list[tuple[int, str, Any]] = []
     for el in elements:
-        role = str(getattr(el, "role", "") or "").casefold()
-        is_ocr = ("ocr" in role) or (view_source == "ocr" and role in {"text", "ocr_text", ""})
         name = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or "").split())
-        if not name or len(name) < 4:
-            continue
-        low = name.casefold()
-        if low in _YT_NAV_NOISE or _DURATION_RE.match(name) or _YT_META_RE.search(name):
-            continue
-        if any(ad in low for ad in ("sponsored", "ad ·", "advertisement", "shop now", "learn more")):
-            continue
-        if not include_shorts and ("#shorts" in low or low == "shorts"):
-            continue
-        if is_ocr and len(name.split()) < 2 and len(name) < 14:
+        if not name:
             continue
         top = int(getattr(el, "top", 0) or 0)
         left = int(getattr(el, "left", 0) or 0)
         width = int(getattr(el, "width", 0) or 0)
         height = int(getattr(el, "height", 0) or 0)
-        if top < (ocr_floor if is_ocr else header_floor) or left < sidebar_ceil:
+        if w_top + 95 <= top <= chip_top_max and left >= sidebar_ceil and 12 <= height <= 56 and width <= 320:
+            compact_rows.append((top, name.casefold(), el))
+
+    chip_band_ys: list[int] = []
+    for top, low, _el in compact_rows:
+        if low in _YT_CHIP_ANCHORS:
+            # Confirm at least 2 compact items share this horizontal line (or UIA tab role)
+            role_cf = str(getattr(_el, "role", "") or "").casefold()
+            siblings = [t2 for t2, _l2, _e2 in compact_rows if abs(t2 - top) <= 22]
+            if len(siblings) >= 2 or role_cf in {"tab", "radiobutton"}:
+                chip_band_ys.append(top)
+
+    now_m = time.monotonic()
+    classified: dict[str, list[dict]] = {
+        ELEM_VIDEO_CARD: [],
+        ELEM_CATEGORY_CHIP: [],
+        ELEM_NAVIGATION_ITEM: [],
+        ELEM_SHORTS_CARD: [],
+        ELEM_AD_CARD: [],
+        ELEM_SEARCH_CONTROL: [],
+        ELEM_PLAYER_CONTROL: [],
+        ELEM_OTHER: [],
+    }
+    seen_videos: set[str] = set()
+    seen_chips: set[str] = set()
+
+    for el in elements:
+        role = str(getattr(el, "role", "") or "").casefold()
+        is_ocr = ("ocr" in role) or (view_source == "ocr" and role in {"text", "ocr_text", ""})
+        name = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or "").split())
+        if not name:
             continue
-        if width < 90 or height < 14:
-            continue
-        # Only take real interactive/text headings or clickable video titles from UIA/OCR
-        if role not in {"link", "button", "heading", "text", "ocr_text", "group", ""}:
-            if "link" not in role and "text" not in role and "heading" not in role:
-                continue
-        if low in seen_titles:
-            continue
-        seen_titles.add(low)
+        low = name.casefold()
+        top = int(getattr(el, "top", 0) or 0)
+        left = int(getattr(el, "left", 0) or 0)
+        width = int(getattr(el, "width", 0) or 0)
+        height = int(getattr(el, "height", 0) or 0)
         cx, cy = (getattr(el, "center", None) or (left + max(1, width // 2), top + max(1, height // 2)))
         src_kind = "ocr" if is_ocr else "uia"
-        candidates.append({
-            "position": len(candidates) + 1,
+        item = {
             "title": name[:160],
+            "label": name[:160],
             "point": (int(cx), int(cy)),
             "rect": (left, top, width, height),
             "top": top,
             "left": left,
             "source": src_kind,
+            "selected": bool(getattr(el, "selected", False)),
             "confidence": ("high" if src_kind == "uia" and "link" in role else "medium"),
             "observed_at": now_m,
             "element": el,
-        })
-    candidates.sort(key=lambda item: (item["top"] // 60, item["left"]))
-    for idx, item in enumerate(candidates, 1):
-        item["position"] = idx
-    return candidates, empty_home
+        }
+
+        # 1. Player controls
+        if any(rx.search(name) for rules in _YT_BUTTON_RULES.values() for rx, _st in rules):
+            item["element_class"] = ELEM_PLAYER_CONTROL
+            classified[ELEM_PLAYER_CONTROL].append(item)
+            continue
+
+        # 2. Search bar controls
+        if role in {"edit", "combobox", "searchbox"} or "search with your voice" in low:
+            item["element_class"] = ELEM_SEARCH_CONTROL
+            classified[ELEM_SEARCH_CONTROL].append(item)
+            continue
+
+        # 3. Ads
+        if any(ad in low for ad in ("sponsored", "ad ·", "advertisement", "shop now", "learn more")):
+            item["element_class"] = ELEM_AD_CARD
+            classified[ELEM_AD_CARD].append(item)
+            continue
+
+        # 4. Category chip bar (`All`, `Music`, `Gaming`, `Science fiction`, etc.)
+        in_chip_band = bool(
+            chip_band_ys and any(abs(top - cy_band) <= 22 for cy_band in chip_band_ys)
+            and left >= sidebar_ceil and height <= 56 and width <= 320
+        )
+        is_uia_chip = role in {"tab", "radiobutton"} and left >= sidebar_ceil and top <= chip_top_max
+        if in_chip_band or is_uia_chip:
+            item["element_class"] = ELEM_CATEGORY_CHIP
+            if low not in seen_chips:
+                seen_chips.add(low)
+                classified[ELEM_CATEGORY_CHIP].append(item)
+            continue
+
+        # 5. Shorts
+        if "#shorts" in low or low == "shorts":
+            item["element_class"] = ELEM_SHORTS_CARD
+            classified[ELEM_SHORTS_CARD].append(item)
+            if not include_shorts:
+                continue
+
+        # 6. Navigation / metadata / sidebar noise
+        if left < sidebar_ceil or low in _YT_NAV_NOISE or _DURATION_RE.match(name) or _YT_META_RE.search(name):
+            item["element_class"] = ELEM_NAVIGATION_ITEM
+            classified[ELEM_NAVIGATION_ITEM].append(item)
+            continue
+
+        # 7. Remaining floor / role / length gates for VIDEO_CARD
+        if (
+            len(name) < 4
+            or (is_ocr and len(name.split()) < 2 and len(name) < 14)
+            or top < (ocr_floor if is_ocr else header_floor)
+            or width < 90
+            or height < 14
+            or (
+                role not in {"link", "button", "heading", "text", "ocr_text", "group", ""}
+                and "link" not in role and "text" not in role and "heading" not in role
+            )
+        ):
+            item["element_class"] = ELEM_OTHER
+            classified[ELEM_OTHER].append(item)
+            continue
+
+        if low in seen_videos:
+            continue
+        seen_videos.add(low)
+        src_upper = "OCR" if src_kind == "ocr" else "UIA"
+        conf_score = (0.90 if src_kind == "uia" and "link" in role else (0.84 if src_kind == "uia" else 0.72))
+        ev_stat = ("OBSERVED" if src_kind == "uia" else "ASSOCIATED")
+        item["exact_title"] = name[:160]
+        item["extraction_source"] = src_upper
+        item["association_confidence"] = conf_score
+        item["card_ordering"] = "row_major"
+        item["evidence_status"] = ev_stat
+        item["title_bbox"] = [left, top, width, height]
+        item["card_bbox"] = [left, max(w_top, top - 165), max(width, 220), height + 175]
+        item["thumbnail_bbox"] = [left, max(w_top, top - 165), max(width, 220), 155]
+        item["conflicting_titles"] = []
+        item["element_class"] = ELEM_SHORTS_CARD if ("#shorts" in low or low == "shorts") else ELEM_VIDEO_CARD
+        classified[ELEM_VIDEO_CARD].append(item)
+
+    # Guard against conflicting OCR titles falling into the same card spatial slot:
+    # NEVER merge conflicting fragments and NEVER guess/pick one over another.
+    raw_videos = list(classified[ELEM_VIDEO_CARD])
+    if any(v.get("extraction_source") == "OCR" for v in raw_videos):
+        merged_slots: list[dict] = []
+        for cand in raw_videos:
+            if cand.get("extraction_source") != "OCR":
+                merged_slots.append(cand)
+                continue
+            cl, ct, cw, _ch = cand["rect"]
+            slot_hit = None
+            for existing in merged_slots:
+                if existing.get("extraction_source") != "OCR":
+                    continue
+                el_l, el_t, el_w, _el_h = existing["rect"]
+                horiz_overlap = min(cl + cw, el_l + el_w) - max(cl, el_l)
+                same_col = (horiz_overlap >= min(cw, el_w) * 0.35) or (abs(cl - el_l) <= 115)
+                if same_col and abs(ct - el_t) <= 155:
+                    slot_hit = existing
+                    break
+            if slot_hit is None:
+                merged_slots.append(cand)
+            else:
+                prev_titles = list(slot_hit.get("conflicting_titles") or [])
+                base_t = str(slot_hit.get("exact_title") or slot_hit.get("title") or "").strip()
+                new_t = str(cand.get("exact_title") or cand.get("title") or "").strip()
+                if base_t and base_t not in prev_titles:
+                    prev_titles.append(base_t)
+                if new_t and new_t not in prev_titles:
+                    prev_titles.append(new_t)
+                if len(prev_titles) > 1:
+                    t_a = {w for w in re.findall(r"[a-z0-9]+", base_t.casefold()) if len(w) >= 2}
+                    t_b = {w for w in re.findall(r"[a-z0-9]+", new_t.casefold()) if len(w) >= 2}
+                    union = t_a | t_b
+                    jaccard = (len(t_a & t_b) / len(union)) if union else 0.0
+                    # Adjacent subtitle lines with high overlap (<0.5 conflict) mark card UNKNOWN rather than guessing
+                    if jaccard < 0.72:
+                        slot_hit["conflicting_titles"] = prev_titles
+                        slot_hit["evidence_status"] = "UNKNOWN"
+                        slot_hit["exact_title"] = ""
+                        slot_hit["title"] = "Unreadable video card"
+                        slot_hit["label"] = "Unreadable video card"
+                        slot_hit["association_confidence"] = 0.0
+                        slot_hit["confidence"] = "uncertain"
+        classified[ELEM_VIDEO_CARD] = merged_slots
+
+    ordered_videos, _rows, _ambig, _secs = _cluster_youtube_video_rows(classified[ELEM_VIDEO_CARD])
+    classified[ELEM_VIDEO_CARD] = ordered_videos
+    classified[ELEM_CATEGORY_CHIP].sort(key=lambda c: (c["top"], c["left"]))
+    for pos, ch in enumerate(classified[ELEM_CATEGORY_CHIP], 1):
+        ch["position"] = pos
+    classified["empty_home"] = empty_home
+    return classified
+
+
+def _extract_native_youtube_candidates(view, *, include_shorts: bool = False) -> tuple[list[dict], bool]:
+    """Extract ordered non-ad ``VIDEO_CARD`` candidates from UIA/OCR on the visible Chrome window."""
+    cls = classify_youtube_elements(view, include_shorts=include_shorts)
+    return list(cls[ELEM_VIDEO_CARD]), bool(cls.get("empty_home"))
 
 
 def _inspect_visible_browser_window(browser_name: str, *, focus_if_needed: bool = False,
-                                    allow_ocr: bool = True) -> dict:
-    """Synchronize foreground window identity, URL, search query, and visible YouTube state."""
+                                    allow_ocr: bool = True, site_hint: str = "",
+                                    lightweight: bool = False) -> dict:
+    """Synchronize foreground window identity, URL, search query, and visible site state."""
     from core import screenact, screenview
 
-    win = _find_browser_window(browser_name)
+    t0 = time.monotonic()
+    sh = str(site_hint or "").strip().casefold()
+    win = _find_browser_window(browser_name, site_hint=sh)
+    window_resolution_ms = round((time.monotonic() - t0) * 1000.0, 1)
+    t_fg0 = time.monotonic()
     if focus_if_needed and win.get("found") and not win.get("foreground"):
         try:
-            screenact.focus_app(win["browser"])
-            time.sleep(0.2)
-            win = _find_browser_window(win["browser"])
+            title_hint = ("WhatsApp" if sh == "whatsapp" else ("YouTube" if sh == "youtube" else str(win.get("title") or "")))
+            if sh:
+                appidentity.focus_window_by_app(win["browser"], title_hint=title_hint)
+            else:
+                screenact.focus_app(win["browser"])
+            time.sleep(0.15)
+            win = _find_browser_window(win["browser"], site_hint=sh)
         except Exception:
             pass
+    foreground_activation_ms = round((time.monotonic() - t_fg0) * 1000.0, 1)
+    hwnd_ms = round((time.monotonic() - t0) * 1000.0, 1)
 
+    t_obs0 = time.monotonic()
+    ocr_before = screenview.ocr_stats() if hasattr(screenview, "ocr_stats") else {"init_ms": 0.0, "exec_count": 0, "total_exec_ms": 0.0}
     view = None
     url = ""
     if win.get("foreground") and _proc_matches_browser(win.get("app", ""), win.get("title", ""), win["browser"]):
         try:
-            view = screenview.look(budget_s=(2.8 if allow_ocr else 1.2), allow_ocr=allow_ocr)
+            budget = 0.45 if lightweight else (2.6 if allow_ocr else 0.9)
+            cand_view = screenview.look(budget_s=budget, allow_ocr=allow_ocr, allow_pixel_digest=not lightweight)
+            c_app = str(getattr(cand_view, "app", "") or win.get("app") or "")
+            c_title = str(getattr(cand_view, "title", "") or win.get("title") or "")
+            c_pid = int(getattr(cand_view, "pid", 0) or win.get("pid", 0) or 0)
+            c_src = str(getattr(cand_view, "source", "") or "")
+            is_explorer_app = "explorer" in c_app.casefold()
+            same_app_or_wa = _proc_matches_browser(c_app, c_title, win["browser"]) or (
+                "whatsapp" in c_app.casefold() and "whatsapp" in str(win.get("title") or "").casefold()
+            )
+            if (
+                c_src == "self"
+                or (c_pid and screenview.is_own_pid(c_pid))
+                or is_explorer_app
+                or not same_app_or_wa
+            ):
+                view = None
+                win = {**win, "foreground": False}
+            else:
+                view = cand_view
         except Exception:
             view = None
+    obs_ms = round((time.monotonic() - t_obs0) * 1000.0, 1)
+    ocr_after = screenview.ocr_stats() if hasattr(screenview, "ocr_stats") else {"init_ms": 0.0, "exec_count": 0, "total_exec_ms": 0.0}
+    ocr_exec_delta_ms = round(max(0.0, float(ocr_after.get("total_exec_ms", 0.0)) - float(ocr_before.get("total_exec_ms", 0.0))), 1)
+    uia_lookup_ms = round(max(0.0, obs_ms - ocr_exec_delta_ms), 1)
 
     uia_count = 0
     ocr_count = 0
@@ -2920,7 +4571,7 @@ def _inspect_visible_browser_window(browser_name: str, *, focus_if_needed: bool 
         label_low = str(getattr(el, "name", "") or getattr(el, "label", "") or "").casefold()
         if not url and ("address" in label_low or "search bar" in label_low or "omnibox" in label_low) and "." in val:
             url = val if "://" in val else f"https://{val}"
-        elif not url and ("youtube.com/" in val.casefold() or "http://" in val.casefold() or "https://" in val.casefold()):
+        elif not url and ("youtube.com/" in val.casefold() or "web.whatsapp.com" in val.casefold() or "http://" in val.casefold() or "https://" in val.casefold()):
             url = val
 
     title = str(win.get("title") or (getattr(view, "title", "") if view else "") or "")
@@ -2935,7 +4586,14 @@ def _inspect_visible_browser_window(browser_name: str, *, focus_if_needed: bool 
         if candidate_q and candidate_q.casefold() not in {"youtube", "home", "(1) youtube"}:
             search_query = candidate_q
 
-    videos, empty_home = _extract_native_youtube_candidates(view) if view is not None else ([], False)
+    detected_site = _site_key_from_url_or_title(url, title) or sh
+    if view is not None and not lightweight and detected_site != "whatsapp":
+        _yt_cls = classify_youtube_elements(view)
+        videos = list(_yt_cls[ELEM_VIDEO_CARD])
+        yt_chips = list(_yt_cls[ELEM_CATEGORY_CHIP])
+        empty_home = bool(_yt_cls.get("empty_home"))
+    else:
+        videos, yt_chips, empty_home = [], [], False
     if empty_home:
         videos = []
     src = getattr(view, "source", "none") if view is not None else "window_list"
@@ -2957,16 +4615,17 @@ def _inspect_visible_browser_window(browser_name: str, *, focus_if_needed: bool 
         confidence = "uncertain"
     app_exe = str(win.get("app") or f"{win['browser']}.exe")
     window_identity = f"{app_exe}: {title}" if title else app_exe
-    is_wa = "whatsapp" in (title + " " + url).casefold()
+    is_wa = detected_site == "whatsapp" or "whatsapp" in (title + " " + url).casefold()
     wa_contacts: list[dict] = []
     wa_chat: dict = {}
-    if is_wa and view is not None:
+    if is_wa and view is not None and not lightweight:
         try:
             from plugins import _whatsapp_core as _wa
             wa_contacts = _wa.extract_whatsapp_contacts(view, query=search_query)
             wa_chat = _wa.verify_selected_chat(view)
         except Exception:
             wa_contacts, wa_chat = [], {}
+    total_ms = round((time.monotonic() - t0) * 1000.0, 1)
     try:
         from core import desktop_control as _dc
         diag_updates = dict(
@@ -2979,11 +4638,12 @@ def _inspect_visible_browser_window(browser_name: str, *, focus_if_needed: bool 
         )
         if is_wa:
             diag_updates["active_application"] = "WhatsApp (Chrome)"
-            diag_updates["unique_contact_count"] = len(wa_contacts)
-            diag_updates["selected_chat_verified"] = bool(wa_chat.get("verified"))
-            if wa_chat.get("active_contact"):
-                diag_updates["active_contact"] = wa_chat["active_contact"]
-                diag_updates["active_chat_id"] = wa_chat.get("chat_id", "")
+            if not lightweight:
+                diag_updates["unique_contact_count"] = len(wa_contacts)
+                diag_updates["selected_chat_verified"] = bool(wa_chat.get("verified"))
+                if wa_chat.get("active_contact"):
+                    diag_updates["active_contact"] = wa_chat["active_contact"]
+                    diag_updates["active_chat_id"] = wa_chat.get("chat_id", "")
         _dc.record_diagnostics(**diag_updates)
     except Exception:
         pass
@@ -2996,9 +4656,12 @@ def _inspect_visible_browser_window(browser_name: str, *, focus_if_needed: bool 
         "window_identity": window_identity,
         "url": url,
         "foreground": bool(win.get("foreground")),
+        "site": detected_site,
+        "site_mismatch": bool(win.get("site_mismatch")),
         "search_query": search_query,
         "empty_home": bool(empty_home),
         "videos": videos,
+        "yt_chips": yt_chips,
         "wa_contacts": wa_contacts,
         "wa_chat": wa_chat,
         "uia_items": uia_count,
@@ -3006,20 +4669,92 @@ def _inspect_visible_browser_window(browser_name: str, *, focus_if_needed: bool 
         "extracted_text_count": extracted_text_count,
         "confidence": confidence,
         "target_identified": bool(videos or wa_contacts or wa_chat.get("verified")),
+        "timings": {
+            "hwnd_ms": hwnd_ms,
+            "obs_ms": obs_ms,
+            "window_resolution_ms": window_resolution_ms,
+            "foreground_activation_ms": foreground_activation_ms,
+            "uia_lookup_ms": uia_lookup_ms,
+            "ocr_init_ms": float(ocr_after.get("init_ms", 0.0)),
+            "ocr_exec_ms": ocr_exec_delta_ms,
+            "total_ms": total_ms,
+        },
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "source": obs_source,
         "cdp_available": False,
         "view": view,
     }
+    try:
+        from core import screen_observation as _so
+        obs_epoch = round(time.time(), 3)
+        ocr_recs, uia_recs = [], []
+        for el in elements[:80]:
+            t_el = str(getattr(el, "name", "") or getattr(el, "value", "") or "").strip()
+            if not t_el:
+                continue
+            rec_item = {
+                "text": t_el,
+                "bbox": [
+                    int(getattr(el, "left", 0) or 0),
+                    int(getattr(el, "top", 0) or 0),
+                    int(getattr(el, "width", 0) or 0),
+                    int(getattr(el, "height", 0) or 0),
+                ],
+                "role": str(getattr(el, "role", "") or ""),
+            }
+            if "ocr" in str(getattr(el, "role", "") or "").casefold():
+                ocr_recs.append(rec_item)
+            else:
+                uia_recs.append(rec_item)
+        obs_rec = _so.record_observation_provenance(
+            captured_at=obs_epoch,
+            hwnd=int(win.get("hwnd", 0) or 0),
+            pid=int(win.get("pid", 0) or 0),
+            active_app=app_exe,
+            active_url=url,
+            tab_identity=title,
+            source=obs_source,
+            ocr_items=ocr_recs,
+            uia_items=uia_recs,
+            confidence=confidence,
+            stale=not bool(win.get("foreground") and not win.get("site_mismatch")),
+        )
+        obs_id = obs_rec["observation_id"]
+        snap["observation_id"] = obs_id
+        snap["captured_at"] = obs_epoch
+        for v in videos:
+            v["observation_id"] = obs_id
+            v["screenshot_timestamp"] = obs_epoch
+            v["hwnd"] = int(win.get("hwnd", 0) or 0)
+            v["pid"] = int(win.get("pid", 0) or 0)
+            v["url"] = url
+            v["tab_identity"] = title
+        if videos:
+            _so.update_observation_targets(obs_id, videos[:20], extraction_source=obs_source)
+    except Exception:
+        pass
+    _registry.note_site_target(win["browser"], detected_site or "other", snap)
     _registry.update_sync(win["browser"], snap)
     return snap
+
+
+def inspect_title_provenance(query: str = "") -> str:
+    """Return recorded evidence provenance for a YouTube video title without fabrication."""
+    from core import screen_observation as _so
+    return _so.explain_title_provenance(query)
 
 
 def _inspect_browser_sync_safe(browser_name: str, *, allow_ocr: bool = True) -> dict:
     return _inspect_visible_browser_window(browser_name, focus_if_needed=True, allow_ocr=allow_ocr)
 
 
-def _ensure_browser_foreground(bname: str, win: dict, title_hint: str = "") -> tuple[bool, dict, str]:
+def _ensure_browser_foreground(
+    bname: str,
+    win: dict,
+    title_hint: str = "",
+    *,
+    site_hint: str = "",
+) -> tuple[bool, dict, str]:
     """Activate and verify that the requested browser window (not REM's own window) is foreground."""
     from core import appidentity, desktop_control, screenact, screenview
 
@@ -3027,50 +4762,120 @@ def _ensure_browser_foreground(bname: str, win: dict, title_hint: str = "") -> t
         desktop_control.record_diagnostics(chrome_detected=False, chrome_foreground=False)
         return False, win, f"no running {bname} window was found and CDP is unavailable; did not substitute another browser"
 
-    if win.get("foreground") and _proc_matches_browser(win.get("app", ""), win.get("title", ""), bname):
-        if not screenview.is_own_pid(int(win.get("pid", 0) or 0)):
-            desktop_control.record_diagnostics(
-                chrome_detected=True, chrome_foreground=True,
-                foreground_app=str(win.get("app") or bname),
-            )
-            return True, win, ""
+    target_hwnd = int(win.get("hwnd", 0) or 0)
+    sh = str(site_hint or win.get("matched_site") or "").strip().casefold()
+    if target_hwnd <= 0 and sh:
+        saved = _registry.get_site_target(bname, sh)
+        target_hwnd = int((saved or {}).get("hwnd", 0) or 0)
 
-    # Activate using screenact.focus_app first, then full Win32 multi-process HWND focus fallback
+    def _matches_intended(cand: dict) -> bool:
+        if not cand.get("foreground") or not _proc_matches_browser(cand.get("app", ""), cand.get("title", ""), bname):
+            return False
+        if screenview.is_own_pid(int(cand.get("pid", 0) or 0)):
+            return False
+        if sh:
+            cand_site = _site_key_from_url_or_title("", str(cand.get("title") or ""))
+            if cand_site and cand_site != sh:
+                return False
+            if target_hwnd and int(cand.get("hwnd", 0) or 0) not in (0, target_hwnd) and cand_site != sh:
+                return False
+        return True
+
+    if _matches_intended(win):
+        desktop_control.record_diagnostics(
+            chrome_detected=True, chrome_foreground=True,
+            foreground_app=str(win.get("app") or bname),
+        )
+        return True, win, ""
+
+    # Activate exact remembered HWND first (recovers cleanly if Explorer or REM stole focus)
+    focus_res: dict = {}
+    act = None
+    want_title = title_hint or str(win.get("title") or "")
+    if target_hwnd > 0 and hasattr(appidentity, "focus_hwnd"):
+        focus_res = appidentity.focus_hwnd(target_hwnd)
+        if focus_res.get("activated"):
+            time.sleep(0.1)
+            refreshed = _find_browser_window(bname, site_hint=sh)
+            if _matches_intended(refreshed) or (
+                focus_res.get("target_hwnd")
+                and not screenview.is_own_pid(int(focus_res.get("target_pid", 0) or 0))
+            ):
+                merged = {
+                    **refreshed,
+                    "found": True,
+                    "foreground": True,
+                    "hwnd": int(refreshed.get("hwnd") or focus_res.get("target_hwnd") or target_hwnd),
+                    "pid": int(refreshed.get("pid") or focus_res.get("target_pid") or 0),
+                    "title": str(refreshed.get("title") or focus_res.get("target_window_title") or win.get("title") or ""),
+                }
+                desktop_control.record_diagnostics(
+                    chrome_detected=True, chrome_foreground=True,
+                    foreground_app=str(merged.get("app") or bname),
+                )
+                return True, merged, ""
+
+    if sh or want_title:
+        focus_res = appidentity.focus_window_by_app(bname, title_hint=want_title)
+        if focus_res.get("activated"):
+            time.sleep(0.1)
+            refreshed = _find_browser_window(bname, site_hint=sh)
+            if _matches_intended(refreshed) or (
+                focus_res.get("target_hwnd")
+                and not screenview.is_own_pid(int(focus_res.get("target_pid", 0) or 0))
+            ):
+                merged = {
+                    **refreshed,
+                    "found": True,
+                    "foreground": True,
+                    "hwnd": int(refreshed.get("hwnd") or focus_res.get("target_hwnd") or 0),
+                    "pid": int(refreshed.get("pid") or focus_res.get("target_pid") or 0),
+                    "title": str(refreshed.get("title") or focus_res.get("target_window_title") or win.get("title") or ""),
+                }
+                desktop_control.record_diagnostics(
+                    chrome_detected=True, chrome_foreground=True,
+                    foreground_app=str(merged.get("app") or bname),
+                )
+                return True, merged, ""
+
     act = screenact.focus_app(bname)
     time.sleep(0.15)
-    refreshed = _find_browser_window(bname)
-    if refreshed.get("foreground") and _proc_matches_browser(refreshed.get("app", ""), refreshed.get("title", ""), bname):
-        if not screenview.is_own_pid(int(refreshed.get("pid", 0) or 0)):
-            desktop_control.record_diagnostics(
-                chrome_detected=True, chrome_foreground=True,
-                foreground_app=str(refreshed.get("app") or bname),
-            )
-            return True, refreshed, ""
+    refreshed = _find_browser_window(bname, site_hint=sh)
+    if _matches_intended(refreshed):
+        desktop_control.record_diagnostics(
+            chrome_detected=True, chrome_foreground=True,
+            foreground_app=str(refreshed.get("app") or bname),
+        )
+        return True, refreshed, ""
 
-    focus_res = appidentity.focus_window_by_app(bname, title_hint=title_hint or str(win.get("title") or ""))
-    if focus_res.get("activated"):
-        time.sleep(0.1)
-        refreshed2 = _find_browser_window(bname)
-        if refreshed2.get("foreground") or focus_res.get("target_hwnd"):
-            merged = {
-                **refreshed,
-                "found": True,
-                "foreground": True,
-                "hwnd": int(refreshed2.get("hwnd") or focus_res.get("target_hwnd") or 0),
-                "pid": int(refreshed2.get("pid") or focus_res.get("target_pid") or 0),
-                "title": str(refreshed2.get("title") or focus_res.get("target_window_title") or win.get("title") or ""),
-            }
-            desktop_control.record_diagnostics(
-                chrome_detected=True, chrome_foreground=True,
-                foreground_app=str(merged.get("app") or bname),
-            )
-            return True, merged, ""
+    if not focus_res:
+        focus_res = appidentity.focus_window_by_app(bname, title_hint=want_title)
+        if focus_res.get("activated"):
+            time.sleep(0.1)
+            refreshed2 = _find_browser_window(bname, site_hint=sh)
+            if (refreshed2.get("foreground") or focus_res.get("target_hwnd")) and not screenview.is_own_pid(
+                int(refreshed2.get("pid") or focus_res.get("target_pid") or 0)
+            ):
+                merged = {
+                    **refreshed2,
+                    "found": True,
+                    "foreground": True,
+                    "hwnd": int(refreshed2.get("hwnd") or focus_res.get("target_hwnd") or 0),
+                    "pid": int(refreshed2.get("pid") or focus_res.get("target_pid") or 0),
+                    "title": str(refreshed2.get("title") or focus_res.get("target_window_title") or win.get("title") or ""),
+                }
+                desktop_control.record_diagnostics(
+                    chrome_detected=True, chrome_foreground=True,
+                    foreground_app=str(merged.get("app") or bname),
+                )
+                return True, merged, ""
 
     desktop_control.record_diagnostics(
         chrome_detected=bool(win.get("found")), chrome_foreground=False,
         foreground_app=str(refreshed.get("app") or "unknown"),
     )
-    return False, refreshed, f"I couldn't complete that action because {bname} did not become the foreground window ({act.error or focus_res.get('reason') or 'foreground lock'})."
+    err_hint = (getattr(act, "error", "") if act is not None else "") or focus_res.get("reason") or "foreground lock"
+    return False, refreshed, f"I couldn't complete that action because {bname} did not become the foreground window ({err_hint})."
 
 
 # --- native (no-DOM) YouTube control state, read from the player's own buttons ---------
@@ -3152,13 +4957,32 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
     from core import screenact, screenview
 
     bname = _ALIASES.get(str(browser_name or "chrome").lower().strip(), str(browser_name or "chrome").lower().strip())
-    win = _find_browser_window(bname)
+    site_hint = _infer_requested_site(action, params)
+    win = _find_browser_window(bname, site_hint=site_hint)
     if action in ("inspect", "get_url", "get_text"):
-        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
+        prov_q = str(params.get("provenance_query") or params.get("description") or params.get("text") or "").strip()
+        if any(k in prov_q.casefold() for k in ("where did you get", "provenance", "source of title", "how did you know")):
+            return outcome.done(
+                "browser_control",
+                action=action, browser=bname, control_mode="native_windows",
+                provenance=inspect_title_provenance(prov_q),
+                verified=True,
+            )
+        is_fast_url = action == "get_url"
+        sync = _inspect_visible_browser_window(
+            bname,
+            focus_if_needed=(not is_fast_url),
+            allow_ocr=(not is_fast_url),
+            site_hint=site_hint,
+            lightweight=is_fast_url,
+        )
+        timings = sync.get("timings") or {}
         videos = sync.get("videos") or []
         wa_contacts = sync.get("wa_contacts") or []
         wa_chat = sync.get("wa_chat") or {}
-        is_wa_surface = "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold()
+        is_wa_surface = (sync.get("site") == "whatsapp") or (
+            "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold()
+        )
         summary_parts = []
         if is_wa_surface:
             if wa_chat.get("verified"):
@@ -3171,7 +4995,28 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
         elif sync.get("empty_home"):
             summary_parts.append("YouTube Home ('Try searching to get started', 0 results)")
         elif videos:
-            summary_parts.append("Videos: " + "; ".join(f"{v['position']}. {v['title']}" for v in videos[:5]))
+            readable_vids = [
+                f"{v['position']}. {v['exact_title']}"
+                for v in videos[:5]
+                if v.get("evidence_status", "OBSERVED") not in ("UNKNOWN", "INFERRED") and (v.get("exact_title") or "").strip()
+            ]
+            if readable_vids:
+                summary_parts.append("Videos: " + "; ".join(readable_vids))
+            else:
+                summary_parts.append(f"Visible YouTube video cards ({len(videos)}), but titles could not be read reliably")
+        if site_hint and sync.get("site_mismatch"):
+            return outcome.unverified(
+                "browser_control",
+                f"{bname} is currently showing {sync.get('title') or sync.get('site') or 'another tab'}, not {site_hint}.",
+                action=action, browser=bname, control_mode="native_windows", cdp_available=False,
+                requested_site=site_hint, actual_site=sync.get("site", ""),
+                window_identity=sync.get("window_identity", ""),
+                title=sync.get("title", ""), url=sync.get("url", ""),
+                timing_hwnd_ms=timings.get("hwnd_ms", 0.0),
+                timing_obs_ms=timings.get("obs_ms", 0.0),
+                timing_total_ms=timings.get("total_ms", 0.0),
+                verified=False,
+            )
         if not win.get("found") and not sync.get("title") and not sync.get("url"):
             return outcome.unverified(
                 "browser_control",
@@ -3182,6 +5027,9 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 extracted_text_count=sync.get("extracted_text_count", 0),
                 uia_items=sync.get("uia_items", 0),
                 ocr_items=sync.get("ocr_items", 0),
+                timing_hwnd_ms=timings.get("hwnd_ms", 0.0),
+                timing_obs_ms=timings.get("obs_ms", 0.0),
+                timing_total_ms=timings.get("total_ms", 0.0),
                 confidence="uncertain",
                 target_identified=False,
                 page_state="unverified", verification_step="open_browser_window",
@@ -3208,6 +5056,19 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                     )
             except Exception:
                 pass
+            if action == "get_url":
+                return outcome.done(
+                    "browser_control", action="get_url", browser=bname, control_mode="native_windows",
+                    active_application="WhatsApp (Chrome)",
+                    url=(sync.get("url") or "https://web.whatsapp.com/"),
+                    title=sync.get("title", ""),
+                    window_identity=sync.get("window_identity", ""),
+                    window_hwnd=sync.get("hwnd", 0), window_pid=sync.get("pid", 0),
+                    timing_hwnd_ms=timings.get("hwnd_ms", 0.0),
+                    timing_obs_ms=timings.get("obs_ms", 0.0),
+                    timing_total_ms=timings.get("total_ms", 0.0),
+                    verified=bool(sync.get("title") or sync.get("url")),
+                )
             return outcome.done(
                 "browser_control", action=action, browser=bname, control_mode="native_windows",
                 active_application="WhatsApp (Chrome)",
@@ -3216,6 +5077,9 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 selected_chat_verified=bool(wa_chat.get("verified")),
                 uia_items=sync.get("uia_items", 0), ocr_items=sync.get("ocr_items", 0),
                 extracted_text_count=sync.get("extracted_text_count", 0),
+                timing_hwnd_ms=timings.get("hwnd_ms", 0.0),
+                timing_obs_ms=timings.get("obs_ms", 0.0),
+                timing_total_ms=timings.get("total_ms", 0.0),
                 source=sync.get("source", "windows_uia"),
                 detail=(" | ".join(summary_parts) if summary_parts else "WhatsApp is open; 0 matching contacts visible."),
                 verified=bool(wa_contacts or wa_chat.get("verified")),
@@ -3232,6 +5096,9 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                     extracted_text_count=sync.get("extracted_text_count", 0),
                     uia_items=sync.get("uia_items", 0),
                     ocr_items=sync.get("ocr_items", 0),
+                    timing_hwnd_ms=timings.get("hwnd_ms", 0.0),
+                    timing_obs_ms=timings.get("obs_ms", 0.0),
+                    timing_total_ms=timings.get("total_ms", 0.0),
                     confidence=sync.get("confidence", "medium"),
                     source=sync.get("source", "windows_uia"), verified=True,
                 )
@@ -3240,11 +5107,15 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 f"CDP is unavailable on {bname} and UIA did not expose the full URL; active window title is {sync.get('title')!r}",
                 browser=bname, control_mode="native_windows", cdp_available=False,
                 title=sync.get("title", ""), window_pid=sync.get("pid", 0),
+                window_hwnd=sync.get("hwnd", 0),
                 window_identity=sync.get("window_identity", ""),
                 timestamp=sync.get("timestamp", ""),
                 extracted_text_count=sync.get("extracted_text_count", 0),
                 uia_items=sync.get("uia_items", 0),
                 ocr_items=sync.get("ocr_items", 0),
+                timing_hwnd_ms=timings.get("hwnd_ms", 0.0),
+                timing_obs_ms=timings.get("obs_ms", 0.0),
+                timing_total_ms=timings.get("total_ms", 0.0),
                 confidence=sync.get("confidence", "uncertain"),
                 source=sync.get("source", "windows_uia"),
             )
@@ -3338,7 +5209,13 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             action=action, browser=bname, dispatch_status="completed", input_status="not_executed",
             verification_status="unverified", cdp_available=False,
         )
-    ok_fg, win, fg_err = _ensure_browser_foreground(bname, win, title_hint=str(params.get("description") or params.get("target") or ""))
+    ok_fg, win, fg_err = _ensure_browser_foreground(
+        bname, win,
+        title_hint=(
+            "WhatsApp" if site_hint == "whatsapp"
+            else ("YouTube" if site_hint == "youtube" else str(params.get("description") or params.get("target") or ""))
+        ),
+    )
     if not ok_fg:
         return outcome.failed(
             "browser_control", fg_err,
@@ -3467,6 +5344,7 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             typing_authorized=True,
             message_sent=False,
             language=draft_lang,
+            draft_verified=readback_ok,
             auth_context=_auth_ctx,
         )
         _dc.record_diagnostics(
@@ -3481,6 +5359,7 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             selected_contact=contact_name, selected_chat_verified=bool(chat_hdr.get("verified")),
             generated_content_hash=_wa.draft_hash(draft),
             composition_requested=True, typing_authorized=True, message_sent=False,
+            lifecycle_state=(_dc.MSG_DRAFT_VERIFIED if readback_ok else _dc.MSG_COMPOSING),
             dispatch_status="completed", input_status="completed",
             verification_status=("verified" if readback_ok else "input_dispatched"),
             cursor_moved=mv.ok, verified=True,
@@ -3494,10 +5373,45 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
         q = str(params.get("text") or params.get("query") or params.get("description") or "").strip()
         if not q:
             return outcome.ask("browser_control", "Which contact or chat should I search for?", browser=bname, verified=False)
-        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
-        sb = _wa.locate_whatsapp_search_bar(sync.get("view"))
-        if sb is None:
-            return outcome.failed("browser_control", "Could not locate WhatsApp's search bar.", action="search_contact", browser=bname)
+        sb = None
+        sync = {}
+        recovery_attempts = 0
+        t_resolve0 = time.monotonic()
+        while recovery_attempts < 2:
+            recovery_attempts += 1
+            sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True, site_hint="whatsapp")
+            # Verify active window/tab really is WhatsApp Web before searching
+            is_wa_win = (
+                sync.get("site") == "whatsapp"
+                or "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold()
+            )
+            if not is_wa_win or not sync.get("foreground"):
+                _registry.invalidate_sync(bname)
+                time.sleep(0.15)
+                continue
+            fg_h = int(win.get("hwnd", 0) or 0)
+            sb = _wa.resolve_whatsapp_search_field(
+                sync.get("view"),
+                target_hwnd=int(sync.get("hwnd", 0) or fg_h),
+                foreground_hwnd=fg_h,
+            )
+            if sb.get("found") and sb.get("visible") and sb.get("enabled"):
+                break
+            sb = None
+            _registry.invalidate_sync(bname)
+            time.sleep(0.15)
+        resolve_ms = round((time.monotonic() - t_resolve0) * 1000.0, 1)
+        if not sb or not sb.get("found"):
+            # Strictly refuse unverified clicks or blind Enter when WhatsApp search field is unresolved.
+            return outcome.failed(
+                "browser_control",
+                f"Could not identify a verified WhatsApp search field inside {bname} ({sync.get('title') or 'unknown window'}) after {recovery_attempts} attempts; no key or click was sent.",
+                action="search_contact", browser=bname,
+                recovery_attempts=recovery_attempts,
+                search_bar_found=False,
+                timing_resolve_ms=resolve_ms,
+            )
+        t_input0 = time.monotonic()
         pt = screenact.Point(sb["x"], sb["y"], origin="element", label=sb["label"])
         screenact.move_cursor(pt)
         clk = screenact.click(pt)
@@ -3506,10 +5420,16 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
         t_res = screenact.type_text(q, clear_first=True)
         if not t_res.ok:
             return outcome.failed("browser_control", f"typing contact query failed: {t_res.error}", action="search_contact", browser=bname)
+        input_ms = round((time.monotonic() - t_input0) * 1000.0, 1)
         time.sleep(0.35)
+        t_ver0 = time.monotonic()
         _registry.invalidate_sync(bname)
-        after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
-        contacts = _wa.extract_whatsapp_contacts(after.get("view"), query=q)
+        after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True, site_hint="whatsapp")
+        after_sb = _wa.resolve_whatsapp_search_field(after.get("view"))
+        query_verified = bool(after_sb.get("found") and q.casefold() in str(after_sb.get("value") or "").casefold())
+        raw_contacts = _wa.extract_whatsapp_contacts(after.get("view"), query=q)
+        contacts = [c for c in raw_contacts if _wa.contact_match(q, c["display_name"]) != "none"]
+        verify_ms = round((time.monotonic() - t_ver0) * 1000.0, 1)
         _dc.record_diagnostics(unique_contact_count=len(contacts), active_application="WhatsApp (Chrome)")
         if contacts:
             _dc.set_active_target(
@@ -3522,15 +5442,32 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             )
         return outcome.done(
             "browser_control", action="search_contact", browser=bname,
-            resolved_target=q, unique_contact_count=len(contacts),
+            resolved_target=q,
+            search_source=sb.get("source", ""),
+            search_method=sb.get("method", ""),
+            query_verified=query_verified,
+            unique_contact_count=len(contacts),
             matched_contacts="; ".join(c["display_name"] for c in contacts[:5]),
+            recovery_attempts=recovery_attempts,
+            timing_resolve_ms=resolve_ms,
+            timing_input_ms=input_ms,
+            timing_verify_ms=verify_ms,
             dispatch_status="completed", input_status="completed",
-            verification_status=("verified" if contacts else "unverified"),
-            verified=bool(contacts),
+            verification_status=("verified" if (contacts or query_verified) else "unverified"),
+            verified=bool(contacts or query_verified),
         )
 
     def _click_diag(clk_action: str, pt, *, rect_info=None) -> tuple:
         cb = screenact.get_cursor_pos() if hasattr(screenact, "get_cursor_pos") else (0, 0)
+        fg_hwnd_b = int(win.get("hwnd", 0) or 0)
+        if _OS == "Windows":
+            try:
+                import ctypes
+                live_fg = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+                if live_fg:
+                    fg_hwnd_b = live_fg if fg_hwnd_b <= 0 else fg_hwnd_b
+            except Exception:
+                pass
         mv = screenact.move_cursor(pt)
         if clk_action == "right_click":
             clk = screenact.right_click(pt)
@@ -3539,9 +5476,18 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
         else:
             clk = screenact.click(pt)
         ca = screenact.get_cursor_pos() if hasattr(screenact, "get_cursor_pos") else (getattr(pt, "x", 0), getattr(pt, "y", 0))
+        fg_hwnd_a = int(win.get("hwnd", 0) or 0)
+        if _OS == "Windows":
+            try:
+                import ctypes
+                live_fg_a = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+                if live_fg_a:
+                    fg_hwnd_a = live_fg_a
+            except Exception:
+                pass
         thwnd = int(win.get("hwnd", 0) or 0)
         tpid = int(win.get("pid", 0) or 0)
-        fhwnd = thwnd
+        fhwnd = int(thwnd or fg_hwnd_a or fg_hwnd_b)
         try:
             from core import desktop_control as _dc_local
             _dc_local.record_diagnostics(
@@ -3554,6 +5500,8 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             "target_hwnd": thwnd,
             "target_pid": tpid,
             "foreground_hwnd": fhwnd,
+            "fg_hwnd_before": int(fg_hwnd_b or 0),
+            "fg_hwnd_after": int(fg_hwnd_a or 0),
             "target_rect": str(rect_info or ""),
             "cursor_before": f"{cb[0]},{cb[1]}",
             "cursor_after": f"{ca[0]},{ca[1]}",
@@ -3561,64 +5509,153 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             "input_status": ("completed" if clk.ok else "failed"),
         }
 
-    if action == "select_contact":
-        from core import desktop_control as _dc
+    def _open_wa_contact_bounded(
+        raw_desc: str,
+        *,
+        sync_snap: dict,
+        action_label: str,
+        resolved_ref: dict | None = None,
+        auth_ctx=None,
+        task_id: str = "",
+    ) -> str:
+        from core import desktop_control as _dc, screen_observation as _so
         from plugins import _whatsapp_core as _wa
 
-        _auth_ctx = _dc.current_bound_auth_context()
-        desc = str(params.get("description") or params.get("text") or params.get("query") or "").strip()
-        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
-        view = sync.get("view")
-        ord_idx = _parse_ordinal_index(desc)
-        ref = _dc.get_active_target(_auth_ctx)
-        if not desc and ref and ref.get("target_type") == "contact":
-            desc = str(ref.get("exact_target_name") or "").strip()
-        cleaned_query = re.sub(
-            r"\b(?:the|first|second|third|fourth|last|1st|2nd|3rd|4th|one|open|select|click|chat|contact)\b",
-            "", desc, flags=re.IGNORECASE,
-        ).strip()
-        contacts = _wa.extract_whatsapp_contacts(view, query=cleaned_query)
-        if not contacts and ref and ref.get("results"):
-            contacts = list(ref.get("results") or ())
+        desc_str = str(raw_desc or "").strip()
+        ord_idx = _parse_ordinal_index(desc_str)
+        wa_intent = _wa.parse_whatsapp_intent_target(desc_str)
+        if resolved_ref is not None and resolved_ref.get("target_type") == "contact":
+            c_query = str(resolved_ref.get("exact_target_name") or "").strip()
+        elif ord_idx is not None:
+            c_query = ""
+        elif wa_intent.get("contact"):
+            c_query = str(wa_intent["contact"]).strip()
+        else:
+            c_query = re.sub(
+                r"\b(?:the|first|second|third|fourth|last|1st|2nd|3rd|4th|one|open|select|click|chat|conversation|contact|named|called|with|for|shed|in|whatsapp|now)\b",
+                " ", desc_str, flags=re.IGNORECASE,
+            )
+            c_query = " ".join(c_query.split()).strip(" .,!?'\"-")
+
+        if not c_query and ord_idx is None:
+            return outcome.ask(
+                "browser_control",
+                "Which WhatsApp contact or chat would you like me to open, Tarun-kun?",
+                browser=bname, task_id=task_id, verified=False,
+            )
+
+        cur_sync = sync_snap
+        contacts = _wa.extract_whatsapp_contacts(cur_sync.get("view"), query=c_query)
+        if not contacts and resolved_ref and resolved_ref.get("results"):
+            contacts = list(resolved_ref.get("results") or ())
+        if c_query:
+            contacts = [c for c in contacts if _wa.contact_match(c_query, c["display_name"]) != "none"]
+
+        # Dedicated bounded sidebar search when contact is not yet in the visible list
+        if not contacts and c_query and ord_idx is None:
+            sb = _wa.locate_whatsapp_search_bar(cur_sync.get("view"))
+            if sb is None:
+                _dc.record_diagnostics(active_application="WhatsApp (Chrome)", unique_contact_count=0, selected_chat_verified=False)
+                return outcome.failed(
+                    "browser_control",
+                    f"Could not locate WhatsApp's sidebar search field to find {c_query!r}.",
+                    action=action_label, browser=bname, task_id=task_id,
+                    failure_reason="whatsapp_search_field_not_found", verified=False,
+                )
+            sb_pt = screenact.Point(sb["x"], sb["y"], origin="element", label=sb["label"])
+            _mv_sb, clk_sb, cdiag_sb = _click_diag("click", sb_pt, rect_info=sb.get("rect"))
+            if not clk_sb.ok:
+                return outcome.failed(
+                    "browser_control",
+                    f"Focusing WhatsApp search field failed: {clk_sb.error}",
+                    action=action_label, browser=bname, task_id=task_id, **cdiag_sb,
+                )
+            t_res = screenact.type_text(c_query, clear_first=True)
+            if not t_res.ok:
+                return outcome.failed(
+                    "browser_control",
+                    f"Entering {c_query!r} in WhatsApp search failed: {t_res.error}",
+                    action=action_label, browser=bname, task_id=task_id, **cdiag_sb,
+                )
+            time.sleep(0.45)
+            _registry.invalidate_sync(bname)
+            _so.invalidate_observation_provenance(reason="whatsapp_search_query", hwnd=int(cur_sync.get("hwnd", 0) or 0))
+            cur_sync = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True, site_hint="whatsapp")
+            contacts = _wa.extract_whatsapp_contacts(cur_sync.get("view"), query=c_query)
+            contacts = [c for c in contacts if _wa.contact_match(c_query, c["display_name"]) != "none"]
+
         _dc.record_diagnostics(unique_contact_count=len(contacts), active_application="WhatsApp (Chrome)")
         if not contacts:
+            try:
+                _dc.clear_task_targets()
+            except Exception:
+                pass
             return outcome.unverified(
-                "browser_control", f"No WhatsApp contact matching {desc or 'selection'!r} was found on screen.",
-                action="select_contact", browser=bname, verified=False,
+                "browser_control",
+                f"I searched WhatsApp for {c_query or desc_str!r}, Tarun-kun, but couldn't find a matching contact.",
+                action=action_label, browser=bname, task_id=task_id,
+                unique_contact_count=0, selected_chat_verified=False,
+                target_identified=False, verified=False,
             )
+
         chosen = None
         if ord_idx is not None:
             pick = (len(contacts) - 1) if ord_idx == -1 else ord_idx
             if 0 <= pick < len(contacts):
                 chosen = contacts[pick]
         if chosen is None:
-            exact = [c for c in contacts if cleaned_query and c["display_name"].casefold() == cleaned_query.casefold()]
+            exact = [c for c in contacts if c_query and c["display_name"].casefold() == c_query.casefold()]
             chosen = exact[0] if len(exact) == 1 else (contacts[0] if len(contacts) == 1 else None)
         if chosen is None:
             _dc.set_active_target(
                 target_type="contact", exact_target_name=contacts[0]["display_name"],
-                browser=bname, tab_title=sync.get("title", ""), tab_url=sync.get("url", ""),
+                browser=bname, tab_title=cur_sync.get("title", ""), tab_url=cur_sync.get("url", ""),
                 result_position=1, point=contacts[0]["point"], rect=contacts[0].get("rect"),
-                results=contacts, auth_context=_auth_ctx,
+                results=contacts, auth_context=auth_ctx,
             )
             names = ", ".join(c["display_name"] for c in contacts[:4])
             return outcome.ask(
                 "browser_control",
-                f"I found {len(contacts)} contacts matching {cleaned_query or desc!r}: {names}. Which one should I open — first or second?",
-                browser=bname, unique_contact_count=len(contacts), verified=False,
+                f"I found {len(contacts)} contacts matching {c_query or desc_str!r}: {names}. Which one should I open?",
+                browser=bname, task_id=task_id, unique_contact_count=len(contacts), verified=False,
             )
-        pt = screenact.Point(chosen["point"][0], chosen["point"][1], origin="element", label=chosen["display_name"])
+
+        cx, cy = chosen["point"]
+        v_rect = getattr(cur_sync.get("view"), "window_rect", None)
+        if isinstance(v_rect, (list, tuple)) and len(v_rect) == 4 and int(v_rect[2] or 0) > 100:
+            wl, wt, ww, wh = (int(x or 0) for x in v_rect)
+            if not (wl <= int(cx) <= wl + ww and wt <= int(cy) <= wt + wh):
+                return outcome.failed(
+                    "browser_control",
+                    f"Contact {chosen['display_name']!r} coordinates ({cx},{cy}) fell outside the visible Chrome window; refused to click.",
+                    action=action_label, browser=bname, task_id=task_id,
+                    failure_reason="coordinates_outside_window", verified=False,
+                )
+
+        pt = screenact.Point(cx, cy, origin="element", label=chosen["display_name"])
         mv, clk, cdiag = _click_diag("click", pt, rect_info=chosen.get("rect"))
         if not clk.ok:
-            return outcome.failed("browser_control", f"clicking contact {chosen['display_name']!r} failed: {clk.error}", action="select_contact", browser=bname, **cdiag)
+            _dc.clear_task_targets()
+            _so.invalidate_observation_provenance(reason="whatsapp_contact_click_failed", hwnd=int(cur_sync.get("hwnd", 0) or 0))
+            return outcome.failed(
+                "browser_control", f"clicking contact {chosen['display_name']!r} failed: {clk.error}",
+                action=action_label, browser=bname, task_id=task_id, **cdiag,
+            )
         time.sleep(0.35)
         _registry.invalidate_sync(bname)
-        after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
-        hdr = _wa.verify_whatsapp_active_chat(after.get("view"), expected_contact=chosen["display_name"], tab_title=after.get("title", ""), tab_url=after.get("url", ""))
+        _so.invalidate_observation_provenance(reason="whatsapp_contact_clicked", hwnd=int(cur_sync.get("hwnd", 0) or 0))
+        after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True, site_hint="whatsapp")
+        hdr = _wa.verify_whatsapp_active_chat(
+            after.get("view"), expected_contact=chosen["display_name"],
+            tab_title=after.get("title", ""), tab_url=after.get("url", ""),
+        )
         if not hdr.get("verified"):
             time.sleep(0.35)
-            after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
-            hdr = _wa.verify_whatsapp_active_chat(after.get("view"), expected_contact=chosen["display_name"], tab_title=after.get("title", ""), tab_url=after.get("url", ""))
+            after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True, site_hint="whatsapp")
+            hdr = _wa.verify_whatsapp_active_chat(
+                after.get("view"), expected_contact=chosen["display_name"],
+                tab_title=after.get("title", ""), tab_url=after.get("url", ""),
+            )
         chat_id = str(hdr.get("chat_id") or chosen.get("id") or "")
         chat_ok = bool(hdr.get("verified"))
         if chat_ok:
@@ -3627,17 +5664,19 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 browser=bname, tab_title=after.get("title", ""), tab_url=after.get("url", ""),
                 result_position=chosen.get("position", 1), point=chosen["point"], rect=chosen.get("rect"),
                 confidence=chosen.get("confidence", "high"), extraction_source=chosen.get("source", ""),
-                auth_context=_auth_ctx,
+                auth_context=auth_ctx,
             )
             _dc.set_active_composition_state(
                 composition_requested=False,
-                composition_task_id=str(getattr(_auth_ctx, "task_id", "") or ""),
+                composition_task_id=str(getattr(auth_ctx, "task_id", "") or ""),
                 selected_contact=chosen["display_name"],
                 generated_content="",
                 typing_authorized=False,
                 message_sent=False,
-                auth_context=_auth_ctx,
+                auth_context=auth_ctx,
             )
+        else:
+            _dc.clear_task_targets()
         _dc.record_diagnostics(
             active_application="WhatsApp (Chrome)",
             active_contact=(chosen["display_name"] if chat_ok else "—"),
@@ -3649,19 +5688,34 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             return outcome.unverified(
                 "browser_control",
                 f"I clicked {chosen['display_name']}, but I couldn't confirm that the chat opened.",
-                action="select_contact", browser=bname,
+                action=action_label, browser=bname, task_id=task_id,
                 resolved_target=chosen["display_name"], active_chat_id=chat_id,
                 unique_contact_count=len(contacts), selected_chat_verified=False,
                 verification_status="unverified", cursor_moved=mv.ok, click_executed=clk.ok,
                 verified=False, **cdiag,
             )
         return outcome.done(
-            "browser_control", action="select_contact", browser=bname,
-            resolved_target=chosen["display_name"], active_contact=chosen["display_name"],
-            active_chat_id=chat_id, unique_contact_count=len(contacts),
-            selected_chat_verified=True,
-            verification_status="verified",
-            cursor_moved=mv.ok, click_executed=clk.ok, verified=True, **cdiag,
+            "browser_control", action=action_label, browser=bname, task_id=task_id,
+            control_mode="native_windows", resolved_target=chosen["display_name"],
+            active_contact=chosen["display_name"], active_chat_id=chat_id,
+            unique_contact_count=len(contacts), selected_chat_verified=True,
+            verification_status="verified", cursor_moved=mv.ok, click_executed=clk.ok,
+            verified=True, **cdiag,
+        )
+
+    if action == "select_contact":
+        from core import desktop_control as _dc
+
+        _auth_ctx = _dc.current_bound_auth_context()
+        _cur_task_id = str(getattr(_auth_ctx, "task_id", "") or "") if _auth_ctx is not None else ""
+        desc = str(params.get("description") or params.get("text") or params.get("query") or "").strip()
+        ref = _dc.get_active_target(_auth_ctx)
+        if not desc and ref and ref.get("target_type") == "contact":
+            desc = str(ref.get("exact_target_name") or "").strip()
+        sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True, site_hint="whatsapp")
+        return _open_wa_contact_bounded(
+            desc, sync_snap=sync, action_label="select_contact",
+            resolved_ref=ref, auth_ctx=_auth_ctx, task_id=_cur_task_id,
         )
 
     if action == "clear_field":
@@ -3810,7 +5864,7 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 target_label, detection_source = sb["label"], sb["source"]
                 time.sleep(0.1)
             elif (
-                any(k in desc_cf for k in ("message", "chat", "composer", "draft", "reply", "input"))
+                any(k in desc_cf for k in ("message", "composer", "draft", "reply", "type a message"))
                 or not desc
             ):
                 comp = _wa.locate_whatsapp_composer(view)
@@ -3940,10 +5994,13 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             _resolved_ref is not None and _resolved_ref.get("target_type") == "search_bar"
         )
         if _is_search_target:
-            sb = _locate_youtube_search_bar_native(sync, bname, desc or "YouTube search bar")
-            if sb is None and "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold():
+            is_wa_now = (sync.get("site") == "whatsapp") or ("whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold())
+            sb = None
+            if is_wa_now:
                 from plugins import _whatsapp_core as _wa
                 sb = _wa.locate_whatsapp_search_bar(sync.get("view"))
+            else:
+                sb = _locate_youtube_search_bar_native(sync, bname, desc or "YouTube search bar")
             if sb is None and _resolved_ref and _resolved_ref.get("point"):
                 sx, sy = _resolved_ref["point"]
                 sb = {"x": sx, "y": sy, "label": _resolved_ref.get("exact_target_name") or "YouTube search bar", "source": _resolved_ref.get("extraction_source") or "active_target"}
@@ -3982,72 +6039,17 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             "whatsapp" in (sync.get("title", "") + " " + sync.get("url", "")).casefold()
             and action in {"smart_click", "click", "left_click"}
             and desc
-            and (
+        ):
+            from plugins import _whatsapp_core as _wa_chk
+            if (
                 (_resolved_ref is not None and _resolved_ref.get("target_type") == "contact")
+                or _wa_chk.parse_whatsapp_intent_target(desc).get("is_intent")
                 or any(k in desc_cf for k in ("chat", "contact"))
                 or desc_cf not in {"message box", "composer"}
-            )
-        ):
-            from plugins import _whatsapp_core as _wa
-            c_query = (
-                str(_resolved_ref.get("exact_target_name") or "")
-                if (_resolved_ref is not None and _resolved_ref.get("target_type") == "contact")
-                else re.sub(r"\b(?:open|select|click|chat|contact)\b", "", desc, flags=re.IGNORECASE).strip() or desc
-            )
-            wa_contacts = _wa.extract_whatsapp_contacts(sync.get("view"), query=c_query)
-            if wa_contacts:
-                exact = [c for c in wa_contacts if c["display_name"].casefold() == c_query.casefold()]
-                chosen_c = exact[0] if len(exact) == 1 else (wa_contacts[0] if len(wa_contacts) == 1 else None)
-                if chosen_c is None:
-                    names = ", ".join(c["display_name"] for c in wa_contacts[:4])
-                    return outcome.ask(
-                        "browser_control",
-                        f"I see {len(wa_contacts)} unique contacts matching {c_query!r}: {names}. Which one should I open?",
-                        browser=bname, unique_contact_count=len(wa_contacts), verified=False,
-                    )
-                pt = screenact.Point(chosen_c["point"][0], chosen_c["point"][1], origin="element", label=chosen_c["display_name"])
-                mv, clk, cdiag = _click_diag(action, pt, rect_info=chosen_c.get("rect"))
-                if not clk.ok:
-                    return outcome.failed("browser_control", f"clicking contact {chosen_c['display_name']!r} failed: {clk.error}", action=action, browser=bname, **cdiag)
-                time.sleep(0.35)
-                _registry.invalidate_sync(bname)
-                after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
-                hdr = _wa.verify_whatsapp_active_chat(after.get("view"), expected_contact=chosen_c["display_name"], tab_title=after.get("title", ""), tab_url=after.get("url", ""))
-                chat_id = str(hdr.get("chat_id") or chosen_c.get("id") or "")
-                chat_ok = bool(hdr.get("verified"))
-                if _dc is not None:
-                    if chat_ok:
-                        _dc.set_active_target(
-                            target_type="contact", exact_target_name=chosen_c["display_name"],
-                            browser=bname, tab_title=after.get("title", ""), tab_url=after.get("url", ""),
-                            result_position=chosen_c.get("position", 1), point=chosen_c["point"], rect=chosen_c.get("rect"),
-                            confidence=chosen_c.get("confidence", "high"), extraction_source=chosen_c.get("source", ""),
-                            auth_context=_auth_ctx,
-                        )
-                    _dc.record_diagnostics(
-                        active_application="WhatsApp (Chrome)",
-                        active_contact=(chosen_c["display_name"] if chat_ok else "—"),
-                        active_chat_id=chat_id,
-                        selected_chat_verified=chat_ok,
-                        unique_contact_count=len(wa_contacts),
-                    )
-                if not chat_ok:
-                    return outcome.unverified(
-                        "browser_control",
-                        f"I clicked {chosen_c['display_name']}, but I couldn't confirm that the chat opened.",
-                        action=action, browser=bname, task_id=_cur_task_id,
-                        control_mode="native_windows", resolved_target=chosen_c["display_name"],
-                        active_chat_id=chat_id, unique_contact_count=len(wa_contacts),
-                        selected_chat_verified=False, verification_status="unverified",
-                        cursor_moved=mv.ok, click_executed=clk.ok, verified=False, **cdiag,
-                    )
-                return outcome.done(
-                    "browser_control", action=action, browser=bname, task_id=_cur_task_id,
-                    control_mode="native_windows", resolved_target=chosen_c["display_name"],
-                    active_contact=chosen_c["display_name"], active_chat_id=chat_id,
-                    unique_contact_count=len(wa_contacts), selected_chat_verified=True,
-                    verification_status="verified",
-                    cursor_moved=mv.ok, click_executed=clk.ok, verified=True, **cdiag,
+            ):
+                return _open_wa_contact_bounded(
+                    desc, sync_snap=sync, action_label=action,
+                    resolved_ref=_resolved_ref, auth_ctx=_auth_ctx, task_id=_cur_task_id,
                 )
         videos = sync.get("videos") or []
         if _resolved_ref is not None and _resolved_ref.get("target_type") == "video":
@@ -4110,12 +6112,21 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 )
         ordinal_idx = _parse_ordinal_index(desc or ("first video" if action == "play_video" else ""))
         if ordinal_idx is not None:
+            t_vid0 = time.monotonic()
             if not videos:
                 if sync.get("empty_home"):
                     return (
                         "I see the YouTube home page in Chrome ('Try searching to get started') "
                         "with 0 visible video results; tell me what to search for or name a specific video title."
                     )
+                _log_browser_action_diag(
+                    task_id=_cur_task_id, browser_hwnd=int(win.get("hwnd", 0) or 0),
+                    browser_pid=int(win.get("pid", 0) or 0), requested_site=site_hint or "youtube",
+                    verified_site=str(sync.get("site") or ""), active_tab=sync.get("title", ""),
+                    action="play_video", selection_method=str(sync.get("source") or "none"),
+                    verification_result=ACTION_UNVERIFIED, failure_reason="video_titles_unreadable",
+                    elapsed_ms=(time.monotonic() - t_vid0) * 1000.0,
+                )
                 return outcome.unverified(
                     "browser_control",
                     "Tarun-kun, I can see YouTube, but I can't reliably read the video titles right now.",
@@ -4128,51 +6139,167 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                     uia_items=sync.get("uia_items", 0),
                     ocr_items=sync.get("ocr_items", 0),
                     confidence=sync.get("confidence", "uncertain"),
+                    action_state=ACTION_UNVERIFIED,
                     execution_status="not_executed",
                     verification_status="unverified",
                     target_identified=False,
                     page_state="unverified",
                 )
-            idx = len(videos) - 1 if ordinal_idx == -1 else ordinal_idx
-            if idx < 0 or idx >= len(videos):
-                return f"I found {len(videos)} eligible non-ad YouTube video results in {bname}; requested position is unavailable, so nothing was clicked."
-            chosen = videos[idx]
+            ordered_vids, rows_v, ambig_v, sections_v = _cluster_youtube_video_rows(videos)
+            cand_pool = ordered_vids
+            if "horizontal" in desc_cf and rows_v:
+                horiz_rows = [r for r in rows_v if len(r) >= 2]
+                if not horiz_rows:
+                    return outcome.unverified(
+                        "browser_control",
+                        "I do not see a multi-column horizontal video row in Chrome right now.",
+                        action="play_video", browser=bname, task_id=_cur_task_id,
+                        action_state=ACTION_UNVERIFIED, verified=False,
+                    )
+                primary_row = horiz_rows[0]
+                if ordinal_idx != -1 and ordinal_idx >= len(primary_row):
+                    return outcome.unverified(
+                        "browser_control",
+                        f"The first horizontal row only shows {len(primary_row)} visible videos; requested position is unavailable.",
+                        action="play_video", browser=bname, task_id=_cur_task_id,
+                        action_state=ACTION_UNVERIFIED, verified=False,
+                    )
+                cand_pool = primary_row
+                ambig_v = False
+            elif ambig_v and sections_v:
+                return outcome.ask(
+                    "browser_control",
+                    f"I see multiple video sections on YouTube ({', '.join(sections_v[:3])}). Which section or video title should I click?",
+                    browser=bname, task_id=_cur_task_id, action_state=ACTION_UNVERIFIED, verified=False,
+                )
+            idx = len(cand_pool) - 1 if ordinal_idx == -1 else ordinal_idx
+            if idx < 0 or idx >= len(cand_pool):
+                return f"I found {len(cand_pool)} eligible non-ad YouTube video results in {bname}; requested position is unavailable, so nothing was clicked."
+            chosen = cand_pool[idx]
+            ord_word = _INDEX_TO_ORDINAL.get(idx, f"#{idx + 1}")
+            ev_stat = str(chosen.get("evidence_status") or "OBSERVED").upper()
+            exact_title = str(chosen.get("exact_title") or chosen.get("title") or "").strip()
+            if ev_stat in ("UNKNOWN", "INFERRED") or not exact_title or exact_title == "Unreadable video card":
+                if _dc is not None:
+                    try:
+                        _dc.clear_task_targets()
+                    except Exception:
+                        pass
+                try:
+                    from core import screen_observation as _so
+                    _so.invalidate_observation_provenance(reason="unreadable_conflicting_card_title", hwnd=int(win.get("hwnd", 0) or 0))
+                except Exception:
+                    pass
+                return outcome.unverified(
+                    "browser_control",
+                    f"I can see the video cards, but I cannot reliably read the {ord_word} video's title.",
+                    action="play_video", browser=bname, task_id=_cur_task_id,
+                    control_mode="native_windows", cdp_available=False,
+                    observation_id=chosen.get("observation_id") or sync.get("observation_id", ""),
+                    evidence_status=ev_stat or "UNKNOWN",
+                    target_identified=False, playback_verified=False, verified=False,
+                )
+            cx, cy = chosen["point"]
+            v_rect = getattr(sync.get("view"), "window_rect", None)
+            if isinstance(v_rect, (list, tuple)) and len(v_rect) == 4 and int(v_rect[2] or 0) > 100:
+                wl, wt, ww, wh = (int(x or 0) for x in v_rect)
+                if not (wl <= int(cx) <= wl + ww and (wt + 40) <= int(cy) <= wt + wh):
+                    return outcome.failed(
+                        "browser_control",
+                        f"Target coordinates ({cx},{cy}) for {chosen['title']!r} fell outside the visible Chrome window; refused to click.",
+                        action="play_video", browser=bname, task_id=_cur_task_id,
+                        action_state=ACTION_FAILED, failure_reason="coordinates_outside_window",
+                    )
             if _dc is not None:
                 _dc.set_active_target(
                     target_type="video", exact_target_name=chosen["title"],
                     browser=bname, tab_title=sync.get("title", ""), tab_url=sync.get("url", ""),
                     result_position=chosen["position"], point=chosen["point"],
                     rect=chosen.get("rect"), confidence=chosen.get("confidence", "medium"),
-                    extraction_source=chosen.get("source", ""), results=videos, auth_context=_auth_ctx,
+                    extraction_source=chosen.get("source", ""), results=cand_pool, auth_context=_auth_ctx,
                 )
-            cx, cy = chosen["point"]
             pt = screenact.Point(cx, cy, origin="element", label=chosen["title"])
             mv, clk, cdiag = _click_diag(action, pt, rect_info=chosen.get("rect"))
             if not clk.ok:
+                if _dc is not None:
+                    try:
+                        _dc.clear_task_targets()
+                    except Exception:
+                        pass
+                try:
+                    from core import screen_observation as _so
+                    _so.invalidate_observation_provenance(reason="play_video_click_failed", hwnd=int(win.get("hwnd", 0) or 0))
+                except Exception:
+                    pass
+                _log_browser_action_diag(
+                    task_id=_cur_task_id, browser_hwnd=int(win.get("hwnd", 0) or 0),
+                    browser_pid=int(win.get("pid", 0) or 0), requested_site=site_hint or "youtube",
+                    verified_site=str(sync.get("site") or ""), active_tab=sync.get("title", ""),
+                    action="play_video", selected_target=chosen["title"],
+                    selection_method=str(chosen.get("source") or "native").upper(),
+                    target_bbox=chosen.get("rect"), verification_result=ACTION_FAILED,
+                    failure_reason=str(clk.error or "click_failed"),
+                    elapsed_ms=(time.monotonic() - t_vid0) * 1000.0,
+                )
                 return outcome.failed(
                     "browser_control", f"real click on {chosen['title']!r} failed: {clk.error}",
                     action="play_video", resolved_target=chosen["title"], browser=bname, task_id=_cur_task_id,
-                    execution_status="failed", verification_status="unverified", **cdiag,
+                    action_state=ACTION_FAILED, execution_status="failed", verification_status="unverified", **cdiag,
                 )
-            time.sleep(0.75)
             _registry.invalidate_sync(bname)
+            try:
+                from core import screen_observation as _so
+                _so.invalidate_observation_provenance(reason="play_video_clicked", hwnd=int(win.get("hwnd", 0) or 0))
+            except Exception:
+                pass
+            if _dc is not None:
+                try:
+                    _dc.clear_task_targets()
+                except Exception:
+                    pass
             after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
             title_changed = bool(after.get("title") and after.get("title") != sync.get("title"))
-            if title_changed:
+            nav_verified = title_changed or ("/watch?v=" in str(after.get("url") or "").casefold())
+            pb_state = _yt_native_state(after.get("view"), "playback") if nav_verified else None
+            if pb_state == "paused":
+                input_focused = any(
+                    getattr(el, "focused", False) and str(getattr(el, "role", "") or "").casefold() in {"edit", "combobox", "searchbox"}
+                    for el in (getattr(after.get("view"), "elements", ()) or ())
+                )
+                if not input_focused and screenact.press("k").ok:
+                    time.sleep(0.25)
+                    after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+                    pb_state = _yt_native_state(after.get("view"), "playback")
+            pb_verified = (pb_state == "playing")
+            _log_browser_action_diag(
+                task_id=_cur_task_id, browser_hwnd=int(after.get("hwnd", 0) or win.get("hwnd", 0) or 0),
+                browser_pid=int(after.get("pid", 0) or win.get("pid", 0) or 0),
+                requested_site=site_hint or "youtube",
+                verified_site=str(after.get("site") or ""), active_tab=after.get("title", ""),
+                action="play_video", selected_target=chosen["title"],
+                selection_method=str(chosen.get("source") or "native").upper(),
+                target_bbox=chosen.get("rect"),
+                verification_result=(ACTION_VERIFIED if nav_verified else ACTION_UNVERIFIED),
+                failure_reason=("" if nav_verified else "navigation_not_confirmed"),
+                elapsed_ms=(time.monotonic() - t_vid0) * 1000.0,
+            )
+            if nav_verified:
                 return outcome.done(
                     "browser_control",
                     action="play_video",
                     browser=bname, task_id=_cur_task_id,
                     control_mode="native_windows",
                     resolved_target=chosen["title"], target=chosen["title"],
+                    action_state=ACTION_VERIFIED,
                     execution_status="completed", verification_status="verified",
                     cdp_available=False,
                     position=chosen["position"],
                     title=chosen["title"],
                     source=chosen["source"],
+                    selection_method=str(chosen.get("source") or "native").upper(),
                     cursor_moved=mv.ok,
                     click_executed=clk.ok,
-                    playback_verified=False,
+                    playback_verified=pb_verified,
                     resulting_title=after.get("title", ""),
                     detail=f"The {chosen['position']} video is {chosen['title']!r}. Clicked it in {bname}.",
                     verified=True, **cdiag,
@@ -4183,6 +6310,7 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 action="play_video", browser=bname, task_id=_cur_task_id,
                 control_mode="native_windows", cdp_available=False,
                 resolved_target=chosen["title"], target=chosen["title"],
+                action_state=ACTION_UNVERIFIED,
                 execution_status="completed", verification_status="unverified",
                 position=chosen["position"], title=chosen["title"],
                 source=chosen["source"], cursor_moved=mv.ok, click_executed=clk.ok,
@@ -4195,10 +6323,100 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 "I couldn't match a fresh visible target for that reference; which video or control should I click, Tarun-kun?",
                 browser=bname, task_id=_cur_task_id, verified=False,
             )
-        # Non-ordinal named click / title search via UIA/OCR in visible Chrome window
+        # Non-ordinal named click / category chip / title search via UIA/OCR in visible Chrome window
         view = sync.get("view")
+        yt_chips = sync.get("yt_chips") or []
         if view is not None and desc:
             needle = desc.casefold()
+            chip_clean = re.sub(
+                r"\b(?:click|on|the|category|chip|filter|pill|tab|button|select)\b",
+                "", desc, flags=re.IGNORECASE,
+            ).strip().casefold()
+            if yt_chips and chip_clean and "video" not in desc_cf:
+                chip_hit = next(
+                    (c for c in yt_chips if str(c.get("label") or "").strip().casefold() == chip_clean),
+                    None,
+                )
+                if chip_hit is not None:
+                    t_ch0 = time.monotonic()
+                    cx, cy = chip_hit["point"]
+                    pt = screenact.Point(cx, cy, origin="element", label=chip_hit["label"])
+                    mv, clk, cdiag = _click_diag(action, pt, rect_info=chip_hit.get("rect"))
+                    _registry.invalidate_sync(bname)
+                    if not clk.ok:
+                        if _dc is not None:
+                            _dc.clear_task_targets()
+                        _log_browser_action_diag(
+                            task_id=_cur_task_id,
+                            intent=(getattr(_auth_ctx, "instruction", "") if _auth_ctx else desc),
+                            parsed_target=chip_hit["label"],
+                            browser_hwnd=int(win.get("hwnd", 0) or 0), browser_pid=int(win.get("pid", 0) or 0),
+                            requested_site="youtube", verified_site=str(sync.get("site") or ""),
+                            active_tab=sync.get("title", ""), action=action,
+                            target_class=ELEM_CATEGORY_CHIP, selected_target=chip_hit["label"],
+                            selection_method=str(chip_hit.get("source") or "native").upper(),
+                            target_bbox=chip_hit.get("rect"), click_method="os_mouse",
+                            fg_hwnd_before=cdiag.get("fg_hwnd_before", 0),
+                            fg_hwnd_after=cdiag.get("fg_hwnd_after", 0),
+                            verification_result=ACTION_FAILED, failure_reason=str(clk.error or "click_failed"),
+                            elapsed_ms=(time.monotonic() - t_ch0) * 1000.0,
+                        )
+                        return outcome.failed(
+                            "browser_control", f"clicking category chip {chip_hit['label']!r} failed: {clk.error}",
+                            action=action, browser=bname, task_id=_cur_task_id,
+                            target_class=ELEM_CATEGORY_CHIP, resolved_target=chip_hit["label"],
+                            action_state=ACTION_FAILED, verified=False, **cdiag,
+                        )
+                    time.sleep(0.4)
+                    after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
+                    after_chips = after.get("yt_chips") or []
+                    after_chip = next(
+                        (c for c in after_chips if str(c.get("label") or "").strip().casefold() == chip_clean),
+                        None,
+                    )
+                    before_vids = [v.get("title") for v in (videos or [])[:4]]
+                    after_vids = [v.get("title") for v in (after.get("videos") or [])[:4]]
+                    chip_verified = bool(
+                        (after_chip and after_chip.get("selected"))
+                        or (after_vids and after_vids != before_vids)
+                        or (after.get("title") and after.get("title") != sync.get("title"))
+                    )
+                    _log_browser_action_diag(
+                        task_id=_cur_task_id,
+                        intent=(getattr(_auth_ctx, "instruction", "") if _auth_ctx else desc),
+                        parsed_target=chip_hit["label"],
+                        browser_hwnd=int(after.get("hwnd", 0) or win.get("hwnd", 0) or 0),
+                        browser_pid=int(after.get("pid", 0) or win.get("pid", 0) or 0),
+                        requested_site="youtube", verified_site=str(after.get("site") or ""),
+                        active_tab=after.get("title", ""), action=action,
+                        target_class=ELEM_CATEGORY_CHIP, selected_target=chip_hit["label"],
+                        selection_method=str(chip_hit.get("source") or "native").upper(),
+                        target_bbox=chip_hit.get("rect"), click_method="os_mouse",
+                        fg_hwnd_before=cdiag.get("fg_hwnd_before", 0),
+                        fg_hwnd_after=cdiag.get("fg_hwnd_after", 0),
+                        verification_result=(ACTION_VERIFIED if chip_verified else ACTION_UNVERIFIED),
+                        failure_reason=("" if chip_verified else "category_chip_selection_unconfirmed"),
+                        elapsed_ms=(time.monotonic() - t_ch0) * 1000.0,
+                    )
+                    if not chip_verified:
+                        if _dc is not None:
+                            _dc.clear_task_targets()
+                        return outcome.unverified(
+                            "browser_control",
+                            f"I clicked the {chip_hit['label']!r} category chip, Tarun-kun, but couldn't confirm it became active.",
+                            action=action, browser=bname, task_id=_cur_task_id,
+                            target_class=ELEM_CATEGORY_CHIP, resolved_target=chip_hit["label"],
+                            action_state=ACTION_UNVERIFIED, click_executed=True, cursor_moved=mv.ok,
+                            verified=False, **cdiag,
+                        )
+                    return outcome.done(
+                        "browser_control", action=action, browser=bname, task_id=_cur_task_id,
+                        control_mode="native_windows", cdp_available=False,
+                        target_class=ELEM_CATEGORY_CHIP, resolved_target=chip_hit["label"],
+                        target=chip_hit["label"], chip_selected=True,
+                        action_state=ACTION_VERIFIED, verification_status="verified",
+                        cursor_moved=mv.ok, click_executed=True, verified=True, **cdiag,
+                    )
             title_m = re.search(r"\b(?:video\s+)?titled\s+[\"']?(.+?)[\"']?$", desc, re.IGNORECASE)
             if title_m:
                 needle = title_m.group(1).strip().casefold()
@@ -4215,9 +6433,13 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                     pt = screenact.Point(v["point"][0], v["point"][1], origin="element", label=v["title"])
                     mv, clk, cdiag = _click_diag(action, pt, rect_info=v.get("rect"))
                     if not clk.ok:
+                        if _dc is not None:
+                            _dc.clear_task_targets()
+                        _registry.invalidate_sync(bname)
                         return outcome.failed(
                             "browser_control", f"real click on {v['title']!r} failed: {clk.error}",
                             action=action, resolved_target=v["title"], browser=bname, task_id=_cur_task_id,
+                            target_class=ELEM_VIDEO_CARD, action_state=ACTION_FAILED,
                             execution_status="failed", verification_status="unverified", **cdiag,
                         )
                     time.sleep(0.75)
@@ -4229,16 +6451,20 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                             "browser_control", action=action, browser=bname, task_id=_cur_task_id,
                             control_mode="native_windows", cdp_available=False,
                             resolved_target=v["title"], target=v["title"],
+                            target_class=ELEM_VIDEO_CARD, action_state=ACTION_VERIFIED,
                             execution_status="completed", verification_status="verified",
                             title=v["title"], cursor_moved=mv.ok, click_executed=clk.ok,
                             playback_verified=False, resulting_title=after.get("title", ""), verified=True, **cdiag,
                         )
+                    if _dc is not None:
+                        _dc.clear_task_targets()
                     return outcome.unverified(
                         "browser_control",
                         "I sent the click, Tarun-kun, but I couldn't confirm that the video opened.",
                         action=action, browser=bname, task_id=_cur_task_id,
                         control_mode="native_windows", cdp_available=False,
                         resolved_target=v["title"], target=v["title"],
+                        target_class=ELEM_VIDEO_CARD, action_state=ACTION_UNVERIFIED,
                         execution_status="completed", verification_status="unverified",
                         title=v["title"], cursor_moved=mv.ok, click_executed=clk.ok,
                         playback_verified=False, verified=False, **cdiag,
@@ -4248,15 +6474,63 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 if label and needle in label.casefold():
                     pt = screenact.Point.from_element(el)
                     mv, clk, cdiag = _click_diag(action, pt, rect_info=getattr(el, "rect", ""))
+                    _registry.invalidate_sync(bname)
+                    if not clk.ok:
+                        if _dc is not None:
+                            _dc.clear_task_targets()
+                        return outcome.failed(
+                            "browser_control", f"real click on {label!r} failed: {clk.error}",
+                            action=action, browser=bname, task_id=_cur_task_id,
+                            resolved_target=label, target=label,
+                            action_state=ACTION_FAILED, execution_status="failed",
+                            verification_status="unverified", click_executed=False,
+                            cursor_moved=mv.ok, verified=False, **cdiag,
+                        )
+                    time.sleep(0.3)
+                    after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False)
+                    changed = bool(
+                        (after.get("title") and after.get("title") != sync.get("title"))
+                        or (after.get("url") and after.get("url") != sync.get("url"))
+                    )
+                    if not changed:
+                        if _dc is not None:
+                            _dc.clear_task_targets()
+                        return outcome.unverified(
+                            "browser_control",
+                            f"I clicked {label!r}, Tarun-kun, but I couldn't confirm the page changed.",
+                            action=action, browser=bname, task_id=_cur_task_id,
+                            control_mode="native_windows", cdp_available=False,
+                            resolved_target=label, target=label,
+                            action_state=ACTION_UNVERIFIED, execution_status="completed",
+                            verification_status="unverified", click_executed=True,
+                            cursor_moved=mv.ok, verified=False, **cdiag,
+                        )
                     return outcome.done(
                         "browser_control", action=action, browser=bname, task_id=_cur_task_id,
                         control_mode="native_windows", cdp_available=False,
                         resolved_target=label, target=label,
-                        execution_status=("completed" if clk.ok else "failed"),
-                        verification_status=("verified" if mv.ok and clk.ok else "unverified"),
-                        click_executed=clk.ok, cursor_moved=mv.ok, verified=clk.ok, **cdiag,
+                        action_state=ACTION_VERIFIED,
+                        execution_status="completed", verification_status="verified",
+                        click_executed=True, cursor_moved=mv.ok, verified=True, **cdiag,
                     )
-        return outcome.failed("browser_control", f"Could not find element {desc!r} in the active {bname} window", action=action, browser=bname, task_id=_cur_task_id, execution_status="failed", verification_status="unverified", cdp_available=False)
+        if _dc is not None:
+            try:
+                _dc.clear_task_targets()
+            except Exception:
+                pass
+        _registry.invalidate_sync(bname)
+        _log_browser_action_diag(
+            task_id=_cur_task_id,
+            intent=(getattr(_auth_ctx, "instruction", "") if _auth_ctx else desc),
+            parsed_target=desc,
+            browser_hwnd=int(win.get("hwnd", 0) or 0), browser_pid=int(win.get("pid", 0) or 0),
+            requested_site=site_hint or str(sync.get("site") or ""),
+            verified_site=str(sync.get("site") or ""), active_tab=sync.get("title", ""),
+            action=action, selected_target=desc,
+            selection_method=str(sync.get("source") or "none").upper(),
+            verification_result=ACTION_FAILED, failure_reason="target_element_not_found",
+        )
+        return outcome.failed("browser_control", f"Could not find element {desc!r} in the active {bname} window", action=action, browser=bname, task_id=_cur_task_id, action_state=ACTION_FAILED, execution_status="failed", verification_status="unverified", cdp_available=False)
 
     if action == "focus_search":
         sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=True)
@@ -4392,25 +6666,58 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
 
     if action == "scroll":
         from core import desktop_control as _dc
+        t_scr0 = time.monotonic()
         direction = str(params.get("direction") or "down").lower().strip()
-        notches = max(1, min(15, int(params.get("amount", 4) or 4)))
-        if notches > 20:
-            notches = max(1, min(12, notches // 100))
-        res = screenact.scroll(direction, clicks=notches)
+        if direction not in ("up", "down", "left", "right"):
+            direction = "down"
+        raw_amt = int(params.get("amount", 4) or 4)
+        if raw_amt > 20:
+            notches = max(1, min(12, raw_amt // 100))
+        else:
+            notches = max(1, min(15, raw_amt))
+        res = screenact.scroll(direction, amount=notches)
         _dc.record_diagnostics(last_mouse_status=f"scroll:{direction}:{'ok' if res.ok else 'fail'}")
         if not res.ok:
+            _log_browser_action_diag(
+                browser_hwnd=int(win.get("hwnd", 0) or 0), browser_pid=int(win.get("pid", 0) or 0),
+                requested_site=site_hint or str(win.get("matched_site") or ""),
+                active_tab=str(win.get("title") or ""), action="scroll",
+                selected_target=direction, selection_method="OS_INPUT",
+                verification_result=ACTION_FAILED, failure_reason=str(res.error or "scroll_failed"),
+                elapsed_ms=(time.monotonic() - t_scr0) * 1000.0,
+            )
             return outcome.failed(
                 "browser_control", f"scroll failed in {bname}: {res.error}",
                 action="scroll", browser=bname, target_hwnd=int(win.get("hwnd", 0) or 0),
                 target_pid=int(win.get("pid", 0) or 0),
+                action_state=ACTION_FAILED,
                 dispatch_status="completed", input_status="failed", verification_status="unverified",
             )
         _registry.invalidate_sync(bname)
+        try:
+            from core import screen_observation as _so
+            _so.invalidate_observation_provenance(reason="scroll", hwnd=int(win.get("hwnd", 0) or 0))
+        except Exception:
+            pass
+        try:
+            _dc.clear_task_targets()
+        except Exception:
+            pass
+        _log_browser_action_diag(
+            browser_hwnd=int(win.get("hwnd", 0) or 0), browser_pid=int(win.get("pid", 0) or 0),
+            requested_site=site_hint or str(win.get("matched_site") or ""),
+            verified_site=str(win.get("matched_site") or site_hint or ""),
+            active_tab=str(win.get("title") or ""), action="scroll",
+            selected_target=direction, selection_method="OS_INPUT",
+            verification_result=ACTION_VERIFIED,
+            elapsed_ms=(time.monotonic() - t_scr0) * 1000.0,
+        )
         return outcome.done(
             "browser_control", action="scroll", browser=bname, control_mode="native_windows",
-            cdp_available=False, direction=direction,
+            cdp_available=False, direction=direction, amount=notches,
             target_hwnd=int(win.get("hwnd", 0) or 0), target_pid=int(win.get("pid", 0) or 0),
             foreground_hwnd=int(win.get("hwnd", 0) or 0),
+            action_state=ACTION_VERIFIED,
             dispatch_status="completed", input_status="completed", verification_status="verified",
             verified=True,
         )
@@ -4418,9 +6725,128 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
     if action in ("back", "forward", "reload", "press", "close_tab"):
         keymap = {"back": "alt+left", "forward": "alt+right", "reload": "ctrl+r", "close_tab": "ctrl+w"}
         key = str(params.get("key") or "enter") if action == "press" else keymap[action]
+        is_wa_win = (site_hint == "whatsapp") or ("whatsapp" in (win.get("title", "") + " " + str(params.get("description") or "")).casefold())
+        if action == "press" and key.strip().casefold() in {"enter", "return"} and is_wa_win:
+            from core import desktop_control as _dc
+            from plugins import _whatsapp_core as _wa
+            _auth_ctx = _dc.current_bound_auth_context()
+            pre_sync = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True, site_hint="whatsapp")
+            pre_view = pre_sync.get("view")
+            comp_state = _dc.get_active_composition_state(_auth_ctx) or {}
+            rb_pre = _wa.read_composer(pre_view)
+            sb_pre = _wa.resolve_whatsapp_search_field(pre_view)
+            # Only bypass send confirmation if the WhatsApp SEARCH field explicitly owns focus
+            search_focused = bool(sb_pre.get("found") and sb_pre.get("focus_verified") and rb_pre.get("status") != "has_text")
+            if not search_focused:
+                draft_txt = str(comp_state.get("generated_content") or rb_pre.get("text") or "").strip()
+                expected_c = str(comp_state.get("selected_contact") or _dc.snapshot().get("active_contact") or "").strip()
+                if expected_c == "—":
+                    expected_c = ""
+                dhash = _wa.draft_hash(draft_txt) if draft_txt else str(comp_state.get("generated_content_hash") or "")
+                ok_send, deny_reason, _conf = _dc.is_send_authorized(
+                    receiver=expected_c,
+                    draft_hash=dhash,
+                    composition_task_id=str(comp_state.get("composition_task_id") or ""),
+                    utterance=str(getattr(_auth_ctx, "instruction", "") if _auth_ctx is not None else ""),
+                    auth_context=_auth_ctx,
+                )
+                if not ok_send:
+                    return outcome.failed(
+                        "browser_control",
+                        deny_reason or "Sending a WhatsApp message requires clear confirmation ('Yes, send it').",
+                        action="press", browser=bname, message_sent=False, verified=False,
+                    )
+                if not draft_txt:
+                    return outcome.failed(
+                        "browser_control",
+                        "No verified WhatsApp draft is present to send.",
+                        action="press", browser=bname, message_sent=False, verified=False,
+                    )
+                _dc.transition_message_lifecycle(
+                    _dc.MSG_SEND_ATTEMPTED,
+                    receiver=expected_c, draft_hash=dhash, reason="whatsapp_enter_pressed", auth_context=_auth_ctx,
+                )
+                _dc.record_sent_attempt(receiver=expected_c, draft_hash=dhash, task_id=str(comp_state.get("composition_task_id") or ""))
+                res = screenact.press(key)
+                if not res.ok:
+                    _dc.transition_message_lifecycle(
+                        _dc.MSG_SEND_UNVERIFIED,
+                        receiver=expected_c, draft_hash=dhash, reason=f"enter_failed:{res.error}", auth_context=_auth_ctx,
+                    )
+                    return outcome.failed("browser_control", f"press failed in {bname}: {res.error}", browser=bname, message_sent=False)
+                time.sleep(0.35)
+                _registry.invalidate_sync(bname)
+                after_sync = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True, site_hint="whatsapp")
+                det = _wa.verify_outgoing_message_detailed(
+                    after_sync.get("view"),
+                    draft_txt,
+                    before_view=pre_view,
+                    expected_contact=expected_c,
+                    tab_title=after_sync.get("title", ""),
+                    tab_url=after_sync.get("url", ""),
+                )
+                if det.get("verified"):
+                    _dc.mark_composition_sent(receiver=expected_c, draft_hash=dhash)
+                    return outcome.done(
+                        "browser_control", action="press", key=key, browser=bname,
+                        control_mode="native_windows", cdp_available=False,
+                        lifecycle_state=_dc.MSG_SEND_VERIFIED,
+                        bubble_verified=True,
+                        composer_cleared=bool(det.get("composer_cleared")),
+                        message_sent=True, verified=True,
+                        title=after_sync.get("title", ""),
+                    )
+                _dc.transition_message_lifecycle(
+                    _dc.MSG_SEND_UNVERIFIED,
+                    receiver=expected_c, draft_hash=dhash, reason=str(det.get("reason") or "outgoing_bubble_not_confirmed"), auth_context=_auth_ctx,
+                )
+                return outcome.unverified(
+                    "browser_control",
+                    "I attempted to send the message, but WhatsApp has not confirmed that it was sent.",
+                    action="press", key=key, browser=bname,
+                    control_mode="native_windows", cdp_available=False,
+                    lifecycle_state=_dc.MSG_SEND_UNVERIFIED,
+                    bubble_verified=False,
+                    composer_cleared=bool(det.get("composer_cleared")),
+                    message_sent=False, verified=False,
+                )
         res = screenact.press(key)
         if not res.ok:
             return outcome.failed("browser_control", f"{action} failed in {bname}: {res.error}", browser=bname)
+        if action == "reload":
+            time.sleep(0.35)
+            _registry.invalidate_sync(bname)
+            post_sync = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False, site_hint=site_hint)
+            post_title = str(post_sync.get("title") or win.get("title") or "")
+            post_url = str(post_sync.get("url") or "")
+            ident = verify_site_page_identity(site_hint, url=post_url, title=post_title)
+            if ident.get("page_state") == "error":
+                return outcome.failed(
+                    "browser_control", f"page error after reloading ({post_title})",
+                    action="reload", browser=bname, title=post_title, page_state="error",
+                    foreground_verified=bool(win.get("foreground")),
+                )
+            if ident.get("page_state") == "loading":
+                return outcome.unverified(
+                    "browser_control", "reload triggered, and the page is still loading",
+                    action="reload", browser=bname, title=post_title, page_state="loading",
+                    foreground_verified=bool(win.get("foreground")),
+                    target_matched=bool(ident.get("target_matched")),
+                )
+            if site_hint and not ident.get("verified"):
+                return outcome.unverified(
+                    "browser_control", ident.get("reason") or "reload finished, but target site identity was not verified",
+                    action="reload", browser=bname, title=post_title,
+                    page_state=ident.get("page_state") or "wrong_tab",
+                    foreground_verified=bool(win.get("foreground")), target_matched=False,
+                )
+            return outcome.done(
+                "browser_control", action="reload", browser=bname,
+                control_mode="native_windows", cdp_available=False,
+                title=post_title, page_state=ident.get("page_state") or "loaded",
+                foreground_verified=True, target_matched=bool(not site_hint or ident.get("verified")),
+                verified=True,
+            )
         return outcome.done("browser_control", action=action, browser=bname, control_mode="native_windows", cdp_available=False, title=win.get("title", ""), verified=True)
 
     return _unknown_action(action)
@@ -4428,11 +6854,19 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
 
 def _is_search_bar_query(desc: str) -> bool:
     cf = str(desc or "").strip().casefold()
+    if any(k in cf for k in ("composer", "type a message", "message box", "reply box", "send message")):
+        return False
     return cf in {
         "search", "search bar", "search box", "search field", "searchbox",
         "youtube search", "youtube search bar", "youtube search box",
         "youtube search field", "youtube search input",
-    } or ("search" in cf and any(k in cf for k in ("bar", "box", "field", "input", "youtube")))
+        "whatsapp search", "whatsapp search bar", "whatsapp search box",
+        "whatsapp search field", "whatsapp sidebar search", "sidebar search",
+        "chat list search", "search chats", "search or start", "new chat", "new chat search",
+    } or (
+        "search" in cf
+        and any(k in cf for k in ("bar", "box", "field", "input", "youtube", "whatsapp", "sidebar", "chat"))
+    )
 
 
 def _detect_youtube_masthead_search_box(monitor: dict | None = None) -> dict | None:
@@ -4785,6 +7219,24 @@ def _browser_control_impl(
             nav_url = base + params.get("query", "").replace(" ", "+")
         else:
             nav_url = params.get("url", "").strip()
+            if not nav_url:
+                try:
+                    from core import desktop_control as _dc_nav
+                    _ctx_n = _dc_nav.current_bound_auth_context()
+                    _inst_n = str(getattr(_ctx_n, "instruction", "") or "") if _ctx_n is not None else ""
+                    _toks_n = set(re.findall(r"[a-z0-9]+", _inst_n.casefold()))
+                    _noise = {"open", "launch", "start", "the", "a", "an", "in", "on", "now", "please", "browser", "chrome", "edge", "firefox", "rem"}
+                    _unclear = _toks_n - _noise
+                    if _unclear and not (_toks_n & {"youtube", "whatsapp", "google", "github", "gmail"}):
+                        result = outcome.ask(
+                            "browser_control",
+                            "Which website or application did you mean for me to open, Tarun-kun?",
+                            verified=False,
+                        )
+                        _log(player, result)
+                        return result
+                except Exception:
+                    pass
 
         try:
             result = _open_native(nav_url, browser)
@@ -4803,13 +7255,14 @@ def _browser_control_impl(
         return result
 
     # Native read-only inspection or explicit tab close when no Playwright session is attached yet
+    site_hint = _infer_requested_site(action, params)
     if action in ("get_url", "get_text", "inspect") and not _registry.has(browser):
         bname = select_browser(browser)
         if not _discover_running_cdp_endpoint(bname):
             result = _native_browser_action(action, params, bname, player=player)
             _log(player, result)
             return result
-        tabs = inspect_open_chrome_tabs_local(bname)
+        tabs = inspect_open_chrome_tabs_local(bname, site_hint=site_hint)
         if tabs:
             result = outcome.done(
                 "browser_control", verified=True, browser=bname,
@@ -4934,7 +7387,7 @@ def _browser_control_impl(
         elif action == "get_text":
             result = sess.run(sess.get_text())
         elif action == "get_url":
-            result = sess.run(sess.get_url())
+            result = sess.run(sess.get_url(site_hint))
         elif action == "inspect":
             result = sess.run(sess.inspect_page())
         elif action == "switch_tab":
@@ -4989,7 +7442,17 @@ def _browser_control_impl(
             result = sess.run(sess.forward())
         elif action == "reload":
             result = sess.run(sess.reload())
-        elif action in ("search_contact", "select_contact", "compose_message", "update_draft"):
+        elif action == "search_contact":
+            q = str(params.get("text") or params.get("query") or params.get("description") or "").strip()
+            result = sess.run(sess.search_whatsapp_contact(q))
+            if str(result).startswith(f"status={outcome.UNVERIFIED} "):
+                result = _native_browser_action(action, params, select_browser(browser), player=player)
+        elif action == "select_contact":
+            d = str(params.get("description") or params.get("text") or params.get("query") or "").strip()
+            result = sess.run(sess.select_whatsapp_contact(d))
+            if str(result).startswith(f"status={outcome.UNVERIFIED} "):
+                result = _native_browser_action(action, params, select_browser(browser), player=player)
+        elif action in ("compose_message", "update_draft"):
             result = _native_browser_action(action, params, select_browser(browser), player=player)
         else:
             result = _unknown_action(action)
@@ -5019,6 +7482,12 @@ def _browser_control_impl(
 
 def _needs_visual_fallback(result: object) -> bool:
     text = str(result or "").casefold()
+    if any(k in text for k in (
+        "evidence_status=unknown", "evidence_status=inferred",
+        "cannot reliably read", "whatsapp_search_field_not_found",
+        "no matching chat", "no whatsapp contact", "selected_chat_verified=false",
+    )):
+        return False
     return (
         text.startswith("status=failed")
         or "no matching" in text
@@ -5091,6 +7560,79 @@ def _try_ocr_click_fallback(browser_name: str, target_desc: str) -> str | None:
         return None
 
 
+_opening_inflight_lock = threading.Lock()
+_opening_inflight: dict[tuple[str, str], float] = {}
+
+
+def _mark_opening_inflight(browser_name: str, site: str, active: bool) -> None:
+    if not site:
+        return
+    key = (str(browser_name or "chrome").lower(), str(site).lower())
+    with _opening_inflight_lock:
+        if active:
+            _opening_inflight[key] = time.monotonic()
+        else:
+            _opening_inflight.pop(key, None)
+
+
+def _is_opening_inflight(browser_name: str, site: str, max_age_s: float = 12.0) -> bool:
+    if not site:
+        return False
+    key = (str(browser_name or "chrome").lower(), str(site).lower())
+    now_m = time.monotonic()
+    with _opening_inflight_lock:
+        ts = _opening_inflight.get(key)
+        if ts is None:
+            return False
+        if (now_m - ts) > max_age_s:
+            _opening_inflight.pop(key, None)
+            return False
+        return True
+
+
+def _wait_or_inspect_inflight_open(browser_name: str, site: str, *, url: str = "") -> str:
+    """Wait briefly or inspect an already-in-progress open operation instead of returning a busy failure."""
+    deadline = time.monotonic() + 1.2
+    while _is_opening_inflight(browser_name, site) and time.monotonic() < deadline:
+        time.sleep(0.15)
+    win = _find_browser_window(browser_name, site_hint=site)
+    if win.get("found") and not win.get("site_mismatch"):
+        ident = verify_site_page_identity(site, url="", title=str(win.get("title") or ""))
+        if ident.get("verified"):
+            ok_fg, fg_win, _fg_err = _ensure_browser_foreground(
+                browser_name, win, title_hint=site, site_hint=site,
+            )
+            if ok_fg:
+                return outcome.done(
+                    "browser_control",
+                    opened=url or site,
+                    browser=browser_name,
+                    url=url,
+                    active_tab=fg_win.get("title") or win.get("title", ""),
+                    window_hwnd=fg_win.get("hwnd") or win.get("hwnd", 0),
+                    window_pid=fg_win.get("pid") or win.get("pid", 0),
+                    page_state=ident.get("page_state") or "loaded",
+                    reused_existing=True,
+                    joined_inflight=True,
+                    navigation_completed=True,
+                    target_matched=True,
+                    foreground_verified=True,
+                    navigation_lifecycle=NAV_SUCCESS,
+                    verified=True,
+                )
+    return outcome.unverified(
+        "browser_control",
+        f"{browser_name} is already opening {site}; checked the active window state instead of starting a duplicate launch.",
+        browser=browser_name,
+        url=url,
+        reused_existing=True,
+        joined_inflight=True,
+        target_matched=False,
+        foreground_verified=False,
+        page_state="loading",
+    )
+
+
 def browser_control(parameters: dict = None, response=None, player=None,
                     session_memory=None, _approved_internal: bool = False) -> str:
     params = parameters or {}
@@ -5113,6 +7655,10 @@ def browser_control(parameters: dict = None, response=None, player=None,
                 player.set_desktop_control_status(desktop_control.snapshot())
             return result
     except RuntimeError as exc:
+        if "in progress" in str(exc).casefold() and action in {"go_to", "open", "inspect", "get_url"}:
+            b_sel = select_browser(params.get("browser"))
+            s_hint = _infer_requested_site(action, params)
+            return _wait_or_inspect_inflight_open(b_sel, s_hint or "whatsapp", url=str(params.get("url") or ""))
         return str(exc)
 
 

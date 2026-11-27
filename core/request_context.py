@@ -22,6 +22,7 @@ class RequestContext:
     parent_instruction: str = ""
     root_task_id: str = ""
     spoken_inputs: tuple[str, ...] = ()
+    cancel_gen: int = -1
 
     @classmethod
     def create(cls, instruction: str, source: str, *, now: float | None = None,
@@ -33,6 +34,13 @@ class RequestContext:
         lifetime = REQUEST_CONTEXT_TTL if ttl is None else max(0.0, float(ttl))
         tid = str(task_id or "").strip() or uuid.uuid4().hex
         cleaned_hist = tuple(str(s).strip() for s in (spoken_inputs or ()) if str(s or "").strip())
+        cgen = -1
+        if now is None:
+            try:
+                from core import task_control as _tc
+                cgen = int(_tc.cancel_generation())
+            except Exception:
+                cgen = -1
         return cls(
             tid,
             str(instruction or "").strip(),
@@ -45,6 +53,7 @@ class RequestContext:
             str(parent_instruction or "").strip(),
             str(root_task_id or tid).strip(),
             cleaned_hist,
+            cgen,
         )
 
     def age(self, *, now: float | None = None) -> float:

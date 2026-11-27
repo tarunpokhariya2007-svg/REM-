@@ -72,6 +72,7 @@ from typing import Any
 DONE = "done"
 UNVERIFIED = "unverified"
 FAILED = "failed"
+TIMEOUT = "timeout"
 ASK = "ask"
 STARTED = "started"
 
@@ -131,6 +132,13 @@ def failed(action: str, reason: str, /, **facts: Any) -> str:
         "the reason. Do not claim any part of it succeeded."
     )
 
+
+def timed_out(action: str, reason: str, /, **facts: Any) -> str:
+    """The operation exceeded its deadline before completing or verifying."""
+    return _line(TIMEOUT, action, {**facts, "reason": reason}) + (
+        " -- Timed out before verification completed. Do not claim it succeeded; "
+        "tell the user it timed out and why."
+    )
 
 def started(action: str, /, **facts: Any) -> str:
     """It is under way on a background thread, and the result will follow.
@@ -271,4 +279,4 @@ def is_problem(result: str) -> bool:
     """
     text = str(result or "")
     return text.startswith((f"status={FAILED} ", f"status={UNVERIFIED} ",
-                            f"status={ASK} "))
+                            f"status={TIMEOUT} ", f"status={ASK} "))

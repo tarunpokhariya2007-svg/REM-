@@ -79,14 +79,19 @@ def tool_result_guidance(result: object) -> str:
     text = str(result or "")
     match = _STATUS.match(text)
     status = match.group(1).casefold() if match else "unknown"
-    if status == "done" and ("verified=false" in text.casefold() or "selected_chat_verified=false" in text.casefold()):
+    text_cf = text.casefold()
+    if status == "done" and ("verified=false" in text_cf or "selected_chat_verified=false" in text_cf):
         status = "unverified"
+    if "evidence_status=unknown" in text_cf or "evidence_status=inferred" in text_cf:
+        status = "unverified"
+    playback_unverified = "playback_verified=false" in text_cf
+    unknown_title = "evidence_status=unknown" in text_cf or "cannot reliably read" in text_cf
     rules = {
         "done": (
             "The tool says the result was verified. Give one short, warm confirmation "
             "of only that verified result in fluent natural English (or Hindi if the user spoke Hindi) "
             "— for example, 'I clicked the video, Tarun-kun.' "
-            "Include the actual video title when opening a video. Never claim failure, never say protocols prohibit routine clicks, and never mention internal mechanisms."),
+            "Include the actual video title when opening a video (never guess or alter it). Never claim failure, never say protocols prohibit routine clicks, and never mention internal mechanisms."),
         "unverified": (
             "The physical action or result is not confirmed. Say honestly what happened and that you "
             "could not confirm the final state — for example, 'I sent the click, Tarun-kun, but I couldn't confirm that the video opened.' "
@@ -107,4 +112,15 @@ def tool_result_guidance(result: object) -> str:
             "verification. Speak naturally and briefly in fluent English (or Hindi if the user spoke Hindi); "
             "omit internal automation details, and do not ask the user to perform or verify an action REM can check."),
     }
-    return "[REM response guidance] " + rules[status]
+    extra = ""
+    if unknown_title:
+        extra = (
+            " The video title was NOT reliably verified: say you can see the video cards "
+            "but cannot reliably read the requested video's title, and never guess or invent a title."
+        )
+    elif playback_unverified and status in ("done", "unverified"):
+        extra = (
+            " Video playback is not confirmed (`playback_verified=false`): do NOT say 'I'm playing it' "
+            "or claim playback started; state honestly whether the card opened."
+        )
+    return "[REM response guidance] " + rules[status] + extra
