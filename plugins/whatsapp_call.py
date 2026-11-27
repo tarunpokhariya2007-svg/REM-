@@ -47,11 +47,11 @@ def _is_voice_authorized_call(contact: str, video: bool) -> tuple[bool, str]:
         )
         if not ok:
             return False, ""
-        combined = " ".join([
-            str(getattr(ctx, "instruction", "") or ""),
-            str(getattr(ctx, "parent_instruction", "") or ""),
-        ]).casefold()
-        if not any(w in combined for w in ("call", "ring", "dial", "voice", "phone", "video")):
+        # Kind of call comes from the PERSON'S words, not from the model's `video` flag:
+        # "call Rio" must not become a video call because the model guessed video=True.
+        from core import task_control
+        kind = task_control.call_kind(str(getattr(ctx, "instruction", "") or ""))
+        if not kind or (kind == "video") != bool(video):
             return False, ""
         return True, str(getattr(ctx, "task_id", "") or "")
     except Exception:
@@ -150,7 +150,8 @@ def _execute_verified_call(contact: str, video: bool, player=None) -> str:
 
     time.sleep(0.55)
     after_call = screenview.look(budget_s=1.5, allow_ocr=True)
-    c_state = verify_call_started(after_call, contact=str(hdr.get("active_contact") or contact))
+    c_state = verify_call_started(after_call, contact=str(hdr.get("active_contact") or contact),
+                                  video=video, before_view=fresh)
     set_active_chat(contact_name=str(hdr.get("active_contact") or contact), verified=True)
     if c_state.get("started"):
         desktop_control.record_diagnostics(
@@ -181,7 +182,9 @@ def _execute_verified_call(contact: str, video: bool, player=None) -> str:
     )
     return outcome.unverified(
         "whatsapp_call",
-        f"I clicked {btn['label']!r}, but WhatsApp did not confirm that the {kind_label} interface started.",
+        (f"I clicked {btn['label']!r}, but a {c_state.get('kind')} call screen appeared instead of a {kind_label}."
+         if c_state.get("state") == "wrong_kind" else
+         f"I clicked {btn['label']!r}, but WhatsApp did not confirm that the {kind_label} interface started."),
         action="request_call",
         contact=str(hdr.get("active_contact") or contact),
         call_type=btn["kind"],

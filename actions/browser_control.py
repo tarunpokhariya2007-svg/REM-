@@ -1313,7 +1313,7 @@ class _BrowserSession:
         if self._page is None or self._page.is_closed():
             try:
                 live = [p for p in (getattr(self._context, "pages", ()) or ()) if not p.is_closed()]
-                self._page = live[-1] if live else await self._context.new_page()
+                self._page = (await self._foreground_page(live)) if live else await self._context.new_page()
             except Exception as exc:
                 # Stale/closed BrowserContext (e.g. browser closed manually or CDP restarted):
                 # drop handles cleanly and recover the session once instead of failing new_page.
@@ -1324,6 +1324,61 @@ class _BrowserSession:
                     self._page = await self._context.new_page()
             await asyncio.sleep(0.15)
         return self._page
+
+    @staticmethod
+    async def _foreground_page(pages):
+        """The tab the person is looking at (visible), else the last one. The old code
+        always took the LAST tab, which is whatever opened most recently."""
+        for p in reversed(list(pages)):
+            try:
+                if await p.evaluate("document.visibilityState === 'visible'") is True:
+                    return p
+            except Exception:
+                continue
+        return list(pages)[-1]
+
+    async def _youtube_page(self):
+        """The YouTube tab player controls must act on, or None.
+
+        Prefers a /watch tab, then a visible one. Never returns a non-YouTube tab,
+        so a key meant for the player cannot land in WhatsApp or the address bar.
+        """
+        def _is_yt(page) -> bool:
+            try:
+                h = (urlsplit(page.url).hostname or "").casefold()
+            except Exception:
+                return False
+            return h == "youtu.be" or h == "youtube.com" or h.endswith(".youtube.com")
+
+        if getattr(self, "_context", None) is None:
+            page = await self._get_page()          # launches/attaches when needed
+            if getattr(self, "_context", None) is None:
+                return page if _is_yt(page) else None
+        pages = [p for p in (getattr(self._context, "pages", ()) or ()) if not p.is_closed()]
+        cands = []
+        for p in pages:
+            try:
+                u = urlsplit(p.url)
+            except Exception:
+                continue
+            host = (u.hostname or "").casefold()
+            if host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com"):
+                try:
+                    vis = (await p.evaluate("document.visibilityState === 'visible'")) is True
+                except Exception:
+                    vis = False
+                cands.append((u.path == "/watch", vis, p is self._page, p))
+        if not cands:
+            return None
+        cands.sort(key=lambda c: (c[0], c[1], c[2]), reverse=True)
+        chosen = cands[0][3]
+        if chosen is not self._page:
+            self._page = chosen
+            try:
+                await chosen.bring_to_front()
+            except Exception:
+                pass
+        return chosen
 
     async def _page_visible_for_action(self, page) -> bool:
         """Refuse input to a hidden/background page whose actions are not observable."""
@@ -1774,7 +1829,12 @@ class _BrowserSession:
 
     async def _verify_youtube_playback(self, page, video_id: str, title: str,
                                        channel: str = "", position: int | None = None) -> str:
-        """Open check + HTML5 <video> playback verification on /watch."""
+        """Open check + REAL player-state verification on /watch.
+
+        ``done`` is returned only when the scoped YouTube player reports the
+        expected video actually playing (not paused, not loading, not an advert).
+        """
+        from core import media_state as _ms
         try:
             await page.wait_for_url(
                 re.compile(r"https?://(?:www\.)?youtube\.com/watch\?.*\bv=" + re.escape(video_id) + r"(?:&|$)"),
@@ -1790,63 +1850,28 @@ class _BrowserSession:
                 f"clicked video {title!r}, but resulting URL ({page.url}) did not match video {video_id}",
                 browser=self.browser_name, video_id=video_id, url=page.url, playback_verified=False,
             )
+        judge = lambda s: _ms.judge_playing(s, expected_id=video_id, expected_title=title)
+        verdict, st = await _ms.wait_until(page, judge, timeout=6.0)
+        if verdict.status == "paused":
+            # Autoplay was blocked: ask the player once, then look again.
+            await _ms.act(page, "play")
+            verdict, st = await _ms.wait_until(page, judge, timeout=3.0)
         ord_label = _INDEX_TO_ORDINAL.get((position or 1) - 1, f"#{position or 1}")
-        summary = f"Opened and verified the {ord_label} YouTube video: {title!r}."
-        if not hasattr(page, "evaluate"):
+        common = dict(action="play_video", browser=getattr(self, "browser_name", "chrome"),
+                      position=position, channel=channel, url=page.url, **_ms.facts(st))
+        common["video_id"] = video_id
+        common["title"] = title or common.get("title", "")
+        if verdict.ok:
             return outcome.done(
-                "browser_control",
-                action="play_video",
-                browser=getattr(self, "browser_name", "chrome"),
-                position=position,
-                title=title,
-                channel=channel,
-                video_id=video_id,
-                url=page.url,
-                detail=summary,
-                verified=True,
-            )
-        state = {}
-        for attempt in range(4):
-            try:
-                state = await page.evaluate(
-                    "() => { const v = document.querySelector('video'); "
-                    "if (!v) return {exists:false}; "
-                    "return {exists:true, paused:!!v.paused, currentTime:Number(v.currentTime||0), "
-                    "readyState:Number(v.readyState||0), duration:Number(v.duration||0)}; }"
-                )
-            except Exception:
-                state = {}
-            if state.get("exists") and not state.get("paused") and state.get("readyState", 0) >= 2:
-                break
-            if attempt == 1 and state.get("exists") and state.get("paused"):
-                try:
-                    await page.evaluate("() => { const v = document.querySelector('video'); if (v && v.paused) v.play(); }")
-                except Exception:
-                    pass
-            await asyncio.sleep(0.25)
-        playing = bool(state.get("exists") and not state.get("paused") and state.get("readyState", 0) >= 2)
-        if not state.get("exists"):
-            return outcome.unverified(
-                "browser_control",
-                f"opened video {title!r}, but HTML5 video player did not initialize yet",
-                browser=getattr(self, "browser_name", "chrome"), action="play_video", video_id=video_id,
-                title=title, channel=channel, position=position, url=page.url, playback_verified=False,
-            )
-        return outcome.done(
+                "browser_control", playback_verified=True, verified=True,
+                detail=f"Opened and verified the {ord_label} YouTube video: {title!r}, and it is playing.",
+                **common)
+        if verdict.status in {"consent", "unavailable", "wrong_video", "no_player"}:
+            return outcome.failed("browser_control", verdict.reason, playback_verified=False, **common)
+        return outcome.unverified(
             "browser_control",
-            action="play_video",
-            browser=getattr(self, "browser_name", "chrome"),
-            position=position,
-            title=title,
-            channel=channel,
-            video_id=video_id,
-            url=page.url,
-            player_state=("playing" if playing else "paused"),
-            current_time=round(float(state.get("currentTime") or 0.0), 2),
-            playback_verified=playing,
-            detail=summary,
-            verified=True,
-        )
+            f"opened video {title!r}, but playback is not confirmed: {verdict.reason}",
+            playback_verified=False, blocked_by=verdict.status, **common)
 
     async def _click_youtube_video_ordinal(self, page, ordinal: int | str, before: tuple | str = ()) -> str:
         """Select a real visible non-ad YouTube video by 0-based ordinal index or word (e.g. 'second')."""
@@ -1905,79 +1930,157 @@ class _BrowserSession:
         except Exception as exc:
             return outcome.failed("browser_control", f"YouTube title selection failed: {type(exc).__name__}: {exc}")
 
+    async def _player_precheck(self, action: str):
+        """Return (page, state, failure_string_or_None) for a player control."""
+        from core import media_state as _ms
+        page = await self._youtube_page()
+        if page is None:
+            return None, _ms.PlayerState(), outcome.failed(
+                "browser_control", "no YouTube tab is open, so no player key or command was sent",
+                action=action, browser=self.browser_name, blocked_by="no_youtube_tab")
+        st = await _ms.read_state(page)
+        blocked = _ms.judge_page(st)
+        if blocked:
+            fn = outcome.failed if blocked.status in {"consent", "no_player", "unavailable"} else outcome.unverified
+            return page, st, fn("browser_control", blocked.reason, action=action,
+                                browser=self.browser_name, url=page.url, blocked_by=blocked.status)
+        return page, st, None
+
     async def pause_video(self) -> str:
-        page = await self._get_page()
+        from core import media_state as _ms
         try:
-            state = await page.evaluate(
-                "() => { const v = document.querySelector('video'); if (!v) return {exists:false}; "
-                "if (!v.paused) v.pause(); "
-                "return {exists:true, paused:!!v.paused, currentTime:Number(v.currentTime||0)}; }"
-            )
-            if not state or not state.get("exists"):
-                return outcome.failed("browser_control", "no active video player was found on this page", url=page.url)
-            paused = bool(state.get("paused"))
-            return outcome.done(
-                "browser_control", action="pause_video", browser=self.browser_name,
-                playback_state=("paused" if paused else "playing"),
-                current_time=round(float(state.get("currentTime") or 0.0), 2),
-                url=page.url, verified=paused,
-            )
+            page, st, fail = await self._player_precheck("pause_video")
+            if fail:
+                return fail
+            if not st.paused:
+                await _ms.act(page, "pause")
+            verdict, st = await _ms.wait_until(page, _ms.judge_paused, timeout=2.0)
+            if verdict.ok:
+                return outcome.done("browser_control", action="pause_video", browser=self.browser_name,
+                                    playback_state="paused", verified=True, url=page.url, **_ms.facts(st))
+            return outcome.unverified("browser_control", verdict.reason, action="pause_video",
+                                      browser=self.browser_name, url=page.url, verified=False)
         except Exception as exc:
             return outcome.failed("browser_control", f"pause failed: {type(exc).__name__}: {exc}")
 
     async def resume_video(self) -> str:
-        page = await self._get_page()
+        from core import media_state as _ms
         try:
-            state = await page.evaluate(
-                "async () => { const v = document.querySelector('video'); if (!v) return {exists:false}; "
-                "if (v.paused) { try { await v.play(); } catch (e) {} } "
-                "return {exists:true, paused:!!v.paused, currentTime:Number(v.currentTime||0)}; }"
-            )
-            if not state or not state.get("exists"):
-                return outcome.failed("browser_control", "no active video player was found on this page", url=page.url)
-            playing = not bool(state.get("paused"))
-            return outcome.done(
-                "browser_control", action="resume_video", browser=self.browser_name,
-                playback_state=("playing" if playing else "paused"),
-                current_time=round(float(state.get("currentTime") or 0.0), 2),
-                url=page.url, verified=playing,
-            )
+            page, st, fail = await self._player_precheck("resume_video")
+            if fail:
+                return fail
+            if st.paused:
+                await _ms.act(page, "play")
+            verdict, st = await _ms.wait_until(page, _ms.judge_playing, timeout=3.0)
+            if verdict.ok:
+                return outcome.done("browser_control", action="resume_video", browser=self.browser_name,
+                                    playback_state="playing", verified=True, url=page.url, **_ms.facts(st))
+            return outcome.unverified("browser_control", verdict.reason, action="resume_video",
+                                      browser=self.browser_name, url=page.url, verified=False)
         except Exception as exc:
             return outcome.failed("browser_control", f"resume failed: {type(exc).__name__}: {exc}")
 
     async def seek_video(self, seconds: float = 10.0) -> str:
-        page = await self._get_page()
+        from core import media_state as _ms
         try:
             delta = float(seconds)
-            state = await page.evaluate(
-                """(delta) => {
-                    const v = document.querySelector('video');
-                    if (!v) return {exists: false};
-                    const before = Number(v.currentTime || 0);
-                    const dur = Number(v.duration || 0);
-                    const target = Math.max(0, dur > 0 ? Math.min(dur, before + delta) : before + delta);
-                    v.currentTime = target;
-                    const after = Number(v.currentTime || target);
-                    return {exists: true, before, after, paused: !!v.paused};
-                }""",
-                delta,
-            )
-            if not state or not state.get("exists"):
-                return outcome.failed("browser_control", "no active video player was found on this page", url=page.url)
-            before_t = round(float(state.get("before") or 0.0), 2)
-            after_t = round(float(state.get("after") or 0.0), 2)
-            moved = (after_t > before_t) if delta >= 0 else (after_t < before_t)
             act_name = "seek_forward" if delta >= 0 else "seek_backward"
-            return outcome.done(
-                "browser_control", action=act_name, browser=self.browser_name,
-                dispatch_status="completed", input_status="completed",
-                verification_status=("verified" if moved else "unverified"),
-                seconds=round(abs(delta), 2), playback_before=before_t, playback_after=after_t,
-                url=page.url, verified=moved,
-                detail=f"Skipped {'forward' if delta >= 0 else 'backward'} {abs(round(delta))} seconds, Tarun-kun.",
-            )
+            page, before, fail = await self._player_precheck(act_name)
+            if fail:
+                return fail
+            t0 = time.monotonic()
+            res = await _ms.act(page, "seek_by", delta)
+            if not res.get("ok"):
+                return outcome.unverified("browser_control", f"the player refused the seek ({res.get('blocked')})",
+                                          action=act_name, browser=self.browser_name, url=page.url)
+            verdict, after = await _ms.wait_until(
+                page, lambda s: _ms.judge_seek(before, s, delta, elapsed=time.monotonic() - t0), timeout=2.5)
+            facts = dict(seconds=round(abs(delta), 2), playback_before=round(before.current_time, 1),
+                         playback_after=round(after.current_time, 1), url=page.url)
+            if verdict.ok:
+                return outcome.done("browser_control", action=act_name, browser=self.browser_name,
+                                    verification_status="verified", verified=True, **facts)
+            return outcome.unverified("browser_control", verdict.reason, action=act_name,
+                                      browser=self.browser_name, verified=False, **facts)
         except Exception as exc:
             return outcome.failed("browser_control", f"seek failed: {type(exc).__name__}: {exc}")
+
+    async def set_volume(self, percent: float) -> str:
+        """Set the YouTube PLAYER volume (not the Windows master volume)."""
+        from core import media_state as _ms
+        try:
+            target = max(0.0, min(100.0, float(percent)))
+            page, st, fail = await self._player_precheck("set_volume")
+            if fail:
+                return fail
+            await _ms.act(page, "set_volume", target)
+            verdict, st = await _ms.wait_until(page, lambda s: _ms.judge_volume(s, target), timeout=1.5)
+            if verdict.ok:
+                return outcome.done("browser_control", action="set_volume", browser=self.browser_name,
+                                    verified=True, target_volume=round(target), url=page.url, **_ms.facts(st))
+            return outcome.unverified("browser_control", verdict.reason, action="set_volume",
+                                      browser=self.browser_name, verified=False, url=page.url)
+        except Exception as exc:
+            return outcome.failed("browser_control", f"set volume failed: {type(exc).__name__}: {exc}")
+
+    async def volume_step(self, delta: float) -> str:
+        from core import media_state as _ms
+        page, st, fail = await self._player_precheck("volume_up" if delta >= 0 else "volume_down")
+        if fail:
+            return fail
+        if st.volume is None:
+            return outcome.unverified("browser_control", "the player did not report its volume",
+                                      action="volume_step", browser=self.browser_name)
+        return await self.set_volume(st.volume + delta)
+
+    async def set_muted(self, muted: bool) -> str:
+        """Idempotent mute/unmute: reads state, acts only if needed, verifies."""
+        from core import media_state as _ms
+        name = "mute" if muted else "unmute"
+        try:
+            page, st, fail = await self._player_precheck(name)
+            if fail:
+                return fail
+            if st.muted is not muted:
+                await _ms.act(page, name)
+            verdict, st = await _ms.wait_until(page, lambda s: _ms.judge_muted(s, muted), timeout=1.5)
+            if verdict.ok:
+                return outcome.done("browser_control", action=name, browser=self.browser_name,
+                                    verified=True, url=page.url, **_ms.facts(st))
+            return outcome.unverified("browser_control", verdict.reason, action=name,
+                                      browser=self.browser_name, verified=False)
+        except Exception as exc:
+            return outcome.failed("browser_control", f"{name} failed: {type(exc).__name__}: {exc}")
+
+    async def set_fullscreen(self, want: bool) -> str:
+        """Enter/exit fullscreen with a REAL key event after verifying player focus."""
+        from core import media_state as _ms
+        name = "fullscreen" if want else "exit_fullscreen"
+        try:
+            page, st, fail = await self._player_precheck(name)
+            if fail and want:
+                return fail
+            if st.fullscreen == want:
+                return outcome.done("browser_control", action=name, browser=self.browser_name,
+                                    verified=True, already=True, url=page.url, **_ms.facts(st))
+            if want:
+                foc = await _ms.act(page, "focus")
+                if not foc.get("focused"):
+                    return outcome.failed("browser_control",
+                                          "the player could not be focused, so no key was sent",
+                                          action=name, browser=self.browser_name)
+                await page.keyboard.press("f")
+            else:
+                await page.keyboard.press("Escape")
+            verdict, st = await _ms.wait_until(
+                page, lambda s: _ms.judge_fullscreen(s, want), timeout=2.0)
+            if verdict.ok:
+                return outcome.done("browser_control", action=name, browser=self.browser_name,
+                                    verified=True, url=page.url, **_ms.facts(st))
+            return outcome.unverified("browser_control", verdict.reason, action=name,
+                                      browser=self.browser_name, verified=False)
+        except Exception as exc:
+            return outcome.failed("browser_control", f"{name} failed: {type(exc).__name__}: {exc}")
 
     async def focus_search_cdp(self) -> str:
         page = await self._get_page()
@@ -2024,22 +2127,21 @@ class _BrowserSession:
                 return res + " replayed=true"
             return res
 
-        page = await self._get_page()
+        from core import media_state as _ms
         try:
-            state = await page.evaluate(
-                "async () => { const v = document.querySelector('video'); if (!v) return {exists:false}; "
-                "v.currentTime = 0; try { await v.play(); } catch (e) {} "
-                "return {exists:true, paused:!!v.paused, currentTime:Number(v.currentTime||0)}; }"
-            )
-            if not state or not state.get("exists"):
-                return outcome.failed("browser_control", "no active video player was found to replay", url=page.url)
-            playing = not bool(state.get("paused"))
-            return outcome.done(
-                "browser_control", action="replay_video", browser=self.browser_name,
-                replayed=True, playback_state=("playing" if playing else "paused"),
-                current_time=round(float(state.get("currentTime") or 0.0), 2),
-                url=page.url, verified=playing,
-            )
+            page, st, fail = await self._player_precheck("replay_video")
+            if fail:
+                return fail
+            await _ms.act(page, "seek_to", 0)
+            await _ms.act(page, "play")
+            verdict, st = await _ms.wait_until(
+                page, lambda s: _ms.judge_playing(s) if s.current_time < 8 else _ms.Verdict(False, "unchanged", "did not restart"),
+                timeout=3.0)
+            if verdict.ok:
+                return outcome.done("browser_control", action="replay_video", browser=self.browser_name,
+                                    replayed=True, verified=True, url=page.url, **_ms.facts(st))
+            return outcome.unverified("browser_control", verdict.reason, action="replay_video",
+                                      browser=self.browser_name, verified=False, url=page.url)
         except Exception as exc:
             return outcome.failed("browser_control", f"replay failed: {type(exc).__name__}: {exc}")
 
@@ -2199,6 +2301,11 @@ class _BrowserSession:
             try:
                 loc = page.locator('#main footer div[contenteditable="true"], div[contenteditable="true"][data-tab="10"], footer [role="textbox"]').first
                 await loc.click(timeout=5_000)
+                pre = await _wa.dom_locate_whatsapp_composer(page)
+                if not pre.get("focus_verified"):
+                    # Ctrl+A / Backspace anywhere else would act on the wrong control.
+                    return outcome.failed("browser_control", "the WhatsApp message box did not take keyboard focus; no keys were sent",
+                                          action="clear_field", verified=False)
                 await page.keyboard.press("Control+A")
                 await page.keyboard.press("Backspace")
                 await page.keyboard.press("Delete")
@@ -2966,6 +3073,62 @@ def _ensure_browser_foreground(bname: str, win: dict, title_hint: str = "") -> t
     return False, refreshed, f"I couldn't complete that action because {bname} did not become the foreground window ({act.error or focus_res.get('reason') or 'foreground lock'})."
 
 
+# --- native (no-DOM) YouTube control state, read from the player's own buttons ---------
+# YouTube labels its transport buttons with their NEXT action: "Pause (k)" while
+# playing, "Play (k)" while paused, "Mute (m)" / "Unmute (m)", "Full screen (f)" /
+# "Exit full screen (f)". Reading those labels through UI Automation lets the
+# native path stay idempotent and verifiable instead of blindly toggling.
+_YT_BUTTON_RULES = {
+    "playback": ((re.compile(r"^pause\b.*\(k\)", re.I), "playing"), (re.compile(r"^play\b.*\(k\)", re.I), "paused")),
+    "mute": ((re.compile(r"^mute\b.*\(m\)", re.I), "unmuted"), (re.compile(r"^unmute\b.*\(m\)", re.I), "muted")),
+    "fullscreen": ((re.compile(r"^full ?screen\b.*\(f\)", re.I), "windowed"), (re.compile(r"^exit full ?screen\b.*\(f\)", re.I), "fullscreen")),
+}
+
+
+def _yt_native_state(view, kind: str) -> str | None:
+    """'playing'|'paused'|'muted'|... from visible player buttons; None if unreadable."""
+    for el in (getattr(view, "elements", ()) or ()):
+        label = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or "").split())
+        if not label:
+            continue
+        for rx, state in _YT_BUTTON_RULES.get(kind, ()):
+            if rx.search(label):
+                return state
+    return None
+
+
+def _native_toggle_with_verification(bname: str, kind: str, want: str, key: str, action: str, win: dict) -> str:
+    """Press a YouTube toggle key only if needed, then verify via the button label."""
+    from core import desktop_control as _dc
+    before = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False).get("view")
+    cur = _yt_native_state(before, kind)
+    if cur == want:
+        return outcome.done("browser_control", action=action, browser=bname, control_mode="native_windows",
+                            already=True, verified=True, verification_status="verified")
+    if cur is None:
+        return outcome.unverified(
+            "browser_control",
+            "the player's state is not readable without DOM access, so I did not press a toggle key blindly",
+            action=action, browser=bname, control_mode="native_windows", verified=False)
+    for el in (getattr(before, "elements", ()) or ()):
+        if getattr(el, "focused", False) and str(getattr(el, "role", "") or "").casefold() in {"edit", "combobox", "searchbox"}:
+            return outcome.unverified(
+                "browser_control", "a text field has keyboard focus, so the player key was not sent",
+                action=action, browser=bname, control_mode="native_windows", verified=False)
+    r = screenact.press(key)
+    _dc.record_diagnostics(last_media_status=f"{action}:{'ok' if r.ok else 'fail'}")
+    if not r.ok:
+        return outcome.failed("browser_control", f"{action} failed in {bname}: {r.error}", action=action, browser=bname)
+    time.sleep(0.3)
+    after = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False).get("view")
+    if _yt_native_state(after, kind) == want:
+        return outcome.done("browser_control", action=action, browser=bname, control_mode="native_windows",
+                            verified=True, verification_status="verified")
+    return outcome.unverified("browser_control", "the key was sent but the player state did not visibly change",
+                              action=action, browser=bname, control_mode="native_windows", verified=False)
+
+
+
 def _extract_yt_time_seconds(view) -> float | None:
     """Read visible player timestamp (e.g. '1:24 / 12:10' or '1:24') from UIA/OCR if exposed."""
     if view is None:
@@ -3528,8 +3691,9 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             time.sleep(0.12)
             _registry.invalidate_sync(bname)
             after_v = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=True)
-            rb_ok, rb_val = _wa.composer_text_value(after_v.get("view"))
-            empty = rb_ok and not rb_val.strip()
+            rb = _wa.read_composer(after_v.get("view"))
+            rb_ok, rb_val = rb["status"] in {"empty", "has_text"}, rb["text"]
+            empty = rb["status"] == "empty"      # unreadable is NOT empty
             _dc.set_active_composition_state(
                 composition_requested=True,
                 selected_contact=str(_dc.snapshot().get("active_contact") or ""),
@@ -3553,10 +3717,12 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
                 )
             return outcome.unverified(
                 "browser_control",
-                "I tried to clear the message box, but I couldn't confirm it is completely empty.",
+                ("I cleared the message box, but I cannot read it back to confirm it is empty."
+                 if rb["status"] == "unreadable" else
+                 "I tried to clear the message box, but text is still in it."),
                 action="clear_field", browser=bname,
-                composer_found=True, composer_empty=False, verification_status="unverified",
-                verified=False, **cdiag,
+                composer_found=True, composer_empty=False, readback=rb["status"],
+                verification_status="unverified", verified=False, **cdiag,
             )
         # Non-WhatsApp generic visible field clear
         target_el = None
@@ -3570,9 +3736,29 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             return outcome.failed("browser_control", f"no editable field matching {desc or 'input'!r} was found to clear", action="clear_field", browser=bname)
         pt = screenact.Point.from_element(target_el)
         mv, clk, cdiag = _click_diag("click", pt)
+        if not clk.ok:
+            return outcome.failed("browser_control", f"focusing the field failed: {clk.error}",
+                                  action="clear_field", browser=bname, **cdiag)
         screenact.press("ctrl+a")
         screenact.press("backspace")
-        return outcome.done("browser_control", action="clear_field", browser=bname, composer_empty=True, verified=clk.ok, **cdiag)
+        time.sleep(0.12)
+        _registry.invalidate_sync(bname)
+        after_f = _inspect_visible_browser_window(bname, focus_if_needed=False, allow_ocr=False).get("view")
+        same = None
+        for el in (getattr(after_f, "elements", ()) or ()):
+            if str(getattr(el, "role", "") or "").casefold() in {"edit", "combobox", "searchbox"} and \
+                    abs(int(getattr(el, "top", 0)) - int(getattr(target_el, "top", 0))) < 6 and \
+                    abs(int(getattr(el, "left", 0)) - int(getattr(target_el, "left", 0))) < 6:
+                same = el
+                break
+        readable = same is not None and getattr(same, "value_read_only", None) is not None
+        if readable and not str(getattr(same, "value", "") or "").strip():
+            return outcome.done("browser_control", action="clear_field", browser=bname, composer_empty=True,
+                                verified=True, verification_status="verified", **cdiag)
+        return outcome.unverified(
+            "browser_control",
+            ("the field still contains text" if readable else "the field was cleared but its content cannot be read back"),
+            action="clear_field", browser=bname, composer_empty=False, verified=False, **cdiag)
 
     if action in ("smart_type", "type"):
         text_val = str(params.get("text") or "")
@@ -4165,32 +4351,34 @@ def _native_browser_action(action: str, params: dict, browser_name: str, player=
             seconds=secs, playback_before=before_pos, playback_after=after_pos, verified=False,
         )
 
-    if action in ("volume_up", "volume_down", "mute", "unmute"):
+    if action in ("mute", "unmute"):
+        return _native_toggle_with_verification(bname, "mute", "muted" if action == "mute" else "unmuted", "m", action, win)
+
+    if action in ("fullscreen", "exit_fullscreen"):
+        return _native_toggle_with_verification(
+            bname, "fullscreen", "fullscreen" if action == "fullscreen" else "windowed",
+            "f" if action == "fullscreen" else "escape", action, win)
+
+    if action in ("volume_up", "volume_down"):
         from core import desktop_control as _dc
-        key = {"volume_up": "up", "volume_down": "down", "mute": "m", "unmute": "m"}[action]
-        r_v = screenact.press(key)
+        r_v = screenact.press("up" if action == "volume_up" else "down")
         _dc.record_diagnostics(last_media_status=f"{action}:{'ok' if r_v.ok else 'fail'}")
         if not r_v.ok:
             return outcome.failed("browser_control", f"{action} failed in {bname}: {r_v.error}", action=action, browser=bname)
         return outcome.unverified(
-            "browser_control", f"Sent {action} key to active {bname} window.",
+            "browser_control", f"Sent {action} key; the level cannot be read without DOM access.",
             action=action, browser=bname, control_mode="native_windows",
-            dispatch_status="completed", input_status="completed", verification_status="unverified",
-        )
+            dispatch_status="completed", input_status="completed", verification_status="unverified")
+
+    if action == "set_volume":
+        return outcome.failed(
+            "browser_control",
+            "setting an exact player volume needs DOM access; start the browser with remote debugging enabled",
+            action=action, browser=bname, control_mode="native_windows")
 
     if action in ("pause_video", "resume_video"):
-        from core import desktop_control as _dc
-        k_res = screenact.press("k")
-        _dc.record_diagnostics(last_media_status=f"{action}:{'ok' if k_res.ok else 'fail'}")
-        if not k_res.ok:
-            return outcome.failed("browser_control", f"media toggle failed in {bname}: {k_res.error}", browser=bname)
-        return outcome.done(
-            "browser_control", action=action, browser=bname,
-            control_mode="native_windows", cdp_available=False,
-            dispatch_status="completed", input_status="completed",
-            verification_status="unverified", playback_verified=False, verified=False,
-            detail=("Done, Tarun-kun. Sent play toggle to resume playback." if action == "resume_video" else "Sent play/pause key 'k' to pause the video."),
-        )
+        return _native_toggle_with_verification(
+            bname, "playback", "paused" if action == "pause_video" else "playing", "k", action, win)
 
     if action == "screenshot":
         sync = _inspect_visible_browser_window(bname, focus_if_needed=True, allow_ocr=False)
@@ -4465,7 +4653,7 @@ _ACTIONS = (
     "click", "left_click", "right_click", "double_click", "smart_click", "type", "smart_type", "fill_form", "press",
     "pause_video", "resume_video", "play_video", "replay_video",
     "seek_forward", "seek_backward", "set_playback_position",
-    "volume_up", "volume_down", "mute", "unmute",
+    "volume_up", "volume_down", "mute", "unmute", "set_volume", "fullscreen", "exit_fullscreen",
     "scroll", "get_text", "get_url", "screenshot",
     "back", "forward", "reload",
     "switch", "list_browsers", "close", "close_all",
@@ -4760,7 +4948,7 @@ def _browser_control_impl(
         elif action == "resume_video":
             result = sess.run(sess.resume_video())
         elif action in ("seek_forward", "seek_backward", "set_playback_position"):
-            raw_v = params.get("seconds") or params.get("value") or params.get("position") or 10
+            raw_v = params.get("seconds") or params.get("value") or params.get("position") or params.get("amount") or 10
             try:
                 sec_v = float(raw_v)
             except (TypeError, ValueError):
@@ -4770,9 +4958,18 @@ def _browser_control_impl(
             elif action == "seek_forward":
                 sec_v = abs(sec_v)
             result = sess.run(sess.seek_video(sec_v))
-        elif action in ("volume_up", "volume_down", "mute", "unmute"):
-            key_map = {"volume_up": "ArrowUp", "volume_down": "ArrowDown", "mute": "m", "unmute": "m"}
-            result = sess.run(sess.press(key_map[action]))
+        elif action in ("volume_up", "volume_down"):
+            step = 10.0 if action == "volume_up" else -10.0
+            result = sess.run(sess.volume_step(step))
+        elif action in ("mute", "unmute"):
+            result = sess.run(sess.set_muted(action == "mute"))
+        elif action == "set_volume":
+            raw_pct = params.get("value") or params.get("percent") or params.get("amount") or params.get("text") or ""
+            m_pct = re.search(r"\d+(?:\.\d+)?", str(raw_pct))
+            result = (sess.run(sess.set_volume(float(m_pct.group(0)))) if m_pct else
+                      outcome.failed("browser_control", "no volume percentage was given", action="set_volume"))
+        elif action in ("fullscreen", "exit_fullscreen"):
+            result = sess.run(sess.set_fullscreen(action == "fullscreen"))
         elif action == "play_video":
             desc = params.get("description") or params.get("text") or "first video"
             result = sess.run(sess.smart_click(desc))
@@ -4976,7 +5173,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | left_click | type | smart_type | clear_field | scroll | fill_form | smart_click | search_contact | select_contact | compose_message | update_draft | pause_video | resume_video | play_video | replay_video | get_text | get_url | inspect | press | new_tab | switch_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | click | left_click | type | smart_type | clear_field | scroll | fill_form | smart_click | search_contact | select_contact | compose_message | update_draft | pause_video | resume_video | play_video | replay_video | next_video | seek_forward | seek_backward | volume_up | volume_down | set_volume | mute | unmute | fullscreen | exit_fullscreen | get_text | get_url | inspect | press | new_tab | switch_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
             },
             "browser": {
                 "type": "STRING",

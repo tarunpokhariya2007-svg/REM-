@@ -1402,15 +1402,36 @@ class MainWindow(QMainWindow):
             stp.body.addWidget(row)
         lay.addWidget(stp)
 
-        # Explicitly visible screen/control state with an emergency stop that
-        # remains available while a worker is performing a computer action.
-        self._computer_panel = HoloPanel("COMPUTER USE", "ON-DEMAND")
+        # Computer-use panel: split the dense content into two compact pages.
+        # Keep the original widget instances/references so all existing update
+        # methods and signal connections continue to work.
+        self._computer_panel = HoloPanel("COMPUTER USE", "1 / 2")
         self._computer_rows = {}
-        for label in ("SCREEN", "AUTHORIZATION", "CLOUD VISION", "UI AUTOMATION", "OCR", "BROWSER", "MEMORY",
-                      "ACTIVE APP", "ACTION", "LAST ACTION", "INPUT", "VERIFICATION"):
+        computer_labels = (
+            "SCREEN", "AUTHORIZATION", "CLOUD VISION", "UI AUTOMATION", "OCR", "BROWSER",
+            "MEMORY", "ACTIVE APP", "ACTION", "LAST ACTION", "INPUT", "VERIFICATION",
+        )
+        for label in computer_labels:
             row = DataRow(label, "OFF" if label == "SCREEN" else "—")
             self._computer_rows[label] = row
-            self._computer_panel.body.addWidget(row)
+
+        self._computer_pages = QStackedWidget()
+        self._computer_pages.setObjectName("computerUsePages")
+        self._computer_pages.setMinimumHeight(126)
+
+        # PAGE 1 — frequently checked live status.
+        page1 = QWidget()
+        page1_layout = QVBoxLayout(page1)
+        page1_layout.setContentsMargins(0, 0, 0, 0)
+        page1_layout.setSpacing(2)
+        for label in computer_labels[:6]:
+            page1_layout.addWidget(self._computer_rows[label])
+
+        from memory.config_manager import (
+            get_persistent_desktop_observation_enabled, get_cloud_screen_vision_enabled,
+            get_local_screen_observation_enabled, get_desktop_observation_exclusions,
+            get_local_autonomy_mode,
+        )
         self._desktop_mode = QComboBox()
         self._desktop_mode.addItems(["ON-DEMAND", "LIVE ASSIST", "COMPUTER CONTROL"])
         self._desktop_mode.setToolTip(
@@ -1420,14 +1441,10 @@ class MainWindow(QMainWindow):
         self._desktop_mode.setFont(px_font(9, QFont.Weight.DemiBold))
         self._desktop_mode.setStyleSheet(
             f"QComboBox {{ color: {C.TEXT}; background: {C.PANEL}; "
-            f"border: 1px solid {C.BORDER}; padding: 4px; }}")
+            f"border: 1px solid {C.BORDER}; padding: 3px; }}")
         self._desktop_mode.currentTextChanged.connect(self._on_desktop_mode_changed)
-        self._computer_panel.body.addWidget(self._desktop_mode)
-        from memory.config_manager import (
-            get_persistent_desktop_observation_enabled, get_cloud_screen_vision_enabled,
-            get_local_screen_observation_enabled, get_desktop_observation_exclusions,
-            get_local_autonomy_mode,
-        )
+        page1_layout.addWidget(self._desktop_mode)
+
         self._local_autonomy_combo = QComboBox()
         self._local_autonomy_combo.addItems(["AUTONOMY: TRUSTED", "AUTONOMY: STANDARD"])
         self._local_autonomy_combo.setToolTip(
@@ -1436,17 +1453,28 @@ class MainWindow(QMainWindow):
         self._local_autonomy_combo.setFont(px_font(9, QFont.Weight.DemiBold))
         self._local_autonomy_combo.setStyleSheet(
             f"QComboBox {{ color: {C.TEXT}; background: {C.PANEL}; "
-            f"border: 1px solid {C.BORDER}; padding: 4px; }}")
+            f"border: 1px solid {C.BORDER}; padding: 3px; }}")
         self._local_autonomy_combo.setCurrentIndex(0 if get_local_autonomy_mode() == "trusted" else 1)
         self._local_autonomy_combo.currentIndexChanged.connect(self._on_local_autonomy_changed)
-        self._computer_panel.body.addWidget(self._local_autonomy_combo)
+        page1_layout.addWidget(self._local_autonomy_combo)
+        page1_layout.addStretch(1)
+        self._computer_pages.addWidget(page1)
+
+        # PAGE 2 — remaining status, settings, safety controls and diagnostics.
+        page2_content = QWidget()
+        page2_layout = QVBoxLayout(page2_content)
+        page2_layout.setContentsMargins(0, 0, 2, 0)
+        page2_layout.setSpacing(3)
+        for label in computer_labels[6:]:
+            page2_layout.addWidget(self._computer_rows[label])
+
         self._local_screen_obs = QCheckBox("LOCAL SCREEN OBSERVATION")
         self._local_screen_obs.setToolTip(
             "Persistent permission for on-request local screen capture, UIA, and OCR. "
             "Screenshots stay on this device and are never uploaded to cloud models.")
         self._local_screen_obs.setChecked(get_local_screen_observation_enabled())
         self._local_screen_obs.toggled.connect(self._on_local_screen_observation_toggled)
-        self._computer_panel.body.addWidget(self._local_screen_obs)
+        page2_layout.addWidget(self._local_screen_obs)
 
         self._persistent_observation = QCheckBox("PERSISTENT LOCAL UIA OBSERVATION")
         self._persistent_observation.setToolTip(
@@ -1454,25 +1482,28 @@ class MainWindow(QMainWindow):
             "This does not capture or upload screenshots.")
         self._persistent_observation.setChecked(get_persistent_desktop_observation_enabled())
         self._persistent_observation.toggled.connect(self._on_persistent_observation_toggled)
-        self._computer_panel.body.addWidget(self._persistent_observation)
+        page2_layout.addWidget(self._persistent_observation)
+
         self._cloud_screen_vision = QCheckBox("CLOUD IMAGE SHARING")
         self._cloud_screen_vision.setToolTip(
             "Separate permission for sending screen images to the selected cloud model. "
             "Local screen observation works without this.")
         self._cloud_screen_vision.setChecked(get_cloud_screen_vision_enabled())
         self._cloud_screen_vision.toggled.connect(self._on_cloud_screen_vision_toggled)
-        self._computer_panel.body.addWidget(self._cloud_screen_vision)
+        page2_layout.addWidget(self._cloud_screen_vision)
+
         self._observation_exclusions = QLineEdit(", ".join(get_desktop_observation_exclusions()))
         self._observation_exclusions.setPlaceholderText("Excluded app/window names (comma separated)")
         self._observation_exclusions.setToolTip(
             "Excluded names are matched locally against the foreground process and title. "
             "Windows sign-in, credential, lock, and consent surfaces are excluded automatically.")
         self._observation_exclusions.editingFinished.connect(self._save_observation_exclusions)
-        self._computer_panel.body.addWidget(self._observation_exclusions)
+        page2_layout.addWidget(self._observation_exclusions)
+
         control_buttons = QHBoxLayout()
-        control_buttons.setSpacing(4)
+        control_buttons.setSpacing(3)
         self._desktop_pause = QPushButton("PAUSE")
-        self._revoke_screen_btn = QPushButton("REVOKE SCREEN ACCESS")
+        self._revoke_screen_btn = QPushButton("REVOKE ACCESS")
         self._desktop_stop = QPushButton("EMERGENCY STOP")
         for button in (self._desktop_pause, self._revoke_screen_btn, self._desktop_stop):
             button.setFont(px_font(8, QFont.Weight.Bold))
@@ -1482,10 +1513,10 @@ class MainWindow(QMainWindow):
         self._desktop_pause.clicked.connect(self._toggle_desktop_pause)
         self._revoke_screen_btn.clicked.connect(self._revoke_screen_access)
         self._desktop_stop.clicked.connect(self._emergency_stop_desktop)
-        self._computer_panel.body.addLayout(control_buttons)
+        page2_layout.addLayout(control_buttons)
 
         self._autonomous_row = DataRow("AUTONOMOUS", "DISABLED")
-        self._computer_panel.body.addWidget(self._autonomous_row)
+        page2_layout.addWidget(self._autonomous_row)
 
         self._diag_rows = {}
         for d_label in (
@@ -1501,9 +1532,10 @@ class MainWindow(QMainWindow):
         ):
             d_row = DataRow(d_label, "—")
             self._diag_rows[d_label] = d_row
-            self._computer_panel.body.addWidget(d_row)
+            page2_layout.addWidget(d_row)
+
         auto_buttons = QHBoxLayout()
-        auto_buttons.setSpacing(4)
+        auto_buttons.setSpacing(3)
         self._autonomous_toggle = QPushButton("AUTONOMOUS: OFF")
         self._autonomous_revoke = QPushButton("REVOKE TRUST")
         for button in (self._autonomous_toggle, self._autonomous_revoke):
@@ -1514,8 +1546,54 @@ class MainWindow(QMainWindow):
         self._autonomous_revoke.setEnabled(False)
         self._autonomous_toggle.clicked.connect(self._toggle_autonomous_mode)
         self._autonomous_revoke.clicked.connect(self._revoke_autonomous_session)
-        self._computer_panel.body.addLayout(auto_buttons)
+        page2_layout.addLayout(auto_buttons)
 
+        page2_scroll = QScrollArea()
+        page2_scroll.setWidgetResizable(True)
+        page2_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        page2_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        page2_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        page2_scroll.setStyleSheet("QScrollArea { background: transparent; border: 0; }")
+        page2_scroll.setWidget(page2_content)
+        self._computer_pages.addWidget(page2_scroll)
+        self._computer_panel.body.addWidget(self._computer_pages, 1)
+
+        # Compact pager stays visible on both pages.
+        pager = QHBoxLayout()
+        pager.setContentsMargins(0, 2, 0, 0)
+        pager.setSpacing(6)
+        self._computer_prev = QPushButton("‹")
+        self._computer_page_label = QLabel("1 / 2")
+        self._computer_next = QPushButton("›")
+        for button in (self._computer_prev, self._computer_next):
+            button.setFixedSize(24, 20)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setFont(px_font(13, QFont.Weight.Bold))
+            button.setStyleSheet(
+                f"QPushButton {{ color: {C.PRI}; background: transparent; "
+                f"border: 1px solid {C.BORDER}; padding: 0px; }} "
+                f"QPushButton:disabled {{ color: {C.TEXT_DIM}; border-color: {C.PANEL}; }}")
+        self._computer_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._computer_page_label.setFont(px_font(8, QFont.Weight.DemiBold, mono=True))
+        self._computer_page_label.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        pager.addStretch(1)
+        pager.addWidget(self._computer_prev)
+        pager.addWidget(self._computer_page_label)
+        pager.addWidget(self._computer_next)
+        pager.addStretch(1)
+        self._computer_panel.body.addLayout(pager)
+
+        def _set_computer_page(index: int) -> None:
+            index = max(0, min(1, int(index)))
+            self._computer_pages.setCurrentIndex(index)
+            self._computer_panel.set_code(f"{index + 1} / 2")
+            self._computer_page_label.setText(f"{index + 1} / 2")
+            self._computer_prev.setEnabled(index > 0)
+            self._computer_next.setEnabled(index < 1)
+
+        self._computer_prev.clicked.connect(lambda: _set_computer_page(0))
+        self._computer_next.clicked.connect(lambda: _set_computer_page(1))
+        _set_computer_page(0)
         lay.addWidget(self._computer_panel)
 
         # Background tasks (core/tasks). Read from the engine every two seconds —
@@ -1554,7 +1632,6 @@ class MainWindow(QMainWindow):
         # Routines (core/routines) share the panel, switched from its header: the
         # column has no room for another panel, and both lists answer the same
         # question — what is the assistant doing without being asked.
-        from PyQt6.QtWidgets import QStackedWidget
         r_box = QWidget()
         r_box.setStyleSheet("background: transparent;")
         r_lay = QVBoxLayout(r_box)

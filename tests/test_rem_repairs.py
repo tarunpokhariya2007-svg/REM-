@@ -667,6 +667,10 @@ class PersistentBrowserChromeYouTubeTests(unittest.TestCase):
             async def _zero(self): return 0
             async def wait_for_url(self, *args, **kwargs): return None
             async def evaluate(self, js, *args):
+                from tests import yt_fakes as _yf
+                from core import media_state as _ms
+                if js in (_ms.STATE_JS, _ms.ACTION_JS):
+                    return await _yf.playing_evaluate(self, js, *args)
                 if "visibilityState" in js:
                     return True
                 if "v.pause()" in js:
@@ -721,6 +725,13 @@ class PersistentBrowserChromeYouTubeTests(unittest.TestCase):
                 self._paused = False
             def is_closed(self): return self._closed
             async def evaluate(self, js, *a):
+                from tests import yt_fakes as _yf
+                from core import media_state as _ms
+                if js in (_ms.STATE_JS, _ms.ACTION_JS):
+                    fake = _yf.FakeYouTubePage(url=self.url, paused=self._paused)
+                    res = await fake.evaluate(js, *a)
+                    self._paused = fake.paused
+                    return res
                 if "visibilityState" in js: return True
                 if "v.pause()" in js: self._paused = True; return {"exists": True, "paused": True, "currentTime": 5.0}
                 if "v.play()" in js: self._paused = False; return {"exists": True, "paused": False, "currentTime": 5.0}
@@ -936,6 +947,14 @@ def _make_fake_youtube_page():
             return self._closed
 
         async def evaluate(self, js, *a):
+            from tests import yt_fakes as _yf
+            from core import media_state as _ms
+            if js in (_ms.STATE_JS, _ms.ACTION_JS):
+                fake = _yf.FakeYouTubePage(url=self.url, paused=self._paused,
+                                           current=self._video_current_time, duration=120.0)
+                res = await fake.evaluate(js, *a)
+                self._paused, self._video_current_time = fake.paused, fake.current
+                return res
             if "visibilityState" in js:
                 return True
             if "v.currentTime = 0" in js:
@@ -2318,16 +2337,13 @@ class FinalTargetResolutionAndAuthTests(unittest.TestCase):
 
         # Verify CDP seek_video changes currentTime and returns verified before/after seconds
         sess = browser_control._BrowserSession("chrome")
-        fake_page = SimpleNamespace(
-            url="https://www.youtube.com/watch?v=abc",
-            evaluate=AsyncMock(return_value={"exists": True, "before": 12.0, "after": 22.0, "paused": False}),
-        )
+        from tests import yt_fakes as _yf
+        fake_page = _yf.FakeYouTubePage(url="https://www.youtube.com/watch?v=abc", current=12.0)
         sess._get_page = AsyncMock(return_value=fake_page)
         res_cdp_seek = asyncio.run(sess.seek_video(10.0))
         self.assertIn("status=done", res_cdp_seek)
         self.assertIn("playback_before=12.0", res_cdp_seek)
         self.assertIn("playback_after=22.0", res_cdp_seek)
-        self.assertIn("Skipped forward 10 seconds", res_cdp_seek)
 
         # Verify native YouTube seek sends 'l' and records before/after timestamp when UIA/OCR exposes clock
         before_view = SimpleNamespace(

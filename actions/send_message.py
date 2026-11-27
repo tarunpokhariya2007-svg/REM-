@@ -350,11 +350,11 @@ def _is_voice_authorized_send(receiver: str, platform: str) -> tuple[bool, str]:
         )
         if not ok:
             return False, ""
-        combined = " ".join([
-            str(getattr(ctx, "instruction", "") or ""),
-            str(getattr(ctx, "parent_instruction", "") or ""),
-        ]).casefold()
-        if not any(w in combined for w in ("send", "deliver", "bhejo", "bhej")):
+        # The send instruction must be in the CURRENT utterance, as a whole, non-negated
+        # word. Earlier turns (parent_instruction) used to count, so "don't send it" or a
+        # cancelled "send hello to Rio" could authorize a later send.
+        from core import task_control
+        if not task_control.has_send_command(str(getattr(ctx, "instruction", "") or "")):
             return False, ""
         return True, str(getattr(ctx, "task_id", "") or "")
     except Exception:

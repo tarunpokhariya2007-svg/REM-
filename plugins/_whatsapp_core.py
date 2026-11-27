@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 import threading
 import time
 from typing import Any
@@ -68,6 +69,45 @@ _ACTIVE_CHAT: dict[str, Any] = {
     "task_id": None,
     "observed_at": None,
 }
+
+
+_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2060\ufeff]")
+_CONTROL_NAME_WORDS = frozenset({"message", "compose", "composer", "box", "field", "input", "type", "write",
+                                 "text", "edit", "textbox", "bar", "here"})
+_PLACEHOLDERS = frozenset({"type a message", "type a message (ocr)", "message composer",
+                           "write a message", "type here", "message"})
+
+
+def normalize_composer_text(text: Any) -> str:
+    """Draft text as a person would see it: no zero-width/NBSP, no stray blank
+    lines, and a placeholder ("Type a message") is NOT content."""
+    t = _INVISIBLE_RE.sub("", str(text or "").replace("\u00a0", " "))
+    t = "\n".join(line.rstrip() for line in t.replace("\r", "").split("\n")).strip()
+    return "" if t.casefold() in _PLACEHOLDERS else t
+
+
+def _name_words(text: str) -> list[str]:
+    """Accent-insensitive, case-insensitive WORDS (``fold`` joins them, which is
+    right for equality but useless for whole-word comparison)."""
+    t = unicodedata.normalize("NFKD", str(text or "")).casefold()
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    return re.findall(r"[^\W_]+", t)
+
+
+def contact_match(expected: str, candidate: str) -> str:
+    """'exact' | 'partial' | 'none' for a requested name against a visible name.
+
+    Whole-word comparison only: "Rio" matches "Rio" (exact) and "Rio Sharma"
+    (partial, every requested word is present) but NEVER "Mario", "Riordan" or
+    the shorter header "Ri". The old bidirectional substring test accepted all
+    of those, so a message for Rio could be typed into Mario's chat.
+    """
+    e, c = _name_words(expected), _name_words(candidate)
+    if not e or not c:
+        return "none"
+    if e == c:
+        return "exact"
+    return "partial" if set(e) <= set(c) else "none"
 
 
 def is_valid_contact_label(name: str) -> bool:
@@ -550,24 +590,76 @@ def locate_whatsapp_composer(view, *, active_chat: dict | None = None) -> dict:
     return base_not_found
 
 
-def composer_text_value(view) -> tuple[bool, str]:
-    """Read current text inside the active WhatsApp composer; returns `(readback_supported, value)`."""
+def read_composer(view) -> dict:
+    """What is in the composer? status: empty | has_text | unreadable | not_found.
+
+    ``unreadable`` is a first-class answer. A UIA/OCR composer that does not
+    expose its value used to be reported as EMPTY, which made "clear the draft"
+    and "message sent" succeed without evidence. Emptiness now needs positive
+    evidence: a readable value of "", or the placeholder being displayed.
+    """
     comp = locate_whatsapp_composer(view)
     if not comp.get("composer_found") or comp.get("element") is None:
-        return False, ""
+        return {"status": "not_found", "text": "", "composer": comp}
     el = comp["element"]
-    val = str(getattr(el, "value", "") or "")
-    label = str(getattr(el, "name", "") or getattr(el, "label", "") or "")
-    # Placeholder label ("Type a message") does not count as typed user text
+    raw_val = str(getattr(el, "value", "") or "")
+    label = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or "").split())
+    patterns = {str(p).casefold() for p in (getattr(el, "patterns", ()) or ())}
+    value_exposed = (getattr(el, "value_read_only", None) is not None) or ("value" in patterns) \
+        or (comp.get("source") == "dom")
+    val = normalize_composer_text(raw_val)
     if val:
-        if val.strip().casefold() == "type a message":
-            return True, ""
-        return True, val
-    if comp.get("source") == "uia":
-        return True, ""
-    if label and label.strip().casefold() not in {"type a message", "type a message (ocr)", "message composer"}:
-        return False, label
-    return True, ""
+        return {"status": "has_text", "text": val, "composer": comp}
+    if label.casefold() in _PLACEHOLDERS:
+        # Placeholder on display => nothing typed (WhatsApp hides it once text exists).
+        return {"status": "empty", "text": "", "composer": comp}
+    if value_exposed and not raw_val.strip():
+        return {"status": "empty", "text": "", "composer": comp}
+    if label and comp.get("source") != "dom" and not (set(_name_words(label)) & _CONTROL_NAME_WORDS):
+        # Some builds expose the draft AS the accessible name. A generic control name
+        # ("Compose box", "Message field") is not a draft, so it never counts.
+        return {"status": "has_text", "text": normalize_composer_text(label), "composer": comp}
+    band = _composer_band_text(view, comp)
+    if band:
+        return {"status": "has_text", "text": band, "composer": comp}
+    return {"status": "unreadable", "text": "", "composer": comp}
+
+
+def _composer_band_text(view, comp: dict) -> str:
+    """Text drawn INSIDE the composer's own row (UIA text children / OCR lines).
+
+    Only elements vertically within the composer row and right of the chat-list
+    divider count, so message bubbles above it and the search box beside it do not.
+    """
+    cy, cx = int(comp.get("y", 0) or 0), int(comp.get("x", 0) or 0)
+    if not cy:
+        return ""
+    w_left, _t, w_w, _h = _window_geometry(view)
+    left_floor = w_left + int(w_w * 0.27)
+    parts = []
+    for el in getattr(view, "elements", ()) or ():
+        if el is comp.get("element"):
+            continue
+        top = int(getattr(el, "top", 0) or 0)
+        height = int(getattr(el, "height", 0) or 0)
+        left = int(getattr(el, "left", 0) or 0)
+        ecy = top + height // 2
+        if abs(ecy - cy) > 28 or left < left_floor:
+            continue
+        txt = normalize_composer_text(getattr(el, "value", "") or getattr(el, "name", "") or "")
+        low = txt.casefold()
+        if not txt or low in _WA_CHROME_NOISE or low in _PLACEHOLDERS or len(txt) < 1:
+            continue
+        parts.append((left, txt))
+    return normalize_composer_text(" ".join(t for _l, t in sorted(parts)))
+
+
+def composer_text_value(view) -> tuple[bool, str]:
+    """Backward-compatible `(readback_supported, value)`; unreadable => (False, "")."""
+    r = read_composer(view)
+    if r["status"] in {"empty", "has_text"}:
+        return True, r["text"]
+    return False, ""
 
 
 def verify_whatsapp_active_chat(
@@ -637,24 +729,28 @@ def verify_whatsapp_active_chat(
     matched = ""
     if exp_fold:
         for cand in header_candidates:
-            if exp_fold in fold(cand) or fold(cand) in exp_fold:
+            if contact_match(expected_contact, cand) != "none":
                 matched = cand
                 break
-        if not matched and not is_web and exp_fold in fold(title_s) and fold(title_s) != "whatsapp":
+        if not matched and not is_web and contact_match(expected_contact, title_s) != "none" and fold(title_s) != "whatsapp":
             matched = expected_contact
     elif header_candidates:
         matched = header_candidates[0]
 
     comp = locate_whatsapp_composer(view, active_chat={"platform": platform_name, "chat_id": (f"chat:{fold(matched)}" if matched else "")})
     has_composer = bool(comp.get("composer_found"))
-    verified = bool(matched and (has_composer or (bool(exp_fold) and header_candidates)))
+    # A conversation is only "verified" with its composer in view: a header
+    # alone can belong to a stale pane or a profile/info drawer.
+    verified = bool(matched and has_composer)
     chat_id = ("chat:" + fold(matched)) if matched else ""
     src = str(getattr(view, "source", "uia") or "uia")
     conf = 0.92 if (verified and has_composer) else (0.72 if verified else 0.2)
 
     reason = ""
     if not verified:
-        if expected_contact and header_candidates:
+        if matched and not has_composer:
+            reason = f"the {matched!r} header is visible but the message box is not"
+        elif expected_contact and header_candidates:
             reason = f"active chat header is {header_candidates[0]!r}, not {expected_contact!r}"
         elif expected_contact:
             reason = f"conversation header for {expected_contact!r} was not visible in the right pane"
@@ -688,7 +784,7 @@ def verify_whatsapp_active_chat(
             confidence=conf,
             observation_id=obs_id,
         )
-    elif expected_contact and header_candidates and fold(header_candidates[0]) != exp_fold:
+    elif expected_contact and header_candidates and contact_match(expected_contact, header_candidates[0]) == "none":
         # User switched to a different open conversation — do not keep stale contact identity!
         set_active_chat(
             platform=platform_name,
@@ -751,41 +847,86 @@ def locate_whatsapp_call_button(view, *, video: bool = False) -> dict | None:
     return None
 
 
-def verify_call_started(view, *, contact: str = "") -> dict:
-    """Verify actual WhatsApp call-session UI markers after clicking call control."""
-    if view is None:
-        return {"started": False, "state": "no_view", "contact_matched": False}
-    texts = []
+# Markers that exist ONLY once a call session is on screen. The idle chat header
+# also contains controls called "Voice call", "Video call" and menu items such as
+# "Mute notifications"; matching those (as the old check did) reported a call as
+# started while nothing had been dialled.
+_CALL_SESSION_MARKERS = ("end call", "hang up", "calling", "ringing", "connecting", "reconnecting",
+                         "end-to-end encrypted call", "leave call")
+_VIDEO_CALL_MARKERS = ("turn off camera", "turn on camera", "stop video", "start video", "camera off", "camera on")
+
+
+def _view_texts(view) -> list[str]:
+    out = []
     for el in getattr(view, "elements", ()) or ():
         t = " ".join(str(getattr(el, "name", "") or getattr(el, "label", "") or getattr(el, "value", "") or "").split())
         if t:
-            texts.append(t.casefold())
-    joined = " | ".join(texts) + " | " + str(getattr(view, "title", "") or "").casefold()
-    markers = ("calling", "ringing", "end call", "hang up", "voice call", "encrypted voice", "connecting", "mute")
-    started = any(m in joined for m in markers)
-    contact_matched = fold(contact) in fold(joined) if contact else True
-    state = "active_or_ringing" if started else "not_detected"
-    return {"started": bool(started and (contact_matched or not contact)), "state": state, "contact_matched": contact_matched}
+            out.append(t.casefold())
+    return out
 
 
-def verify_outgoing_message(after_view, draft: str) -> bool:
-    """Confirm outgoing delivery either via message bubble visibility or cleared composer."""
+def verify_call_started(view, *, contact: str = "", video: bool = False, before_view=None) -> dict:
+    """Verify an actual call session, of the right KIND, with the right PERSON.
+
+    Evidence must be NEW relative to ``before_view`` (the idle chat) so controls
+    that were already there cannot count. Voice and video are told apart by the
+    in-call camera controls, and a call of the wrong kind is reported as such.
+    """
+    if view is None:
+        return {"started": False, "state": "no_view", "contact_matched": False, "kind": "unknown"}
+    texts = _view_texts(view)
+    before = set(_view_texts(before_view)) if before_view is not None else set()
+    title = str(getattr(view, "title", "") or "").casefold()
+    fresh = [t for t in texts if t not in before]
+    session_hits = [t for t in fresh if any(m in t for m in _CALL_SESSION_MARKERS)]
+    kind = "video" if any(m in t for t in fresh for m in _VIDEO_CALL_MARKERS) else "voice"
+    if not session_hits:
+        return {"started": False, "state": "not_detected", "contact_matched": False, "kind": "unknown"}
+    joined = " | ".join(texts) + " | " + title
+    contact_matched = (not contact) or any(contact_match(contact, t) != "none" for t in texts + [title])
+    kind_ok = (kind == ("video" if video else "voice"))
+    state = "active_or_ringing" if (contact_matched and kind_ok) else ("wrong_kind" if contact_matched else "wrong_contact")
+    return {"started": bool(contact_matched and kind_ok), "state": state,
+            "contact_matched": bool(contact_matched), "kind": kind}
+
+
+def _bubble_count(view, snippet: str) -> int:
+    n = 0
+    comp = locate_whatsapp_composer(view)
+    comp_y = int(comp.get("y", 0) or 0) if comp.get("composer_found") else 0
+    for el in getattr(view, "elements", ()) or ():
+        role = str(getattr(el, "role", "") or "").casefold()
+        if role in {"edit", "combobox", "searchbox", "textbox"}:
+            continue
+        if comp_y and (int(getattr(el, "top", 0) or 0) + int(getattr(el, "height", 0) or 0) // 2) >= comp_y - 20:
+            continue    # the composer row is not a sent bubble
+        txt = fold(str(getattr(el, "value", "") or getattr(el, "name", "") or ""))
+        if snippet and snippet in txt:
+            n += 1
+    return n
+
+
+def verify_outgoing_message(after_view, draft: str, before_view=None) -> bool:
+    """True only with POSITIVE evidence the message left the composer.
+
+    Required: a message bubble containing the draft that was not there before
+    (count increased), AND the composer is not still holding that draft. An
+    unreadable composer is never evidence of "sent".
+    """
     if after_view is None:
         return False
-    elements = list(getattr(after_view, "elements", ()) or ())
-    comp = locate_whatsapp_composer(after_view)
-    draft_cf = str(draft or "").strip().casefold()
-    snippet = draft_cf[:24] if draft_cf else ""
-    for el in elements:
-        role = str(getattr(el, "role", "") or "").casefold()
-        txt = str(getattr(el, "value", "") or getattr(el, "name", "") or "").strip().casefold()
-        if snippet and snippet in txt and role not in {"edit", "combobox", "searchbox"}:
-            return True
-    if comp.get("composer_found") and comp.get("element") is not None:
-        comp_val = str(getattr(comp["element"], "value", "") or "").strip().casefold()
-        if snippet and snippet not in comp_val and len(comp_val) == 0:
-            return True
-    return False
+    snippet = fold(normalize_composer_text(draft))[:40]
+    if not snippet:
+        return False
+    after_n = _bubble_count(after_view, snippet)
+    before_n = _bubble_count(before_view, snippet) if before_view is not None else 0
+    state = read_composer(after_view)
+    still_in_composer = state["status"] == "has_text" and snippet in fold(state["text"])
+    # The draft sitting in the composer is not a bubble; read_composer's own
+    # element is excluded by role, but OCR may surface it as plain text.
+    if still_in_composer:
+        return False
+    return after_n > before_n
 
 
 def generate_autonomous_draft(
@@ -961,8 +1102,19 @@ async def dom_verify_active_chat(page, expected_contact: str = "") -> dict:
     header = str((info or {}).get("header") or "").strip()
     has_comp = bool((info or {}).get("composer"))
     exp_fold = fold(expected_contact) if expected_contact else ""
-    matched = header if (header and is_valid_contact_label(header) and (not exp_fold or exp_fold in fold(header) or fold(header) in exp_fold)) else ""
+    matched = header if (header and is_valid_contact_label(header) and (not exp_fold or contact_match(expected_contact, header) != "none")) else ""
     verified = bool(matched and has_comp)
+    if not verified:
+        if not (info or {}).get("found"):
+            reason = "WhatsApp Web has no open conversation pane"
+        elif header and exp_fold and not matched:
+            reason = f"active chat header is {header!r}, not {expected_contact!r}"
+        elif matched and not has_comp:
+            reason = "the message box is not visible"
+        else:
+            reason = "no active conversation header was found"
+    else:
+        reason = ""
     chat_id = f"chat:{fold(matched)}" if matched else ""
     if verified:
         set_active_chat(
@@ -978,8 +1130,9 @@ async def dom_verify_active_chat(page, expected_contact: str = "") -> dict:
         "chat_url": str((info or {}).get("url") or ""),
         "platform": "whatsapp_web",
         "application": "chrome",
-        "has_composer": has_composer if False else has_comp,
-        "composer_text": str((info or {}).get("text") or ""),
+        "has_composer": has_comp,
+        "composer_text": normalize_composer_text((info or {}).get("text") or ""),
+        "reason": reason,
         "source": "dom",
         "confidence": (0.98 if verified else 0.15),
     }
@@ -1024,7 +1177,7 @@ async def dom_locate_whatsapp_composer(page) -> dict:
         "focus_verified": bool(meta.get("focused")),
         "observation_id": "dom",
         "confidence": "high",
-        "composer_text": str(meta.get("text") or ""),
+        "composer_text": normalize_composer_text(meta.get("text") or ""),
         "rect": tuple(meta.get("rect") or (0, 0, 0, 0)),
         "source": "dom",
     }
@@ -1045,8 +1198,9 @@ class WhatsAppDriver:
         return None, f"More than one possible {what} was found; no action was taken."
 
     def send_message_to(self, receiver: str, message: str, *, task_id: str = "") -> tuple[bool, str]:
-        from core import appidentity, desktop_control, screenact, screenview
+        from core import appidentity, desktop_control, screenact, screenview, task_control
 
+        gen = task_control.cancel_generation()
         receiver, message = str(receiver or "").strip(), str(message or "")
         if not receiver or not message:
             return False, "recipient and message are required"
@@ -1101,6 +1255,13 @@ class WhatsAppDriver:
             if not hdr.get("verified"):
                 return False, "active chat title does not match the requested contact; nothing was typed"
 
+        return self._type_and_submit(view, receiver, message, task_id, gen, dhash)
+
+    def _type_and_submit(self, view, receiver: str, message: str, task_id: str, gen: int, dhash: str) -> tuple[bool, str]:
+        """Type into the verified chat, read the draft back, submit, verify the bubble."""
+        from core import desktop_control, screenact, task_control
+        if task_control.was_cancelled_since(gen) or desktop_control.should_stop():
+            return False, "cancelled before anything was typed"
         comp = locate_whatsapp_composer(view)
         if not comp.get("composer_found"):
             return False, "No unique message field was found."
@@ -1108,22 +1269,36 @@ class WhatsAppDriver:
         entered = screenact.type_text(message, target=pt_comp, clear_first=True)
         if not entered.ok:
             return False, f"could not enter the message: {entered.error}"
+
+        # ---- the draft must be READ BACK as the intended text before Enter is allowed
         staged = self._view()
-        if any(getattr(e, "role", "") == screenview.ROLE_EDIT for e in getattr(staged, "elements", ()) or ()):
-            if not any(message[:24] in (e.value or e.name or "") for e in staged.elements if getattr(e, "role", "") in (screenview.ROLE_EDIT, screenview.ROLE_TEXT)):
-                return False, "message was not visible in the intended composer; it was not submitted"
+        rb = read_composer(staged)
+        want = fold(normalize_composer_text(message))
+        got = fold(rb["text"])
+        if rb["status"] != "has_text":
+            return False, ("the message box could not be read back (" + rb["status"] + "), so Enter was not pressed "
+                           "and nothing was sent")
+        if want[:60] != got[:60] or (len(want) <= 60 and want != got):
+            return False, "the message box does not contain exactly the intended text; it was not submitted"
+        hdr2 = verify_whatsapp_active_chat(staged, expected_contact=receiver)
+        if not hdr2.get("verified"):
+            return False, f"the open conversation is no longer {receiver!r}; it was not submitted"
+        if task_control.was_cancelled_since(gen) or desktop_control.should_stop():
+            return False, "cancelled before sending; the draft was left in the message box"
+
+        # Enter may succeed even if we cannot SEE it succeed, so the attempt is recorded
+        # first: an unconfirmed send must never be retried into a duplicate.
+        desktop_control.record_sent_attempt(receiver=receiver, draft_hash=dhash, task_id=task_id)
         sent = screenact.press("enter")
         if not sent.ok:
             return False, f"message submission failed: {sent.error}"
         time.sleep(0.30)
         after = self._view()
-        if after.app != view.app:
-            return False, "active conversation changed during submission"
-        if not verify_outgoing_message(after, message):
-            return False, "unverified: outgoing message was not confirmed in the active chat after Enter"
-        desktop_control.record_sent_attempt(receiver=receiver, draft_hash=dhash, task_id=task_id)
+        if not verify_outgoing_message(after, message, before_view=staged):
+            return False, ("unverified: Enter was pressed but the message was not confirmed in the chat; it may "
+                           "have been sent, so I will not send it again")
         desktop_control.mark_composition_sent(receiver=receiver, draft_hash=dhash)
-        return True, "exact chat matched, message submitted, and outgoing state verified"
+        return True, "exact chat matched, draft read back, message submitted, and outgoing bubble verified"
 
 
 def get():

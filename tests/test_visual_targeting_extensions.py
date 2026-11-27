@@ -385,6 +385,7 @@ class YouTubeOrdinalTargetTests(unittest.TestCase):
             async def wait_for_url(self, *args, **kwargs):
                 self.url = "https://www.youtube.com/watch?v=abcdefghijk"
 
+        Page.evaluate = lambda self, script, arg=None: __import__('tests.yt_fakes', fromlist=['x']).playing_evaluate(self, script, arg)
         page = Page()
         coro = object.__new__(_BrowserSession)._click_youtube_video_ordinal(page, "first", ())
         with self.assertRaises(StopIteration) as completed:
@@ -419,6 +420,7 @@ class YouTubeOrdinalTargetTests(unittest.TestCase):
             async def wait_for_url(self, *args, **kwargs):
                 self.url = "https://www.youtube.com/watch?v=abcdefghijk"
 
+        Page.evaluate = lambda self, script, arg=None: __import__('tests.yt_fakes', fromlist=['x']).playing_evaluate(self, script, arg)
         session = object.__new__(_BrowserSession)
         page = Page()
         coro = session._click_youtube_video_ordinal(page, "first", ())
@@ -451,6 +453,7 @@ class YouTubeOrdinalTargetTests(unittest.TestCase):
                 return Locator(selector)
             async def wait_for_url(self, *args, **kwargs):
                 self.url = "https://www.youtube.com/watch?v=lmnopqrstuv"
+        Page.evaluate = lambda self, script, arg=None: __import__('tests.yt_fakes', fromlist=['x']).playing_evaluate(self, script, arg)
         page = Page()
         coro = object.__new__(_BrowserSession)._click_youtube_video_ordinal(page, "second", ())
         with self.assertRaises(StopIteration) as completed:

@@ -1154,7 +1154,26 @@ class RemLive:
                         cleaned = sess.objective
             except Exception:
                 pass
+            utter_class = "command"
             if cleaned:
+                try:
+                    from core import task_control as _tc
+                    utter_class = _tc.classify_utterance(cleaned)
+                    if utter_class == "cancel":
+                        # "Cancel" ends the task chain NOW: pending operations are cancelled,
+                        # every task-scoped grant is dropped, and this utterance authorizes nothing.
+                        _tc.request_cancel("spoken cancel")
+                        self._active_browser_task = None
+                        self._last_assistant_question = ""
+                        stable_task_id = ""
+                    elif utter_class == "correction" and isinstance(getattr(self, "_active_browser_task", None), dict):
+                        # A correction REPLACES the previous intent: earlier wording must not
+                        # keep authorizing actions on top of the new instruction.
+                        self._active_browser_task = dict(self._active_browser_task,
+                                                         spoken_inputs=(), last_instruction="")
+                except Exception:
+                    pass
+            if cleaned and utter_class != "cancel":
                 self._last_user_text_for_expr = cleaned
                 try:
                     from core import desktop_control
@@ -1174,7 +1193,7 @@ class RemLive:
                         "clear", "empty", "erase", "field", "bar", "box", "is there",
                         "translate", "hindi", "english", "replace", "remove", "previous",
                         "send", "deliver", "call", "ring", "dial", "try again", "continue",
-                        "shorter", "shorten", "natural", "rewrite", "rio",
+                        "shorter", "shorten", "natural", "rewrite",
                         "first", "second", "third", "fourth", "fifth", "sixth", "last", "titled",
                     ))
                     unrelated_non_browser = any(w in low for w in (
@@ -1204,6 +1223,8 @@ class RemLive:
                         bool(prev_bt)
                         and not desktop_control.should_stop()
                         and float(prev_bt.get("expires_at", 0) or 0) > time.monotonic()
+                        # sliding expiry must not let one task live forever
+                        and (time.monotonic() - float(prev_bt.get("started_at", time.monotonic()) or time.monotonic())) < 1800.0
                     )
                     # Short direct answers (e.g. "short" after REM asks "What would you like me to type?"),
                     # clarification confirmations ("Yes, click it."), and anaphoric target turns belong to
@@ -1253,6 +1274,7 @@ class RemLive:
                         self._active_browser_task = {
                             "task_id": browser_task_id,
                             "browser": browser,
+                            "started_at": (float(prev_bt.get("started_at", now_m)) if has_live_bt else now_m),
                             "expires_at": now_m + 600.0,
                             "last_instruction": recorded_parent,
                             "spoken_inputs": tuple(prev_history),

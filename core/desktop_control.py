@@ -195,7 +195,7 @@ def resolve_target_reference(description: str, *, auth_context=None,
     results = rec.get("results") or []
 
     # 1. Explicit ordinal inside description or request ("the first one", "the second one", "first rio")
-    pos = _ordinal_from_ref(desc_cf) or (_ordinal_from_ref(req_cf) if ({"one", "video", "contact", "chat", "rio"} & _tokens(req_cf)) else None)
+    pos = _ordinal_from_ref(desc_cf) or (_ordinal_from_ref(req_cf) if ({"one", "video", "contact", "chat"} & _tokens(req_cf)) else None)
     if pos is not None and results:
         idx = (len(results) - 1) if pos == -1 else (pos - 1)
         if 0 <= idx < len(results):
@@ -379,10 +379,24 @@ def clear_task_targets(*, task_id: str = "", browser_task_id: str = "") -> None:
         if not keys:
             _active_targets_by_task.clear()
             _active_typing_by_task.clear()
+            _active_composition_by_task.clear()
             return
         for k in keys:
             _active_targets_by_task.pop(k, None)
             _active_typing_by_task.pop(k, None)
+            _active_composition_by_task.pop(k, None)
+
+
+def clear_all_task_state() -> None:
+    """Forget every task-scoped target, typing payload and composed-draft grant.
+
+    Sent-attempt records are deliberately KEPT: cancelling must never re-enable
+    sending a message that may already have gone out.
+    """
+    with _active_target_lock:
+        _active_targets_by_task.clear()
+        _active_typing_by_task.clear()
+        _active_composition_by_task.clear()
 
 
 def _tokens(value) -> set[str]:
@@ -590,8 +604,10 @@ def classify_action(tool: str, args: dict | None) -> dict:
             category = "media.resume"
         elif raw_action in ("seek_forward", "seek_backward", "set_playback_position"):
             category = "media.seek"
-        elif raw_action in ("volume_up", "volume_down", "mute", "unmute"):
+        elif raw_action in ("volume_up", "volume_down", "mute", "unmute", "set_volume"):
             category = "media.volume"
+        elif raw_action in ("fullscreen", "exit_fullscreen"):
+            category = "media.fullscreen"
         elif raw_action in ("fill_form", "close", "close_all"):
             category = "sensitive.form"
             routine = False
@@ -820,6 +836,17 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
     """
     request = str(user_request or "").casefold().strip()
     trusted_sources = {"voice", "typed", "dashboard", "ui"}
+    # A request the person cancelled stays cancelled: a context created BEFORE the
+    # latest cancel cannot authorize anything, including work already in flight.
+    if auth_context is not None:
+        try:
+            from core import task_control as _tc
+            if _tc.last_cancel()[0] > float(getattr(auth_context, "created_at", 0.0) or 0.0):
+                _log_auth_decision("DENY", tool=str(tool), action=str((args or {}).get("action") or ""), source=source,
+                                   auth_context=auth_context, category="cancelled", reason="cancelled_by_user")
+                return False, "That request was cancelled; nothing was done."
+        except Exception:
+            pass
     t = str(tool or "").lower()
     if t == "desktop_ui":
         t = "screen_agent"
@@ -853,6 +880,23 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
 
     if _negates_action(request, action or t):
         return False, "Your request explicitly forbids that action; nothing was done."
+
+    # Clearing a DRAFT, deleting a SENT message and deleting a CONVERSATION are three
+    # different acts. Draft-clearing tools must never be used to satisfy the other two,
+    # and neither destructive scope is ever authorized by this keyword layer: it needs
+    # an explicit confirmation turn (the HUD confirm path).
+    try:
+        from core import task_control as _tc
+        scope = _tc.deletion_scope(request)
+    except Exception:
+        scope = ""
+    if scope in {"delete_message", "delete_chat"} and (
+            action in {"clear_field", "type", "smart_type", "type_text", "press", "hotkey"}
+            or t in {"send_message"}):
+        _log_auth_decision("DENY", tool=t, action=action, source=source, auth_context=auth_context,
+                           category="destructive_scope", reason=scope)
+        return False, ("Deleting a sent message or a conversation needs explicit confirmation; "
+                       "clearing the message box is not the same thing, so nothing was done.")
 
     # Task-scoped trusted authorization (Overnight Autonomous Mode)
     session_id = getattr(auth_context, "autonomous_session_id", "") if auth_context is not None else ""
@@ -961,16 +1005,16 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
             "new_tab": {"tab", "open", "new"},
             "switch_tab": {"tab", "switch", "open", "focus", "whatsapp", "youtube", "chrome", "edge", "browser", "current"},
             "inspect": {"inspect", "open", "see", "check", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "page", "site", "website", "tab", "status", "loaded", "login", "url", "read", "search", "cursor", "play", "pause", "resume", "replay", "video", "videos", "result", "results", "first", "second", "third", "fourth", "fifth", "titled", "title"},
-            "smart_click": {"click", "left", "open", "select", "choose", "press", "search", "focus", "bar", "put", "cursor", "play", "replay", "again", "restart", "pause", "resume", "video", "videos", "result", "results", "recommended", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "last", "next", "previous", "titled", "title", "tab", "youtube", "rio", "chat", "contact", "1st", "2nd", "3rd", "4th", "5th", "it", "that", "this", "one", "yes"},
+            "smart_click": {"click", "left", "open", "select", "choose", "press", "search", "focus", "bar", "put", "cursor", "play", "replay", "again", "restart", "pause", "resume", "video", "videos", "result", "results", "recommended", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "last", "next", "previous", "titled", "title", "tab", "youtube", "chat", "contact", "1st", "2nd", "3rd", "4th", "5th", "it", "that", "this", "one", "yes"},
             "click": {"click", "left", "open", "select", "choose", "focus", "search", "bar", "play", "pause", "resume", "replay", "it", "that", "this", "one", "yes"},
             "left_click": {"click", "left", "open", "select", "focus", "bar", "video", "result", "play", "it", "that", "this", "one", "yes"},
-            "smart_type": {"type", "enter", "search", "fill", "write", "put", "that", "it", "yes", "compose", "write", "message", "draft", "text", "replace", "remove", "clear", "english", "hindi", "translate", "again", "natural", "shorter", "rewrite", "rio"},
+            "smart_type": {"type", "enter", "search", "fill", "write", "put", "that", "it", "yes", "compose", "write", "message", "draft", "text", "replace", "remove", "clear", "english", "hindi", "translate", "again", "natural", "shorter", "rewrite"},
             "type": {"type", "enter", "search", "fill", "write", "put", "that", "it", "yes", "compose", "write", "message", "draft", "text", "replace", "remove", "clear", "english", "hindi", "translate", "again", "natural", "shorter", "rewrite"},
             "clear_field": {"clear", "remove", "empty", "erase", "delete", "clean", "reset", "message", "text", "draft", "composer", "bar", "box", "field", "all", "everything", "previous", "old", "it"},
             "compose_message": {"compose", "write", "message", "draft", "yourself", "friendly", "nice", "natural", "shorter", "rewrite", "reply", "say", "hindi", "english", "translate", "replace", "text", "again"},
             "update_draft": {"shorter", "shorten", "natural", "rewrite", "change", "edit", "update", "draft", "make", "more", "replace", "remove", "translate", "english", "hindi", "text"},
-            "search_contact": {"search", "find", "look", "rio", "contact", "chat", "whatsapp", "for", "is", "there"},
-            "select_contact": {"open", "click", "select", "chat", "contact", "first", "second", "third", "one", "rio", "it", "that", "again", "whatsapp"},
+            "search_contact": {"search", "find", "look", "contact", "chat", "whatsapp", "for", "is", "there"},
+            "select_contact": {"open", "click", "select", "chat", "contact", "first", "second", "third", "one", "it", "that", "again", "whatsapp"},
             "screenshot": {"screenshot", "screen", "capture", "see", "look", "check", "inspect", "what", "visible", "youtube", "whatsapp"},
             "fill_form": {"fill", "form", "enter", "complete"},
             "pause_video": {"pause", "stop", "halt", "video", "playback", "roko"},
@@ -982,6 +1026,9 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
             "set_playback_position": {"seek", "jump", "skip", "position", "minute", "minutes", "seconds", "video"},
             "volume_up": {"volume", "louder", "up", "sound"},
             "volume_down": {"volume", "quieter", "down", "sound"},
+            "set_volume": {"volume", "sound", "percent", "set"},
+            "fullscreen": {"fullscreen", "full", "screen", "maximize", "theater"},
+            "exit_fullscreen": {"exit", "leave", "close", "fullscreen", "full", "screen", "minimize", "normal"},
             "mute": {"mute", "silence", "sound"},
             "unmute": {"unmute", "sound", "audio"},
             "get_text": {"read", "summarize", "page", "website", "screen", "text", "search", "open", "check", "see", "whether", "verify", "confirm", "chrome", "browser", "whatsapp", "youtube", "tab", "loaded"},
@@ -1119,11 +1166,11 @@ def _authorize_user_request_core(user_request: str, tool: str, args: dict, *,
         routine_substeps = {
             "inspect", "get_url", "get_text", "list_browsers", "screenshot",
             "reload", "back", "forward", "scroll", "switch_tab",
-            "close_tab", "new_tab", "pause_video", "resume_video",
+            "pause_video", "resume_video",
             "play_video", "replay_video", "seek_forward", "seek_backward",
             "set_playback_position", "focus_search", "volume_up",
-            "volume_down", "mute", "unmute",
-            "search_contact", "select_contact", "compose_message", "update_draft", "clear_field",
+            "volume_down", "mute", "unmute", "set_volume", "fullscreen", "exit_fullscreen",
+            "search_contact", "select_contact",
         }
         if browser_task_id and action in routine_substeps and auth_context is not None and not auth_context.is_expired() and not should_stop():
             print(f"[Auth] ALLOW tool=browser_control action={action} browser_task={browser_task_id} source={source}")
